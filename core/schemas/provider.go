@@ -257,6 +257,8 @@ type AllowedRequests struct {
 	ContainerFileDelete   bool `json:"container_file_delete"`
 	Passthrough           bool `json:"passthrough"`
 	PassthroughStream     bool `json:"passthrough_stream"`
+	WebSocketResponses    bool `json:"websocket_responses"`
+	Realtime              bool `json:"realtime"`
 }
 
 // IsOperationAllowed checks if a specific operation is allowed
@@ -360,6 +362,10 @@ func (ar *AllowedRequests) IsOperationAllowed(operation RequestType) bool {
 		return ar.Passthrough
 	case PassthroughStreamRequest:
 		return ar.PassthroughStream
+	case WebSocketResponsesRequest:
+		return ar.WebSocketResponses
+	case RealtimeRequest:
+		return ar.Realtime
 	default:
 		return false // Default to not allowed for unknown operations
 	}
@@ -397,17 +403,14 @@ type ProviderPricingOverride struct {
 	InputCostPerAudioPerSecond *float64 `json:"input_cost_per_audio_per_second,omitempty"`
 
 	// Character-based pricing
-	InputCostPerCharacter  *float64 `json:"input_cost_per_character,omitempty"`
-	OutputCostPerCharacter *float64 `json:"output_cost_per_character,omitempty"`
+	InputCostPerCharacter *float64 `json:"input_cost_per_character,omitempty"`
 
 	// Pricing above 128k tokens
 	InputCostPerTokenAbove128kTokens          *float64 `json:"input_cost_per_token_above_128k_tokens,omitempty"`
-	InputCostPerCharacterAbove128kTokens      *float64 `json:"input_cost_per_character_above_128k_tokens,omitempty"`
 	InputCostPerImageAbove128kTokens          *float64 `json:"input_cost_per_image_above_128k_tokens,omitempty"`
 	InputCostPerVideoPerSecondAbove128kTokens *float64 `json:"input_cost_per_video_per_second_above_128k_tokens,omitempty"`
 	InputCostPerAudioPerSecondAbove128kTokens *float64 `json:"input_cost_per_audio_per_second_above_128k_tokens,omitempty"`
 	OutputCostPerTokenAbove128kTokens         *float64 `json:"output_cost_per_token_above_128k_tokens,omitempty"`
-	OutputCostPerCharacterAbove128kTokens     *float64 `json:"output_cost_per_character_above_128k_tokens,omitempty"`
 
 	// Pricing above 200k tokens
 	InputCostPerTokenAbove200kTokens           *float64 `json:"input_cost_per_token_above_200k_tokens,omitempty"`
@@ -422,11 +425,19 @@ type ProviderPricingOverride struct {
 	OutputCostPerTokenBatches   *float64 `json:"output_cost_per_token_batches,omitempty"`
 
 	// Image generation pricing
-	InputCostPerImageToken       *float64 `json:"input_cost_per_image_token,omitempty"`
-	OutputCostPerImageToken      *float64 `json:"output_cost_per_image_token,omitempty"`
-	InputCostPerImage            *float64 `json:"input_cost_per_image,omitempty"`
-	OutputCostPerImage           *float64 `json:"output_cost_per_image,omitempty"`
-	CacheReadInputImageTokenCost *float64 `json:"cache_read_input_image_token_cost,omitempty"`
+	InputCostPerImageToken                        *float64 `json:"input_cost_per_image_token,omitempty"`
+	OutputCostPerImageToken                       *float64 `json:"output_cost_per_image_token,omitempty"`
+	InputCostPerImage                             *float64 `json:"input_cost_per_image,omitempty"`
+	OutputCostPerImage                            *float64 `json:"output_cost_per_image,omitempty"`
+	OutputCostPerImageAbove1024x1024Pixels        *float64 `json:"output_cost_per_image_above_1024_and_1024_pixels,omitempty"`
+	OutputCostPerImageAbove1024x1024PixelsPremium *float64 `json:"output_cost_per_image_above_1024_and_1024_pixels_and_premium_image,omitempty"`
+	OutputCostPerImageAbove2048x2048Pixels        *float64 `json:"output_cost_per_image_above_2048_and_2048_pixels,omitempty"`
+	OutputCostPerImageAbove4096x4096Pixels        *float64 `json:"output_cost_per_image_above_4096_and_4096_pixels,omitempty"`
+	OutputCostPerImageLowQuality                  *float64 `json:"output_cost_per_image_low_quality,omitempty"`
+	OutputCostPerImageMediumQuality               *float64 `json:"output_cost_per_image_medium_quality,omitempty"`
+	OutputCostPerImageHighQuality                 *float64 `json:"output_cost_per_image_high_quality,omitempty"`
+	OutputCostPerImageAutoQuality                 *float64 `json:"output_cost_per_image_auto_quality,omitempty"`
+	CacheReadInputImageTokenCost                  *float64 `json:"cache_read_input_image_token_cost,omitempty"`
 }
 
 // IsOperationAllowed checks if a specific operation is allowed for this custom provider
@@ -446,8 +457,9 @@ type ProviderConfig struct {
 	// Logger instance, can be provided by the user or bifrost default logger is used if not provided
 	Logger               Logger                    `json:"-"`
 	ProxyConfig          *ProxyConfig              `json:"proxy_config,omitempty"` // Proxy configuration
-	SendBackRawRequest   bool                      `json:"send_back_raw_request"`  // Send raw request back in the bifrost response (default: false)
-	SendBackRawResponse  bool                      `json:"send_back_raw_response"` // Send raw response back in the bifrost response (default: false)
+	SendBackRawRequest        bool                      `json:"send_back_raw_request"`         // Send raw request back in the bifrost response (default: false)
+	SendBackRawResponse       bool                      `json:"send_back_raw_response"`        // Send raw response back in the bifrost response (default: false)
+	StoreRawRequestResponse   bool                      `json:"store_raw_request_response"`    // Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)
 	CustomProviderConfig *CustomProviderConfig     `json:"custom_provider_config,omitempty"`
 	PricingOverrides     []ProviderPricingOverride `json:"pricing_overrides,omitempty"`
 }
@@ -588,4 +600,18 @@ type Provider interface {
 	Passthrough(ctx *BifrostContext, key Key, req *BifrostPassthroughRequest) (*BifrostPassthroughResponse, *BifrostError)
 	// PassthroughStream executes a streaming passthrough, forwarding raw response bytes as BifrostStreamChunks.
 	PassthroughStream(ctx *BifrostContext, postHookRunner PostHookRunner, key Key, req *BifrostPassthroughRequest) (chan *BifrostStreamChunk, *BifrostError)
+}
+
+// WebSocketCapableProvider is an optional interface that providers can implement
+// to indicate support for the OpenAI Responses API WebSocket Mode.
+// Checked via type assertion: provider.(WebSocketCapableProvider).
+// Providers that implement this interface will have native WS upstream connections
+// instead of the HTTP bridge fallback for Responses WS mode.
+type WebSocketCapableProvider interface {
+	// SupportsWebSocketMode returns true if the provider supports the Responses API WebSocket Mode.
+	SupportsWebSocketMode() bool
+	// WebSocketResponsesURL returns the WebSocket URL for the Responses API.
+	WebSocketResponsesURL(key Key) string
+	// WebSocketHeaders returns the headers required for the upstream WebSocket connection.
+	WebSocketHeaders(key Key) map[string]string
 }

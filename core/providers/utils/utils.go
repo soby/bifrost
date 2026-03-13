@@ -508,17 +508,53 @@ func GetPathFromContext(ctx context.Context, defaultPath string) string {
 // It returns the resolved value and a boolean indicating whether the value is a full absolute URL.
 // If the boolean is false, the returned string is a path (leading slash ensured).
 func GetRequestPath(ctx context.Context, defaultPath string, customProviderConfig *schemas.CustomProviderConfig, requestType schemas.RequestType) (string, bool) {
-	// If path/url set in context, return it.
+	// Track whether the path came from the per-request context so that static
+	// RequestPathOverrides do not overwrite an explicitly provided context path.
+	pathFromContext := false
+
+	// If an explicit path/URL is set in context, handle it before checking ProviderOverride.
+	// Absolute URLs short-circuit entirely. Relative paths update defaultPath so the
+	// ProviderOverride.BaseURL join logic below can still combine them into a full URL.
 	if pathInContext, ok := ctx.Value(schemas.BifrostContextKeyURLPath).(string); ok {
 		trimmed := strings.TrimSpace(pathInContext)
 		if u, err := url.Parse(trimmed); err == nil && u != nil && u.IsAbs() && u.Host != "" {
 			return trimmed, true
 		}
-		return trimmed, false
+		// Relative path: do not return yet. If a ProviderOverride.BaseURL is also set,
+		// it should be joined with this path rather than the provider's static base URL.
+		if trimmed != "" {
+			defaultPath = trimmed
+			pathFromContext = true
+		}
 	}
 
-	// If path override set in custom provider config, return it.
-	if customProviderConfig != nil && customProviderConfig.RequestPathOverrides != nil {
+	// If a ProviderOverride with a BaseURL is set, combine with the effective path and return
+	// as a complete absolute URL, bypassing the provider's static NetworkConfig.BaseURL.
+	// Respect RequestPathOverrides for the path suffix when configured, but only when the
+	// path was not already set explicitly via context (pathFromContext = false).
+	// BaseURL is used unconditionally: a non-empty value is an explicit developer choice.
+	// If it is malformed the concatenated result is returned as-is so the transport surfaces
+	// a clear error rather than silently routing to the static provider endpoint.
+	if override, ok := ctx.Value(schemas.BifrostContextKeyProviderOverride).(*schemas.ProviderOverride); ok && override != nil && override.BaseURL != "" {
+		path := defaultPath
+		if !pathFromContext && customProviderConfig != nil && customProviderConfig.RequestPathOverrides != nil {
+			if raw, ok := customProviderConfig.RequestPathOverrides[requestType]; ok && strings.TrimSpace(raw) != "" {
+				path = strings.TrimSpace(raw)
+				// If the path override is itself an absolute URL, return it directly.
+				if pu, perr := url.Parse(path); perr == nil && pu != nil && pu.IsAbs() && pu.Host != "" {
+					return path, true
+				}
+			}
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		return strings.TrimRight(override.BaseURL, "/") + path, true
+	}
+
+	// If path override set in custom provider config, return it (only when path was not
+	// already provided via context).
+	if !pathFromContext && customProviderConfig != nil && customProviderConfig.RequestPathOverrides != nil {
 		if raw, ok := customProviderConfig.RequestPathOverrides[requestType]; ok {
 			override := strings.TrimSpace(raw)
 			if override == "" {
@@ -538,7 +574,11 @@ func GetRequestPath(ctx context.Context, defaultPath string, customProviderConfi
 		}
 	}
 
-	// Return default path.
+	// Ensure a leading slash on relative paths before returning so buildRequestURL
+	// does not produce a malformed URL when concatenating with a base URL.
+	if defaultPath != "" && !strings.HasPrefix(defaultPath, "/") {
+		defaultPath = "/" + defaultPath
+	}
 	return defaultPath, false
 }
 
@@ -799,36 +839,6 @@ func CloneFastHTTPClientConfig(base *fasthttp.Client) *fasthttp.Client {
 		DisableHeaderNamesNormalizing: base.DisableHeaderNamesNormalizing,
 		DisablePathNormalizing:        base.DisablePathNormalizing,
 		StreamResponseBody:            base.StreamResponseBody,
-	}
-}
-
-// gzipReaderPool reuses gzip.Reader instances across requests to reduce GC pressure.
-var gzipReaderPool = sync.Pool{
-	New: func() any {
-		return &gzip.Reader{}
-	},
-}
-
-// AcquireGzipReader gets a gzip.Reader from the pool and resets it to read from r,
-// or creates a new one if the pool is empty or reset fails.
-func AcquireGzipReader(r io.Reader) (*gzip.Reader, error) {
-	if v := gzipReaderPool.Get(); v != nil {
-		gz := v.(*gzip.Reader)
-		if err := gz.Reset(r); err == nil {
-			return gz, nil
-		}
-		// Reset failed; discard the reader. After a failed Reset the internal
-		// decompressor may be nil, making Close() panic (Go 1.26+).
-		// Do not re-pool — let GC reclaim it.
-	}
-	return gzip.NewReader(r)
-}
-
-// ReleaseGzipReader closes and returns a gzip.Reader to the pool.
-func ReleaseGzipReader(gz *gzip.Reader) {
-	if gz != nil {
-		_ = gz.Close()
-		gzipReaderPool.Put(gz)
 	}
 }
 
@@ -1621,9 +1631,12 @@ type RequestMetadata struct {
 	RequestType schemas.RequestType
 }
 
-// ShouldSendBackRawRequest checks if the raw request should be sent back.
+// ShouldSendBackRawRequest checks if the raw request should be captured.
 // Context overrides are intentionally restricted to asymmetric behavior: a context value can only
 // promote false→true and will not override a true config to false, avoiding accidental suppression.
+// Both full send-back mode and logging-only mode (store_raw_request_response) set
+// BifrostContextKeySendBackRawRequest=true in the request context so a single flag is checked here.
+// In logging-only mode the payload is stripped before the response reaches the client.
 func ShouldSendBackRawRequest(ctx context.Context, defaultSendBackRawRequest bool) bool {
 	if sendBackRawRequest, ok := ctx.Value(schemas.BifrostContextKeySendBackRawRequest).(bool); ok && sendBackRawRequest {
 		return sendBackRawRequest
@@ -1631,7 +1644,12 @@ func ShouldSendBackRawRequest(ctx context.Context, defaultSendBackRawRequest boo
 	return defaultSendBackRawRequest
 }
 
-// ShouldSendBackRawResponse checks if the raw response should be sent back, and returns it if it exists.
+// ShouldSendBackRawResponse checks if the raw response should be captured.
+// Context overrides are intentionally restricted to asymmetric behavior: a context value can only
+// promote false→true and will not override a true config to false, avoiding accidental suppression.
+// Both full send-back mode and logging-only mode (store_raw_request_response) set
+// BifrostContextKeySendBackRawResponse=true in the request context so a single flag is checked here.
+// In logging-only mode the payload is stripped before the response reaches the client.
 func ShouldSendBackRawResponse(ctx context.Context, defaultSendBackRawResponse bool) bool {
 	if sendBackRawResponse, ok := ctx.Value(schemas.BifrostContextKeySendBackRawResponse).(bool); ok && sendBackRawResponse {
 		return sendBackRawResponse
@@ -1681,6 +1699,77 @@ func SendInProgressEventResponsesChunk(ctx *schemas.BifrostContext, postHookRunn
 	ProcessAndSendResponse(ctx, postHookRunner, bifrostResponse, responseChan)
 }
 
+// BuildClientStreamChunk constructs a BifrostStreamChunk from post-hook results.
+// It never mutates the shared processedResponse or processedError objects — when in
+// logging-only mode (BifrostContextKeyRawRequestResponseForLogging) it shallow-copies
+// each inner response struct and the BifrostError, nils only the raw fields on those
+// copies, and returns them as the outgoing chunk. This is safe for concurrent PostLLMHook
+// goroutines that still hold references to the originals.
+func BuildClientStreamChunk(ctx context.Context, processedResponse *schemas.BifrostResponse, processedError *schemas.BifrostError) *schemas.BifrostStreamChunk {
+	dropRaw, _ := ctx.Value(schemas.BifrostContextKeyRawRequestResponseForLogging).(bool)
+	streamResponse := &schemas.BifrostStreamChunk{}
+	if processedResponse != nil {
+		streamResponse.BifrostTextCompletionResponse = processedResponse.TextCompletionResponse
+		streamResponse.BifrostChatResponse = processedResponse.ChatResponse
+		streamResponse.BifrostResponsesStreamResponse = processedResponse.ResponsesStreamResponse
+		streamResponse.BifrostSpeechStreamResponse = processedResponse.SpeechStreamResponse
+		streamResponse.BifrostTranscriptionStreamResponse = processedResponse.TranscriptionStreamResponse
+		streamResponse.BifrostImageGenerationStreamResponse = processedResponse.ImageGenerationStreamResponse
+		// Strip raw fields from client-facing copies without mutating the shared objects
+		// that PostLLMHook goroutines may still be reading.
+		if dropRaw {
+			if streamResponse.BifrostTextCompletionResponse != nil {
+				cp := *streamResponse.BifrostTextCompletionResponse
+				cp.ExtraFields.RawRequest = nil
+				cp.ExtraFields.RawResponse = nil
+				streamResponse.BifrostTextCompletionResponse = &cp
+			}
+			if streamResponse.BifrostChatResponse != nil {
+				cp := *streamResponse.BifrostChatResponse
+				cp.ExtraFields.RawRequest = nil
+				cp.ExtraFields.RawResponse = nil
+				streamResponse.BifrostChatResponse = &cp
+			}
+			if streamResponse.BifrostResponsesStreamResponse != nil {
+				cp := *streamResponse.BifrostResponsesStreamResponse
+				cp.ExtraFields.RawRequest = nil
+				cp.ExtraFields.RawResponse = nil
+				streamResponse.BifrostResponsesStreamResponse = &cp
+			}
+			if streamResponse.BifrostSpeechStreamResponse != nil {
+				cp := *streamResponse.BifrostSpeechStreamResponse
+				cp.ExtraFields.RawRequest = nil
+				cp.ExtraFields.RawResponse = nil
+				streamResponse.BifrostSpeechStreamResponse = &cp
+			}
+			if streamResponse.BifrostTranscriptionStreamResponse != nil {
+				cp := *streamResponse.BifrostTranscriptionStreamResponse
+				cp.ExtraFields.RawRequest = nil
+				cp.ExtraFields.RawResponse = nil
+				streamResponse.BifrostTranscriptionStreamResponse = &cp
+			}
+			if streamResponse.BifrostImageGenerationStreamResponse != nil {
+				cp := *streamResponse.BifrostImageGenerationStreamResponse
+				cp.ExtraFields.RawRequest = nil
+				cp.ExtraFields.RawResponse = nil
+				streamResponse.BifrostImageGenerationStreamResponse = &cp
+			}
+		}
+	}
+	if processedError != nil {
+		if dropRaw {
+			// Strip raw fields from a client-facing copy without mutating the shared error object.
+			errCopy := *processedError
+			errCopy.ExtraFields.RawRequest = nil
+			errCopy.ExtraFields.RawResponse = nil
+			streamResponse.BifrostError = &errCopy
+		} else {
+			streamResponse.BifrostError = processedError
+		}
+	}
+	return streamResponse
+}
+
 // ProcessAndSendResponse handles post-hook processing and sends the response to the channel.
 // This utility reduces code duplication across streaming implementations by encapsulating
 // the common pattern of running post hooks, handling errors, and sending responses with
@@ -1712,18 +1801,7 @@ func ProcessAndSendResponse(
 		return
 	}
 
-	streamResponse := &schemas.BifrostStreamChunk{}
-	if processedResponse != nil {
-		streamResponse.BifrostTextCompletionResponse = processedResponse.TextCompletionResponse
-		streamResponse.BifrostChatResponse = processedResponse.ChatResponse
-		streamResponse.BifrostResponsesStreamResponse = processedResponse.ResponsesStreamResponse
-		streamResponse.BifrostSpeechStreamResponse = processedResponse.SpeechStreamResponse
-		streamResponse.BifrostTranscriptionStreamResponse = processedResponse.TranscriptionStreamResponse
-		streamResponse.BifrostImageGenerationStreamResponse = processedResponse.ImageGenerationStreamResponse
-	}
-	if processedError != nil {
-		streamResponse.BifrostError = processedError
-	}
+	streamResponse := BuildClientStreamChunk(ctx, processedResponse, processedError)
 
 	select {
 	case responseChan <- streamResponse:
@@ -1764,17 +1842,7 @@ func ProcessAndSendBifrostError(
 		return
 	}
 
-	streamResponse := &schemas.BifrostStreamChunk{}
-	if processedResponse != nil {
-		streamResponse.BifrostTextCompletionResponse = processedResponse.TextCompletionResponse
-		streamResponse.BifrostChatResponse = processedResponse.ChatResponse
-		streamResponse.BifrostResponsesStreamResponse = processedResponse.ResponsesStreamResponse
-		streamResponse.BifrostSpeechStreamResponse = processedResponse.SpeechStreamResponse
-		streamResponse.BifrostTranscriptionStreamResponse = processedResponse.TranscriptionStreamResponse
-	}
-	if processedError != nil {
-		streamResponse.BifrostError = processedError
-	}
+	streamResponse := BuildClientStreamChunk(ctx, processedResponse, processedError)
 
 	select {
 	case responseChan <- streamResponse:

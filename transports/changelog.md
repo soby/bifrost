@@ -1,3 +1,7 @@
+- fix: MCP health monitor now automatically reconnects clients after consecutive failures using exponential backoff retry logic
+- fix: MCP clients that fail initial connection on startup are retained in disconnected state and automatically recovered by the health monitor
+- fix: MCP tool retrieval during connection no longer hangs indefinitely for failing STDIO/SSE connections — bounded by a 30s timeout
+- fix: toolChoice silently dropped on Bedrock /converse and /converse-stream endpoints — auto, any, and specific tool constraints now correctly propagate to the model
 - feat: adds option to select specific API key for routing rules
 - feat: adds support for multiple weighted routing targets for probabilistic routing
 - [breaking change] feat: routing rules no longer support top-level `provider`/`model` fields; replace with a `targets` array — e.g. `"targets": [{"provider": "openai", "model": "gpt-4o", "weight": 1.0}]`
@@ -6,6 +10,7 @@
 - feat: adds attachment support in Maxim plugin
 - feat: add x-bf-api-key-id header support for explicit key selection by ID, with priority over x-bf-api-key name selection
 - fix: streaming tool call indices for multiple parallel tool calls in chat completions stream
+- fix: handle request body passthrough for count tokens endpoint for Anthropic and Vertex providers
 
 ## Migration Guide
 

@@ -122,6 +122,7 @@ type ConfigData struct {
 	ConfigStoreConfig *configstore.Config                   `json:"config_store,omitempty"`
 	LogsStoreConfig   *logstore.Config                      `json:"logs_store,omitempty"`
 	Plugins           []*schemas.PluginConfig               `json:"plugins,omitempty"`
+	WebSocket         *schemas.WebSocketConfig              `json:"websocket,omitempty"`
 }
 
 // UnmarshalJSON unmarshals the ConfigData from JSON using internal unmarshallers
@@ -141,6 +142,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 		ConfigStoreConfig json.RawMessage                       `json:"config_store,omitempty"`
 		LogsStoreConfig   json.RawMessage                       `json:"logs_store,omitempty"`
 		Plugins           []*schemas.PluginConfig               `json:"plugins,omitempty"`
+		WebSocket         *schemas.WebSocketConfig              `json:"websocket,omitempty"`
 	}
 
 	var temp TempConfigData
@@ -156,6 +158,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 	cd.MCP = temp.MCP
 	cd.Governance = temp.Governance
 	cd.Plugins = temp.Plugins
+	cd.WebSocket = temp.WebSocket
 	// Initialize providers map if nil
 	if cd.Providers == nil {
 		cd.Providers = make(map[string]configstore.ProviderConfig)
@@ -309,6 +312,14 @@ type Config struct {
 	// Optional event broadcaster for real-time updates (e.g., WebSocket).
 	// Set by HTTP server at startup; may be nil in non-HTTP usage.
 	EventBroadcaster schemas.EventBroadcaster
+
+	// StreamingDecompressThreshold overrides the default threshold (10MB) for
+	// switching from buffered to streaming request decompression. Set by
+	// enterprise from LargePayloadConfig.RequestThresholdBytes. Zero means
+	// use schemas.DefaultLargePayloadRequestThresholdBytes.
+	StreamingDecompressThreshold int64
+	// WebSocket configuration for WS gateway features (Responses WS mode, Realtime API).
+	WebSocketConfig *schemas.WebSocketConfig
 }
 
 var DefaultClientConfig = configstore.ClientConfig{
@@ -469,6 +480,15 @@ func loadConfigFromFile(ctx context.Context, config *Config, data []byte) (*Conf
 	initFrameworkConfigFromFile(ctx, config, &configData)
 	// Sync encryption: encrypt any plaintext rows written during config loading
 	syncEncryption(ctx, config)
+	// Load WebSocket config (always enabled, apply defaults for any missing values)
+	if configData.WebSocket != nil {
+		configData.WebSocket.CheckAndSetDefaults()
+		config.WebSocketConfig = configData.WebSocket
+	} else {
+		wsConfig := &schemas.WebSocketConfig{}
+		wsConfig.CheckAndSetDefaults()
+		config.WebSocketConfig = wsConfig
+	}
 	return config, nil
 }
 
@@ -1968,6 +1988,10 @@ func loadConfigFromDefaults(ctx context.Context, config *Config, configDBPath, l
 	}
 	// Sync encryption: encrypt any plaintext rows written during config loading
 	syncEncryption(ctx, config)
+	// Initialize WebSocket config with defaults (always enabled)
+	wsConfig := &schemas.WebSocketConfig{}
+	wsConfig.CheckAndSetDefaults()
+	config.WebSocketConfig = wsConfig
 	return config, nil
 }
 

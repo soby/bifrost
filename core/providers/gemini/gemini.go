@@ -1647,6 +1647,7 @@ func (provider *GeminiProvider) SpeechStream(ctx *schemas.BifrostContext, postHo
 				Latency:        time.Since(startTime).Milliseconds(),
 			},
 		}
+		response.BackfillParams(request)
 		// Set raw request if enabled
 		if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
 			providerUtils.ParseAndSetRawRequest(&response.ExtraFields, jsonBody)
@@ -2473,7 +2474,6 @@ func (provider *GeminiProvider) VideoRetrieve(ctx *schemas.BifrostContext, key s
 		return nil, bifrostErr
 	}
 
-	// Convert to Bifrost response
 	bifrostResp, bifrostErr := ToBifrostVideoGenerationResponse(&operation, "")
 	if bifrostErr != nil {
 		return nil, bifrostErr
