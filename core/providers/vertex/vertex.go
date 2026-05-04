@@ -524,8 +524,8 @@ func (provider *VertexProvider) ChatCompletion(ctx *schemas.BifrostContext, key 
 	// project (often empty) and 403s with "The caller does not have permission".
 	// See `Rerank` below — same pattern, also on a publisher endpoint.
 	req.Header.Set("X-Goog-User-Project", projectID)
-	// build-verification sentinel — grep for "BIFROST-VERTEX-FIX-MARKER-PLATFORM931" in the gateway binary to confirm this code path was compiled in
-	_ = "BIFROST-VERTEX-FIX-MARKER-PLATFORM931"
+	// build-verification sentinel: prints once per request so gateway log shows the new code path is active. To remove after PLATFORM-931 deploy verification.
+	fmt.Printf("[BIFROST-VERTEX-FIX-MARKER-PLATFORM931] vertex chat completion outbound, project=%s region=%s\n", projectID, region)
 	// Skip anthropic-beta from context headers — Anthropic models on Vertex use the
 	// anthropic_beta body field instead, and other model families don't use it.
 	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, []string{anthropic.AnthropicBetaHeader})
