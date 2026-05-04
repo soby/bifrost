@@ -518,6 +518,12 @@ func (provider *VertexProvider) ChatCompletion(ctx *schemas.BifrostContext, key 
 
 	req.Header.SetMethod(http.MethodPost)
 	req.Header.SetContentType("application/json")
+	// Required for Vertex Model Garden partner offerings (e.g. openai/gpt-oss-*-maas):
+	// the publishers/openai/* endpoints synthesise an IAM policy that gates on the
+	// quota project, and without this header the call lands on the SA's default
+	// project (often empty) and 403s with "The caller does not have permission".
+	// See `Rerank` below — same pattern, also on a publisher endpoint.
+	req.Header.Set("X-Goog-User-Project", projectID)
 	// Skip anthropic-beta from context headers — Anthropic models on Vertex use the
 	// anthropic_beta body field instead, and other model families don't use it.
 	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, []string{anthropic.AnthropicBetaHeader})
@@ -825,10 +831,13 @@ func (provider *VertexProvider) ChatCompletionStream(ctx *schemas.BifrostContext
 			completeURL = fmt.Sprintf("%s?alt=sse", completeURL)
 		}
 
-		// Prepare headers for Vertex Gemini
+		// Prepare headers for Vertex Gemini.
+		// X-Goog-User-Project is required for partner publisher offerings (and
+		// inert for first-party Google ones); see ChatCompletion above.
 		headers := map[string]string{
-			"Accept":        "text/event-stream",
-			"Cache-Control": "no-cache",
+			"Accept":              "text/event-stream",
+			"Cache-Control":       "no-cache",
+			"X-Goog-User-Project": projectID,
 		}
 
 		// If no auth query, use OAuth2 token
@@ -890,8 +899,11 @@ func (provider *VertexProvider) ChatCompletionStream(ctx *schemas.BifrostContext
 			if err != nil {
 				return nil, providerUtils.NewBifrostOperationError("error getting token", err)
 			}
+			// X-Goog-User-Project required for partner publisher offerings
+			// (e.g. openai/gpt-oss-*-maas); see ChatCompletion above.
 			authHeader = map[string]string{
-				"Authorization": "Bearer " + token.AccessToken,
+				"Authorization":       "Bearer " + token.AccessToken,
+				"X-Goog-User-Project": projectID,
 			}
 		}
 
@@ -1291,10 +1303,13 @@ func (provider *VertexProvider) ResponsesStream(ctx *schemas.BifrostContext, pos
 			completeURL = fmt.Sprintf("%s?alt=sse", completeURL)
 		}
 
-		// Prepare headers for Vertex Gemini
+		// Prepare headers for Vertex Gemini.
+		// X-Goog-User-Project is required for partner publisher offerings (and
+		// inert for first-party Google ones); see ChatCompletion above.
 		headers := map[string]string{
-			"Accept":        "text/event-stream",
-			"Cache-Control": "no-cache",
+			"Accept":              "text/event-stream",
+			"Cache-Control":       "no-cache",
+			"X-Goog-User-Project": projectID,
 		}
 
 		// If no auth query, use OAuth2 token
