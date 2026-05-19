@@ -739,10 +739,10 @@ func (c *safeCapture) recordAttempt(r *http.Request) int {
 	c.attemptNum++
 	return c.attemptNum
 }
-func (c *safeCapture) Auth() string     { c.mu.Lock(); defer c.mu.Unlock(); return c.auth }
-func (c *safeCapture) Host() string     { c.mu.Lock(); defer c.mu.Unlock(); return c.host }
-func (c *safeCapture) Path() string     { c.mu.Lock(); defer c.mu.Unlock(); return c.path }
-func (c *safeCapture) Sentinel() bool   { c.mu.Lock(); defer c.mu.Unlock(); return c.sentinel }
+func (c *safeCapture) Auth() string   { c.mu.Lock(); defer c.mu.Unlock(); return c.auth }
+func (c *safeCapture) Host() string   { c.mu.Lock(); defer c.mu.Unlock(); return c.host }
+func (c *safeCapture) Path() string   { c.mu.Lock(); defer c.mu.Unlock(); return c.path }
+func (c *safeCapture) Sentinel() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.sentinel }
 func (c *safeCapture) AuthSeen() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -3678,6 +3678,134 @@ func TestFallbackToUnconfiguredProvider(t *testing.T) {
 	}
 }
 
+// TestRuntimeInjectedFallbacks verifies that fallbacks added by a PreLLMHook
+// during the primary attempt are used by the wrapper fallback loop. Gateway
+// routing plugins attach provider chains this way after resolving runtime agent
+// config; the public request can arrive with no static Fallbacks at all.
+func TestRuntimeInjectedFallbacks(t *testing.T) {
+	const fallbackKey = "sk-runtime-fallback-openai-key"
+
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
+	}))
+	defer primaryServer.Close()
+
+	t.Run("ChatCompletionRequest", func(t *testing.T) {
+		fallbackCap := &safeCapture{}
+		fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fallbackCap.recordAuth(r)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(mockOpenAIChatResponse("gpt-4o-mini"))
+		}))
+		defer fallbackServer.Close()
+
+		account := NewMockAccount()
+		account.AddProviderWithBaseURL(schemas.OpenAI, 10, 100, "http://static-should-not-be-called.invalid/v1")
+
+		plugin := &runtimeFallbacksPlugin{
+			primaryBaseURL:  primaryServer.URL,
+			fallbackKey:     fallbackKey,
+			fallbackBaseURL: fallbackServer.URL,
+		}
+
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		bf, err := Init(ctx, schemas.BifrostConfig{
+			Account:    account,
+			Logger:     NewDefaultLogger(schemas.LogLevelError),
+			LLMPlugins: []schemas.LLMPlugin{plugin},
+		})
+		if err != nil {
+			t.Fatalf("Init failed: %v", err)
+		}
+		t.Cleanup(func() { bf.Shutdown() })
+
+		content := schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")}
+		reqCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		resp, bifrostErr := bf.ChatCompletionRequest(reqCtx, &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o",
+			Input:    []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &content}},
+		})
+		if bifrostErr != nil {
+			t.Fatalf("expected runtime-injected fallback to succeed, got error: %v", bifrostErr)
+		}
+		if resp == nil {
+			t.Fatal("expected non-nil response from fallback")
+		}
+		if got := fallbackCap.Auth(); got != "Bearer "+fallbackKey {
+			t.Errorf("fallback Authorization header: got %q, want %q", got, "Bearer "+fallbackKey)
+		}
+	})
+
+	t.Run("ChatCompletionStreamRequest", func(t *testing.T) {
+		fallbackCap := &safeCapture{}
+		sseBody := "data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\"," +
+			"\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"," +
+			"\"content\":\"hi\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\"," +
+			"\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{}," +
+			"\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3," +
+			"\"completion_tokens\":1,\"total_tokens\":4}}\n\n" +
+			"data: [DONE]\n\n"
+		fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fallbackCap.recordAuth(r)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(sseBody))
+		}))
+		defer fallbackServer.Close()
+
+		account := NewMockAccount()
+		account.AddProviderWithBaseURL(schemas.OpenAI, 10, 100, "http://static-should-not-be-called.invalid/v1")
+
+		plugin := &runtimeFallbacksPlugin{
+			primaryBaseURL:  primaryServer.URL,
+			fallbackKey:     fallbackKey,
+			fallbackBaseURL: fallbackServer.URL,
+		}
+
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		bf, err := Init(ctx, schemas.BifrostConfig{
+			Account:    account,
+			Logger:     NewDefaultLogger(schemas.LogLevelError),
+			LLMPlugins: []schemas.LLMPlugin{plugin},
+		})
+		if err != nil {
+			t.Fatalf("Init failed: %v", err)
+		}
+		t.Cleanup(func() { bf.Shutdown() })
+
+		content := schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")}
+		reqCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ch, bifrostErr := bf.ChatCompletionStreamRequest(reqCtx, &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o",
+			Input:    []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &content}},
+		})
+		if bifrostErr != nil {
+			t.Fatalf("expected runtime-injected streaming fallback to start, got error: %v", bifrostErr)
+		}
+		if ch == nil {
+			t.Fatal("expected non-nil stream channel")
+		}
+
+		var streamErr *schemas.BifrostError
+		for chunk := range ch {
+			if chunk.BifrostError != nil {
+				streamErr = chunk.BifrostError
+			}
+		}
+		if streamErr != nil {
+			t.Fatalf("stream returned error: %v", streamErr)
+		}
+		if got := fallbackCap.Auth(); got != "Bearer "+fallbackKey {
+			t.Errorf("fallback Authorization header: got %q, want %q", got, "Bearer "+fallbackKey)
+		}
+	})
+}
+
 // TestBifrostRequestClone verifies that Clone returns an independent copy: mutations
 // to scalar fields (Provider, Model) and ProviderOverride on the clone do not affect
 // the original, and vice versa.
@@ -3810,6 +3938,32 @@ func (p *fallbackOverridePlugin) PreLLMHook(ctx *schemas.BifrostContext, req *sc
 }
 
 func (p *fallbackOverridePlugin) PostLLMHook(_ *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
+	return resp, bifrostErr, nil
+}
+
+type runtimeFallbacksPlugin struct {
+	primaryBaseURL  string
+	fallbackKey     string
+	fallbackBaseURL string
+}
+
+func (p *runtimeFallbacksPlugin) GetName() string { return "runtime-fallbacks-test-plugin" }
+func (p *runtimeFallbacksPlugin) Cleanup() error  { return nil }
+
+func (p *runtimeFallbacksPlugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
+	idx, _ := ctx.Value(schemas.BifrostContextKeyFallbackIndex).(int)
+	if idx == 0 {
+		req.UpdateProviderBaseURL(p.primaryBaseURL)
+		req.SetFallbacks([]schemas.Fallback{{Provider: schemas.OpenAI, Model: "gpt-4o-mini"}})
+		return req, nil, nil
+	}
+
+	req.UpdateAPIKey(schemas.Key{Value: *schemas.NewEnvVar(p.fallbackKey)})
+	req.UpdateProviderBaseURL(p.fallbackBaseURL)
+	return req, nil, nil
+}
+
+func (p *runtimeFallbacksPlugin) PostLLMHook(_ *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
 	return resp, bifrostErr, nil
 }
 

@@ -4446,6 +4446,10 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		return primaryResult, primaryErr
 	}
 
+	// PreLLMHook may attach fallbacks after the wrapper captures request
+	// fields above. Refresh from the mutated request before iterating.
+	_, _, fallbacks = req.GetRequestFields()
+
 	// Try fallbacks in order
 	for i, fallback := range fallbacks {
 		ctx.SetValue(schemas.BifrostContextKeyFallbackIndex, i+1)
@@ -4521,6 +4525,10 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 	if !shouldTryFallbacks {
 		return primaryResult, primaryErr
 	}
+
+	// PreLLMHook may attach fallbacks after the wrapper captures request
+	// fields above. Refresh from the mutated request before iterating.
+	_, _, fallbacks = req.GetRequestFields()
 
 	// Try fallbacks in order
 	for i, fallback := range fallbacks {
