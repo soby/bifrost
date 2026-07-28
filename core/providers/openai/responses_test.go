@@ -480,6 +480,10 @@ func TestToOpenAIResponsesRequest_GPTOSS_SummaryToContentBlocks(t *testing.T) {
 		message           schemas.ResponsesMessage
 		expectedBlocks    int
 		expectedBlockText string
+		// OpenAI accepts `role` only on message input items, so ToOpenAIResponsesRequest
+		// strips it from a reasoning item that carries no explicit type. Set this for
+		// those cases: the role is expected to be dropped, not preserved.
+		expectRoleDropped bool
 		description       string
 	}{
 		{
@@ -533,6 +537,9 @@ func TestToOpenAIResponsesRequest_GPTOSS_SummaryToContentBlocks(t *testing.T) {
 			},
 			expectedBlocks:    1,
 			expectedBlockText: "existing content",
+			// Typeless reasoning item, so role is stripped here too — the strip
+			// happens before the summary-conversion branch is chosen.
+			expectRoleDropped: true,
 			description:       "gpt-oss model should preserve message when Content already exists",
 		},
 		{
@@ -552,6 +559,8 @@ func TestToOpenAIResponsesRequest_GPTOSS_SummaryToContentBlocks(t *testing.T) {
 			},
 			expectedBlocks:    1,
 			expectedBlockText: "variant summary",
+			// No explicit Type on a reasoning item, so role is stripped.
+			expectRoleDropped: true,
 			description:       "gpt-oss variant model should also convert Summary to ContentBlocks",
 		},
 	}
@@ -611,9 +620,6 @@ func TestToOpenAIResponsesRequest_GPTOSS_SummaryToContentBlocks(t *testing.T) {
 				if tt.message.Status != nil && (resultMsg.Status == nil || *resultMsg.Status != *tt.message.Status) {
 					t.Errorf("Expected Status to be preserved")
 				}
-				if tt.message.Role != nil && (resultMsg.Role == nil || *resultMsg.Role != *tt.message.Role) {
-					t.Errorf("Expected Role to be preserved")
-				}
 			} else {
 				// For other cases, verify message is preserved as-is
 				if resultMsg.Content != nil && len(resultMsg.Content.ContentBlocks) > 0 {
@@ -621,6 +627,18 @@ func TestToOpenAIResponsesRequest_GPTOSS_SummaryToContentBlocks(t *testing.T) {
 						t.Errorf("Expected ContentBlock text to be preserved as %q", tt.expectedBlockText)
 					}
 				}
+			}
+
+			// Role handling is asserted for every case, not just the
+			// summary-conversion one: the converter strips role from any non-message
+			// item before it reaches either branch, so scoping this check to
+			// Content == nil would leave the existing-content path unverified.
+			if tt.expectRoleDropped {
+				if resultMsg.Role != nil {
+					t.Errorf("Expected Role to be dropped for a typeless reasoning item, got %q", *resultMsg.Role)
+				}
+			} else if tt.message.Role != nil && (resultMsg.Role == nil || *resultMsg.Role != *tt.message.Role) {
+				t.Errorf("Expected Role to be preserved")
 			}
 		})
 	}
@@ -2224,6 +2242,66 @@ func TestToOpenAIResponsesRequest_DefaultsImageDetail(t *testing.T) {
 	original := bifrostReq.Input[0].Content.ContentBlocks[1].ResponsesInputMessageContentBlockImage
 	if original.Detail != nil {
 		t.Errorf("caller's input was mutated: detail = %q", *original.Detail)
+	}
+}
+
+// TestToOpenAIResponsesRequest_DefaultsStrictOnFunctionTools verifies function tools
+// leave with an explicit strict rather than null. OpenAI resolves a null strict to
+// false, but strict-pydantic upstreams (sglang's ResponseTool.strict is a non-Optional
+// bool) reject the null with a bool_type validation error. Explicit caller values are
+// preserved and the caller's tools are never mutated.
+func TestToOpenAIResponsesRequest_DefaultsStrictOnFunctionTools(t *testing.T) {
+	bifrostReq := &schemas.BifrostResponsesRequest{
+		Model: "glm-5.2",
+		Input: []schemas.ResponsesMessage{{
+			Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+			Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("hi")},
+		}},
+		Params: &schemas.ResponsesParameters{
+			Tools: []schemas.ResponsesTool{
+				{
+					Type: schemas.ResponsesToolTypeFunction,
+					Name: schemas.Ptr("Bash"),
+					ResponsesToolFunction: &schemas.ResponsesToolFunction{
+						Parameters: &schemas.ToolFunctionParameters{Type: "object"},
+					},
+				},
+				{
+					Type: schemas.ResponsesToolTypeFunction,
+					Name: schemas.Ptr("Grep"),
+					ResponsesToolFunction: &schemas.ResponsesToolFunction{
+						Parameters: &schemas.ToolFunctionParameters{Type: "object"},
+						Strict:     schemas.Ptr(true),
+					},
+				},
+			},
+		},
+	}
+
+	req := ToOpenAIResponsesRequest(nil, bifrostReq)
+	if req == nil {
+		t.Fatal("converted request is nil")
+	}
+
+	if req.Tools[0].ResponsesToolFunction.Strict == nil || *req.Tools[0].ResponsesToolFunction.Strict {
+		t.Errorf("nil strict not defaulted to false: %v", req.Tools[0].ResponsesToolFunction.Strict)
+	}
+	if req.Tools[1].ResponsesToolFunction.Strict == nil || !*req.Tools[1].ResponsesToolFunction.Strict {
+		t.Errorf("explicit strict not preserved: %v", req.Tools[1].ResponsesToolFunction.Strict)
+	}
+
+	// Wire-level: no tool may carry a null strict.
+	data, err := sonic.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal converted request: %v", err)
+	}
+	if strings.Contains(string(data), `"strict":null`) {
+		t.Errorf("wire JSON carries a null strict: %s", data)
+	}
+
+	// Caller's tools must remain untouched.
+	if bifrostReq.Params.Tools[0].ResponsesToolFunction.Strict != nil {
+		t.Error("caller's tools were mutated")
 	}
 }
 

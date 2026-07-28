@@ -1591,12 +1591,16 @@ func (h *GovernanceHandler) mutateVirtualKeyBudgetOverride(ctx *fasthttp.Request
 		}
 	}
 
+	// IsCalendarAligned was stamped onto the budget by the virtual key's AfterFind
+	// during loadVirtualKeyBudget, and the store needs it to anchor a finite grant
+	// on the same lattice the budget actually resets on.
 	budget, err = h.configStore.UpdateBudgetOverride(
 		ctx,
 		budget.ID,
 		budget.OverrideAmount,
 		budget.OverrideMode,
 		budget.OverrideCyclesRemaining,
+		budget.IsCalendarAligned,
 	)
 	if err != nil {
 		if errors.Is(err, configstore.ErrNotFound) {
@@ -4354,6 +4358,7 @@ func (h *GovernanceHandler) deleteRoutingRule(ctx *fasthttp.RequestCtx) {
 type CreatePricingOverrideRequest struct {
 	Name          string                      `json:"name"`
 	ScopeKind     modelcatalog.ScopeKind      `json:"scope_kind"`
+	UserID        *string                     `json:"user_id,omitempty"`
 	VirtualKeyID  *string                     `json:"virtual_key_id,omitempty"`
 	ProviderID    *string                     `json:"provider_id,omitempty"`
 	ProviderKeyID *string                     `json:"provider_key_id,omitempty"`
@@ -4391,6 +4396,7 @@ func (n *nullableString) UnmarshalJSON(b []byte) error {
 type UpdatePricingOverrideRequest struct {
 	Name          *string                      `json:"name,omitempty"`
 	ScopeKind     *modelcatalog.ScopeKind      `json:"scope_kind,omitempty"`
+	UserID        nullableString               `json:"user_id"`
 	VirtualKeyID  nullableString               `json:"virtual_key_id"`
 	ProviderID    nullableString               `json:"provider_id"`
 	ProviderKeyID nullableString               `json:"provider_key_id"`
@@ -4402,9 +4408,12 @@ type UpdatePricingOverrideRequest struct {
 
 func (h *GovernanceHandler) getPricingOverrides(ctx *fasthttp.RequestCtx) {
 	// Parse filter parameters
-	var scopeKind, virtualKeyID, providerID, providerKeyID *string
+	var scopeKind, userID, virtualKeyID, providerID, providerKeyID *string
 	if v := strings.TrimSpace(string(ctx.QueryArgs().Peek("scope_kind"))); v != "" {
 		scopeKind = &v
+	}
+	if v := strings.TrimSpace(string(ctx.QueryArgs().Peek("user_id"))); v != "" {
+		userID = &v
 	}
 	if v := strings.TrimSpace(string(ctx.QueryArgs().Peek("virtual_key_id"))); v != "" {
 		virtualKeyID = &v
@@ -4425,6 +4434,7 @@ func (h *GovernanceHandler) getPricingOverrides(ctx *fasthttp.RequestCtx) {
 		params := configstore.PricingOverridesQueryParams{
 			Search:        search,
 			ScopeKind:     scopeKind,
+			UserID:        userID,
 			VirtualKeyID:  virtualKeyID,
 			ProviderID:    providerID,
 			ProviderKeyID: providerKeyID,
@@ -4474,6 +4484,7 @@ func (h *GovernanceHandler) getPricingOverrides(ctx *fasthttp.RequestCtx) {
 	// Non-paginated path: return all matching overrides (backward compatible)
 	filters := configstore.PricingOverrideFilters{
 		ScopeKind:     scopeKind,
+		UserID:        userID,
 		VirtualKeyID:  virtualKeyID,
 		ProviderID:    providerID,
 		ProviderKeyID: providerKeyID,
@@ -4509,6 +4520,7 @@ func (h *GovernanceHandler) createPricingOverride(ctx *fasthttp.RequestCtx) {
 
 	shape := modelcatalog.PricingOverride{
 		ScopeKind:     req.ScopeKind,
+		UserID:        req.UserID,
 		VirtualKeyID:  req.VirtualKeyID,
 		ProviderID:    req.ProviderID,
 		ProviderKeyID: req.ProviderKeyID,
@@ -4532,6 +4544,7 @@ func (h *GovernanceHandler) createPricingOverride(ctx *fasthttp.RequestCtx) {
 		ID:               uuid.NewString(),
 		Name:             name,
 		ScopeKind:        string(req.ScopeKind),
+		UserID:           normalizeOptionalString(req.UserID),
 		VirtualKeyID:     normalizeOptionalString(req.VirtualKeyID),
 		ProviderID:       normalizeOptionalString(req.ProviderID),
 		ProviderKeyID:    normalizeOptionalString(req.ProviderKeyID),
@@ -4583,6 +4596,7 @@ func (h *GovernanceHandler) updatePricingOverride(ctx *fasthttp.RequestCtx) {
 	// Merge request fields onto the existing record; omitted fields keep their current values.
 	merged := modelcatalog.PricingOverride{
 		ScopeKind:     modelcatalog.ScopeKind(existing.ScopeKind),
+		UserID:        existing.UserID,
 		VirtualKeyID:  existing.VirtualKeyID,
 		ProviderID:    existing.ProviderID,
 		ProviderKeyID: existing.ProviderKeyID,
@@ -4594,9 +4608,13 @@ func (h *GovernanceHandler) updatePricingOverride(ctx *fasthttp.RequestCtx) {
 		merged.ScopeKind = *req.ScopeKind
 		// Changing scope_kind resets all scope IDs; only what the request
 		// explicitly provides will be kept.
+		merged.UserID = nil
 		merged.VirtualKeyID = nil
 		merged.ProviderID = nil
 		merged.ProviderKeyID = nil
+	}
+	if req.UserID.Set {
+		merged.UserID = req.UserID.Value
 	}
 	if req.VirtualKeyID.Set {
 		merged.VirtualKeyID = req.VirtualKeyID.Value
@@ -4647,6 +4665,7 @@ func (h *GovernanceHandler) updatePricingOverride(ctx *fasthttp.RequestCtx) {
 		ID:               id,
 		Name:             nameStr,
 		ScopeKind:        string(merged.ScopeKind),
+		UserID:           normalizeOptionalString(merged.UserID),
 		VirtualKeyID:     normalizeOptionalString(merged.VirtualKeyID),
 		ProviderID:       normalizeOptionalString(merged.ProviderID),
 		ProviderKeyID:    normalizeOptionalString(merged.ProviderKeyID),
@@ -4721,6 +4740,7 @@ var validRoutingScopes = map[string]bool{
 	"team":        true,
 	"customer":    true,
 	"virtual_key": true,
+	"user":        true,
 }
 
 // errRoutingScopeIDNotFound marks a validateRoutingScopeID failure as a genuine
@@ -4756,6 +4776,10 @@ func (h *GovernanceHandler) validateRoutingScopeID(ctx context.Context, scope st
 			}
 			return fmt.Errorf("failed to verify customer: %w", err)
 		}
+	case "user":
+		// User ids live outside the config store (they arrive on requests via
+		// the resolved identity context), so existence cannot be verified
+		// here; the id is matched at eval time against the calling user.
 	}
 	return nil
 }
@@ -4778,7 +4802,7 @@ func validateRoutingScope(scope string) error {
 		return nil // Empty scope will default to "global" later
 	}
 	if !validRoutingScopes[scope] {
-		return fmt.Errorf("invalid scope %q: must be one of: global, team, customer, virtual_key", scope)
+		return fmt.Errorf("invalid scope %q: must be one of: global, team, customer, virtual_key, user", scope)
 	}
 	return nil
 }

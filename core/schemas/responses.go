@@ -522,6 +522,12 @@ type ResponsesParameters struct {
 	Tools                []ResponsesTool               `json:"tools,omitempty"`       // Tools to use
 	Truncation           *string                       `json:"truncation,omitempty"`
 	User                 *string                       `json:"user,omitempty"`
+
+	// Opts into running built-in server-side tools (e.g. Google Search) in the same
+	// turn as function declarations. Required by Gemini 3+, which otherwise rejects
+	// the combination; providers without the concept ignore it.
+	IncludeServerSideToolInvocations *bool `json:"include_server_side_tool_invocations,omitempty"`
+
 	// Dynamic parameters that can be provider-specific, they are directly
 	// added to the request as is.
 	ExtraParams map[string]interface{} `json:"-"`
@@ -1229,6 +1235,10 @@ type ResponsesMessage struct {
 	// not ResponsesMCPListTools.Tools, because the entries are ResponsesTool-shaped.
 	ToolSearchOutputTools json.RawMessage `json:"-"`
 
+	// Tools declared by a codex additional_tools item, surfaced so providers that
+	// reject the item type can hoist them into the top-level tools param.
+	AdditionalTools json.RawMessage `json:"-"`
+
 	*ResponsesToolMessage // For Tool calls and outputs
 
 	CacheControl *CacheControl `json:"cache_control,omitempty"` // Carries cache_control for function_call and function_call_output message types
@@ -1283,6 +1293,29 @@ func (m *ResponsesMessage) UnmarshalJSON(data []byte) error {
 		// consumers that read Arguments keep working; MarshalJSON still re-emits the
 		// preserved bytes verbatim, so this is additive and does not affect round-trip.
 		m.setToolArguments(json.RawMessage(gjson.GetBytes(data, "arguments").Raw))
+		// Same rationale for `execution`: Codex reads it to decide whether to
+		// dispatch the call client-side, and returning early here skips the
+		// field-level decode that would otherwise populate it.
+		if execution := gjson.GetBytes(data, "execution"); execution.Type == gjson.String && execution.String() != "" {
+			if m.ResponsesToolMessage == nil {
+				m.ResponsesToolMessage = &ResponsesToolMessage{}
+			}
+			m.Execution = Ptr(execution.String())
+		}
+		// tool_search_output carries the discovered tool list; surface it for the
+		// same reason. Held as raw JSON because the embedded ResponsesMCPListTools
+		// decode drops the per-tool type discriminator.
+		if t == string(ResponsesMessageTypeToolSearchOutput) {
+			if tools := gjson.GetBytes(data, "tools"); tools.IsArray() {
+				m.ToolSearchOutputTools = json.RawMessage(tools.Raw)
+			}
+		}
+		// additional_tools carries the codex tool declarations; same rationale.
+		if t == string(ResponsesMessageTypeAdditionalTools) {
+			if tools := gjson.GetBytes(data, "tools"); tools.IsArray() {
+				m.AdditionalTools = json.RawMessage(tools.Raw)
+			}
+		}
 		m.rawPreserved = append([]byte(nil), data...)
 		return nil
 	}
@@ -1349,6 +1382,15 @@ func responsesToolArgumentsToString(raw json.RawMessage) string {
 // normalizes both forms into the internal string field.
 func (m ResponsesMessage) MarshalJSON() ([]byte, error) {
 	type Alias ResponsesMessage
+
+	// Items decoded through the raw-preserved fast path are re-emitted byte for
+	// byte. That path deliberately skips field-level decoding, so the struct holds
+	// only Type plus the few fields surfaced for downstream readers — marshalling
+	// from those fields would silently drop everything else on the item (id,
+	// status, call_id, per-tool type discriminators), which OpenAI then rejects.
+	if len(m.rawPreserved) > 0 {
+		return append([]byte(nil), m.rawPreserved...), nil
+	}
 
 	// Re-emit the raw tools captured during unmarshal so the type discriminator survives.
 	if m.Type != nil && *m.Type == ResponsesMessageTypeToolSearchOutput {

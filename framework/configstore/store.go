@@ -187,6 +187,7 @@ type OAuth2SessionsQueryParams struct {
 // PricingOverrideFilters holds the filters for pricing overrides.
 type PricingOverrideFilters struct {
 	ScopeKind     *string
+	UserID        *string
 	VirtualKeyID  *string
 	ProviderID    *string
 	ProviderKeyID *string
@@ -198,6 +199,7 @@ type PricingOverridesQueryParams struct {
 	Offset        int
 	Search        string
 	ScopeKind     *string
+	UserID        *string
 	VirtualKeyID  *string
 	ProviderID    *string
 	ProviderKeyID *string
@@ -354,7 +356,13 @@ type ConfigStore interface {
 	CreateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
 	UpdateBudget(ctx context.Context, budget *tables.TableBudget, tx ...*gorm.DB) error
 	// UpdateBudgetOverride updates only the override state and returns the refreshed budget.
-	UpdateBudgetOverride(ctx context.Context, id string, amount float64, mode tables.BudgetOverrideMode, cyclesRemaining int, tx ...*gorm.DB) (*tables.TableBudget, error)
+	//
+	// A finite grant is anchored at the budget's current window boundary so every
+	// cluster node derives the same remaining-cycle count from it. calendarAligned
+	// must come from the owning entity (virtual key, team, customer or access
+	// profile) because the budget row does not persist it, and getting it wrong
+	// anchors the grant on the wrong lattice.
+	UpdateBudgetOverride(ctx context.Context, id string, amount float64, mode tables.BudgetOverrideMode, cyclesTotal int, calendarAligned bool, tx ...*gorm.DB) (*tables.TableBudget, error)
 	UpdateBudgets(ctx context.Context, budgets []*tables.TableBudget, tx ...*gorm.DB) error
 	DeleteBudget(ctx context.Context, id string, tx ...*gorm.DB) error
 	UpdateBudgetUsage(ctx context.Context, id string, currentUsage float64, tx ...*gorm.DB) error
@@ -680,6 +688,7 @@ type ConfigStore interface {
 	CreateSidekiqJob(ctx context.Context, job *tables.TableSidekiqJob) error
 	GetSidekiqJob(ctx context.Context, id string) (*tables.TableSidekiqJob, error)
 	ClaimSidekiqJob(ctx context.Context, id, runnerID string, staleBefore time.Time) (bool, error)
+	ClaimPartitionedSidekiqJob(ctx context.Context, id, runnerID string, staleBefore time.Time, partitioningKey string, createdAt time.Time) (bool, error)
 	HeartbeatSidekiqJob(ctx context.Context, id, runnerID string) (bool, error)
 	UpdateSidekiqJobProgress(ctx context.Context, id, runnerID, metadata string) error
 	CompleteSidekiqJob(ctx context.Context, id, runnerID, metadata string) error
