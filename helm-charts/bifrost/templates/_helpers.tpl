@@ -822,6 +822,9 @@ false
 {{- if .Values.storage.configStore.maxOpenConns }}
 {{- $_ := set $pgConfig "max_open_conns" (.Values.storage.configStore.maxOpenConns | int) }}
 {{- end }}
+{{- if .Values.storage.configStore.connMaxIdleTime }}
+{{- $_ := set $pgConfig "conn_max_idle_time" .Values.storage.configStore.connMaxIdleTime }}
+{{- end }}
 {{- $configStore := dict "enabled" true "type" "postgres" "config" $pgConfig }}
 {{- $_ := set $config "config_store" $configStore }}
 {{- else }}
@@ -888,6 +891,12 @@ false
 {{- end }}
 {{- if .Values.storage.logsStore.matviewRefreshInterval }}
 {{- $_ := set $pgConfig "matview_refresh_interval" .Values.storage.logsStore.matviewRefreshInterval }}
+{{- end }}
+{{- if .Values.storage.logsStore.matviewRefreshTimeout }}
+{{- $_ := set $pgConfig "matview_refresh_timeout" .Values.storage.logsStore.matviewRefreshTimeout }}
+{{- end }}
+{{- if .Values.storage.logsStore.connMaxIdleTime }}
+{{- $_ := set $pgConfig "conn_max_idle_time" .Values.storage.logsStore.connMaxIdleTime }}
 {{- end }}
 {{- $logsStore := dict "enabled" true "type" "postgres" "config" $pgConfig }}
 {{- if .Values.storage.logsStore.writer }}
@@ -1370,6 +1379,9 @@ false
 {{- end }}
 {{- if $inputConfig.protocol }}
 {{- $_ := set $otelConfig "protocol" $inputConfig.protocol }}
+{{- end }}
+{{- if $inputConfig.export_timeout }}
+{{- $_ := set $otelConfig "export_timeout" ($inputConfig.export_timeout | int) }}
 {{- end }}
 {{- if hasKey $inputConfig "metrics_enabled" }}
 {{- $_ := set $otelConfig "metrics_enabled" $inputConfig.metrics_enabled }}
