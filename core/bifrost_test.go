@@ -5567,7 +5567,7 @@ func findPrivateIPv4(t *testing.T) string {
 			return ip.String()
 		}
 	}
-	t.Fatal("no RFC 1918 IPv4 interface address found — cannot exercise the private-IP dial policy")
+	t.Skip("no RFC 1918 IPv4 interface address found — cannot exercise the private-IP dial policy")
 	return ""
 }
 

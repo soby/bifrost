@@ -4820,8 +4820,9 @@ func (bifrost *Bifrost) RunRealtimeTurnPreHooks(ctx *schemas.BifrostContext, req
 
 // getProviderByKey retrieves a provider instance from the providers array by its provider key.
 // Returns the provider if found, or nil if no provider with the given key exists.
-// NOTE: This helper is used only from test code. Production request paths use
-// getProviderQueue, which also handles auto-initialisation of dynamic providers.
+// NOTE: This helper is shared by test code and the public GetProviderByKey
+// getter. Production request paths use getProviderQueue, which also handles
+// auto-initialisation of dynamic providers.
 func (bifrost *Bifrost) getProviderByKey(providerKey schemas.ModelProvider) schemas.Provider {
 	providers := bifrost.providers.Load()
 	if providers == nil {
@@ -6092,7 +6093,7 @@ func executeRequestWithRetries[T any](
 				}
 				keyNote = fmt.Sprintf("; %s=%s", rotationNote, currentKey.Name)
 			}
-			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Retry %d/%d for %s/%s (previous attempt failed: %s%s)", attempts, config.NetworkConfig.MaxRetries, providerKey, model, routingErrorSummary(bifrostError), keyNote))
+			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Retry %d/%d for %s/%s (previous attempt failed: %s%s)", attempts, effectiveConfig.NetworkConfig.MaxRetries, providerKey, model, routingErrorSummary(bifrostError), keyNote))
 
 			if !(lastWasPermanentKeyFailure && keyChanged) {
 				// effectiveConfig (not config) so per-request backoff overrides apply.
@@ -6434,7 +6435,7 @@ func executeRequestWithRetries[T any](
 		// different key — this avoids false positives for fixed-key providers whose keyProvider
 		// is non-nil but returns the same key. Network-error retries reuse the same key, and
 		// terminal attempts (attempts == MaxRetries) won't run another iteration.
-		if lastWasPerKeyFailure && keyProvider != nil && attempts < config.NetworkConfig.MaxRetries {
+		if lastWasPerKeyFailure && keyProvider != nil && attempts < effectiveConfig.NetworkConfig.MaxRetries {
 			if trail, ok := ctx.Value(schemas.BifrostContextKeyAttemptTrail).([]schemas.KeyAttemptRecord); ok && len(trail) > 0 {
 				pendingRotationAttemptIdx = len(trail) - 1
 			}
