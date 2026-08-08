@@ -64,6 +64,20 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 	}
 
 	switch bifrostReq.Provider {
+	case schemas.OpenRouter:
+		// OpenRouter accepts structured reasoning_details on assistant messages.
+		// The generic converter leaves this provider extension unset so it cannot
+		// be sent to providers that reject unknown assistant-message fields.
+		for i := range openaiReq.Messages {
+			if i >= len(bifrostReq.Input) {
+				break
+			}
+			if assistant := bifrostReq.Input[i].ChatAssistantMessage; assistant != nil {
+				openaiReq.Messages[i].ReasoningDetails = assistant.ReasoningDetails
+			}
+		}
+		openaiReq.filterOpenAISpecificParameters(capModel)
+		return openaiReq
 	case schemas.OpenAI, schemas.Azure:
 		openaiReq.normalizeReasoningEffort(capModel)
 		return openaiReq
@@ -214,6 +228,7 @@ func (req *OpenAIChatRequest) stripReasoningDetails() {
 			continue
 		}
 		assistantMessage.Reasoning = nil
+		assistantMessage.ReasoningAlias = nil
 		assistantMessage.ReasoningDetails = nil
 	}
 }
