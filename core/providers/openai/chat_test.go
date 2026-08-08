@@ -1602,3 +1602,27 @@ func TestToOpenAIChatRequest_DoesNotEmitInboundReasoningAliases(t *testing.T) {
 		})
 	}
 }
+
+func TestToOpenAIChatRequest_OpenRouterEmitsReasoningDetails(t *testing.T) {
+	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
+	defer cancel()
+
+	reasoning, signature := "step by step", "sig-123"
+	req := ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+		Provider: schemas.OpenRouter,
+		Model:    "anthropic/claude-sonnet-4-5",
+		Input: []schemas.ChatMessage{{
+			Role: schemas.ChatMessageRoleAssistant,
+			ChatAssistantMessage: &schemas.ChatAssistantMessage{
+				ReasoningDetails: []schemas.ChatReasoningDetails{{
+					Index: 0, Type: schemas.BifrostReasoningDetailsTypeText,
+					Text: &reasoning, Signature: &signature,
+				}},
+			},
+		}},
+	})
+
+	require.Len(t, req.Messages, 1)
+	require.Len(t, req.Messages[0].ReasoningDetails, 1)
+	require.Equal(t, signature, *req.Messages[0].ReasoningDetails[0].Signature)
+}
