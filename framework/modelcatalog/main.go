@@ -29,6 +29,7 @@ type ModelCatalog struct {
 	configStore            configstore.ConfigStore
 	distributedLockManager *configstore.DistributedLockManager
 	logger                 schemas.Logger
+	automaticSyncEnabled   bool
 
 	datasheet *datasheet.Store
 	live      *live.Store
@@ -53,6 +54,10 @@ type ModelCatalog struct {
 }
 
 func Init(ctx context.Context, config *Config, configStore configstore.ConfigStore, logger schemas.Logger) (*ModelCatalog, error) {
+	automaticSyncEnabled := true
+	if config != nil && config.AutomaticSyncEnabled != nil {
+		automaticSyncEnabled = *config.AutomaticSyncEnabled
+	}
 	pricingURL := DefaultPricingURL
 	if config != nil && config.PricingURL != nil {
 		pricingURL = *config.PricingURL
@@ -83,6 +88,7 @@ func Init(ctx context.Context, config *Config, configStore configstore.ConfigSto
 		mcpLibrarySyncInterval: mcpLibrarySyncInterval,
 		configStore:            configStore,
 		logger:                 logger,
+		automaticSyncEnabled:   automaticSyncEnabled,
 		distributedLockManager: configstore.NewDistributedLockManager(configStore, logger, configstore.WithDefaultTTL(30*time.Second)),
 		datasheet: datasheet.New(configStore, logger, datasheet.Config{
 			URL:                pricingURL,
@@ -132,7 +138,27 @@ func Init(ctx context.Context, config *Config, configStore configstore.ConfigSto
 				IsVertexMultiRegionOnly: p.VertexMultiRegionOnly,
 			}
 		})
+	}
 
+	if !automaticSyncEnabled {
+		logger.Info("automatic model catalog sync disabled; loading stored data only")
+		if configStore != nil {
+			if err := mc.datasheet.LoadFromDB(ctx); err != nil {
+				return nil, fmt.Errorf("failed to load initial pricing data: %w", err)
+			}
+			if _, err := mc.datasheet.LoadModelParamsFromDB(ctx); err != nil {
+				return nil, fmt.Errorf("failed to load initial model parameters: %w", err)
+			}
+		}
+		mc.datasheet.MarkSynced(time.Now())
+		if err := mc.datasheet.LoadOverridesFromStore(ctx); err != nil {
+			return nil, fmt.Errorf("failed to load pricing overrides: %w", err)
+		}
+		initSucceeded = true
+		return mc, nil
+	}
+
+	if configStore != nil {
 		var wg sync.WaitGroup
 		var pricingErr, paramsErr error
 		wg.Add(2)
@@ -325,6 +351,16 @@ func (mc *ModelCatalog) UpdateSyncConfig(ctx context.Context, config *Config) er
 		ModelParametersURL: modelParametersURL,
 		SyncInterval:       syncInterval,
 	})
+
+	automaticSyncEnabled := true
+	if config != nil && config.AutomaticSyncEnabled != nil {
+		automaticSyncEnabled = *config.AutomaticSyncEnabled
+	}
+	mc.automaticSyncEnabled = automaticSyncEnabled
+	if !automaticSyncEnabled {
+		mc.datasheet.MarkSynced(time.Now())
+		return mc.ReloadFromDB(ctx)
+	}
 
 	mc.syncCtx, mc.syncCancel = context.WithCancel(ctx)
 	mc.startSyncWorker(mc.syncCtx)
