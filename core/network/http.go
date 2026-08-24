@@ -680,6 +680,12 @@ func (f *HTTPClientFactory) newFasthttpBaseClient(purpose ClientPurpose) *fastht
 // connection reused from the pool: contextTransport.RoundTrip reports failures
 // on a freshly dialed socket with retry=false, so a real upstream failure is
 // counted against Bifrost's own max_retries instead of being retried here.
+//
+// The callback must return resetTimeout=false. fasthttp interprets true as "grant the
+// retry a fresh copy of the original Request timeout". A nominal 300s provider deadline
+// could therefore become 900s or longer after consecutive EOF/closed-connection failures,
+// even when Bifrost MaxRetries was zero. Stale retries share the caller's original absolute
+// deadline; they are transport recovery, not a new provider attempt budget.
 const maxStaleConnRetries = 3
 
 func StaleConnectionRetryIfErr(_ *fasthttp.Request, attempts int, err error) (resetTimeout bool, retry bool) {
@@ -704,7 +710,7 @@ func StaleConnectionRetryIfErr(_ *fasthttp.Request, attempts int, err error) (re
 		strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "use of closed network connection") ||
 		strings.Contains(errStr, "server closed connection") {
-		return true, true
+		return false, true
 	}
 	return false, false
 }
