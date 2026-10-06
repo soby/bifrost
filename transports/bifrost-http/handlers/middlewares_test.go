@@ -13,6 +13,7 @@ import (
 	"net"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -4566,4 +4567,54 @@ func (p *capturePluginLogsPlugin) Inject(_ context.Context, trace *schemas.Trace
 		}
 	}
 	return nil
+}
+
+// TestCorsMiddleware_AccessLogQuietPaths asserts that a quiet path is logged only
+// when its response fails, and that other paths are unaffected.
+func TestCorsMiddleware_AccessLogQuietPaths(t *testing.T) {
+	previous := accessLogQuietPaths
+	accessLogQuietPaths = parseAccessLogPaths(" /api/plugins/loaded, ,/probe ")
+	defer func() { accessLogQuietPaths = previous }()
+
+	config := &lib.Config{
+		ClientConfig: &configstore.ClientConfig{
+			AllowedOrigins: []string{},
+		},
+	}
+	cors := NewCorsMiddleware(config).Middleware()
+
+	cases := []struct {
+		uri    string
+		status int
+		logged bool
+	}{
+		{"/api/plugins/loaded", fasthttp.StatusOK, false},
+		{"/probe/live", fasthttp.StatusNoContent, false},
+		{"/api/plugins/loaded", fasthttp.StatusServiceUnavailable, true},
+		{"/probe", fasthttp.StatusNotFound, true},
+		{"/api/plugins", fasthttp.StatusOK, true},
+		{"/v1/chat/completions", fasthttp.StatusOK, true},
+	}
+	for _, tc := range cases {
+		logger := &captureLogger{}
+		SetLogger(logger)
+		ctx := &fasthttp.RequestCtx{}
+		ctx.Request.SetRequestURI(tc.uri)
+		ctx.Request.Header.SetMethod("GET")
+		cors(func(ctx *fasthttp.RequestCtx) { ctx.SetStatusCode(tc.status) })(ctx)
+		if got := len(logger.events) == 1; got != tc.logged {
+			t.Errorf("%s %d: logged = %v, want %v", tc.uri, tc.status, got, tc.logged)
+		}
+	}
+	SetLogger(&mockLogger{})
+}
+
+func TestParseAccessLogPaths(t *testing.T) {
+	if got := parseAccessLogPaths(""); len(got) != 0 {
+		t.Errorf("parseAccessLogPaths(\"\") = %v, want empty", got)
+	}
+	got := parseAccessLogPaths(" /a ,, /b/ ")
+	if want := []string{"/a", "/b/"}; !slices.Equal(got, want) {
+		t.Errorf("parseAccessLogPaths = %v, want %v", got, want)
+	}
 }

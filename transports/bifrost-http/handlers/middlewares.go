@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net"
 	"net/url"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -37,6 +38,12 @@ import (
 )
 
 var loggingSkipPaths = []string{"/health", "/_next", "/api/dev/"}
+
+// accessLogQuietPaths lists path prefixes whose successful requests are not
+// access-logged; their 4xx and 5xx responses still are. It is read from
+// BIFROST_ACCESS_LOG_QUIET_PATHS, a comma-separated list, and suits endpoints
+// polled by probes.
+var accessLogQuietPaths = parseAccessLogPaths(os.Getenv("BIFROST_ACCESS_LOG_QUIET_PATHS"))
 var realtimeTransportPaths = buildRealtimeTransportPathSet()
 
 // apiPathPrefix is the route prefix whose responses must never be served from a shared cache.
@@ -139,6 +146,18 @@ func InferenceOuterMiddlewares(tm *TracingMiddleware, cors *CorsMiddleware) []sc
 	return []schemas.BifrostHTTPMiddleware{tm.Middleware(), RecoveryMiddleware(cors)}
 }
 
+// parseAccessLogPaths splits a comma-separated list of path prefixes,
+// dropping empty entries.
+func parseAccessLogPaths(raw string) []string {
+	var paths []string
+	for _, path := range strings.Split(raw, ",") {
+		if path = strings.TrimSpace(path); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
 // clientForwardedIP returns the client-supplied originating IP from reverse-proxy
 // headers, or "" if none are present. X-Forwarded-For may be a comma-separated list
 // (client, proxy1, proxy2); the leftmost entry is the original client.
@@ -220,9 +239,15 @@ func (c *CorsMiddleware) Middleware() schemas.BifrostHTTPMiddleware {
 				return strings.HasPrefix(string(ctx.RequestURI()), path)
 			}) == -1
 			if shouldLog {
+				quietOnSuccess := slices.IndexFunc(accessLogQuietPaths, func(path string) bool {
+					return strings.HasPrefix(string(ctx.RequestURI()), path)
+				}) != -1
 				startTime := time.Now()
 				defer func() {
 					statusCode := ctx.Response.Header.StatusCode()
+					if quietOnSuccess && statusCode < 400 {
+						return
+					}
 					level := schemas.LogLevelInfo
 					if statusCode >= 500 {
 						level = schemas.LogLevelError
