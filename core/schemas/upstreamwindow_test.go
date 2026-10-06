@@ -55,6 +55,24 @@ func TestUpstreamWindowKeepsFirstStartAndExtendsLastEnd(t *testing.T) {
 	if total, _ := GetUpstreamLatency(ctx); total < 10*time.Millisecond {
 		t.Fatalf("total %v does not include both waits", total)
 	}
+	if waited := GetUpstreamWindow(ctx).Waited(); waited < 10*time.Millisecond {
+		t.Fatalf("window waited %v does not include both waits", waited)
+	}
+}
+
+func TestUpstreamWindowExcludesNonProviderWaits(t *testing.T) {
+	ctx := NewBifrostContext(context.Background(), NoDeadline)
+	ctx.ResetUpstreamLatency()
+	// A non-provider wait (for example an MCP tool call) adds to the upstream
+	// total only.
+	AddUpstreamLatency(ctx, 50*time.Millisecond)
+	if waited := GetUpstreamWindow(ctx).Waited(); waited != 0 {
+		t.Fatalf("window counted a non-provider wait: %v", waited)
+	}
+	var nilWindow *UpstreamWindow
+	if nilWindow.Waited() != 0 {
+		t.Fatal("nil window reported a wait")
+	}
 }
 
 func TestUpstreamWindowConcurrentObservers(t *testing.T) {

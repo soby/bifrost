@@ -52,11 +52,16 @@ func (bc *BifrostContext) ResetUpstreamLatency() {
 //
 // Instants are stored as offsets from a base taken at reset, so they keep the
 // monotonic clock and concurrent writers never touch the context's value map.
+//
+// The window also keeps its own total of the provider socket waits it observed.
+// Unlike the upstream total, it excludes non-provider waits such as MCP tool
+// calls, so it is the provider's share of the request on its own.
 type UpstreamWindow struct {
 	base time.Time
 	// Offsets are stored plus one so that zero means "not yet observed".
 	firstStart atomic.Int64
 	lastEnd    atomic.Int64
+	waited     atomic.Int64
 }
 
 func (w *UpstreamWindow) offset(t time.Time) int64 {
@@ -68,6 +73,7 @@ func (w *UpstreamWindow) offset(t time.Time) int64 {
 }
 
 func (w *UpstreamWindow) observe(start, end time.Time) {
+	w.waited.Add(int64(end.Sub(start)))
 	w.firstStart.CompareAndSwap(0, w.offset(start))
 	endOffset := w.offset(end)
 	for {
@@ -89,6 +95,15 @@ func (w *UpstreamWindow) Bounds() (firstStart, lastEnd time.Time, ok bool) {
 		return time.Time{}, time.Time{}, false
 	}
 	return w.base.Add(time.Duration(first - 1)), w.base.Add(time.Duration(last - 1)), true
+}
+
+// Waited returns the total time spent blocked on provider sockets observed by
+// this window. Zero with Bounds ok=false means no provider wait happened.
+func (w *UpstreamWindow) Waited() time.Duration {
+	if w == nil {
+		return 0
+	}
+	return time.Duration(w.waited.Load())
 }
 
 // GetUpstreamWindow returns the request's window, or nil when no window was
