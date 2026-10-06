@@ -187,6 +187,7 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		openaiReq.ChatParameters.Prediction = prediction
 		return openaiReq
 	default:
+		openaiReq.forwardReasoningDetails(bifrostReq.Input)
 		// Check if provider is a custom provider
 		if isCustomProvider, ok := ctx.Value(schemas.BifrostContextKeyIsCustomProvider).(bool); ok && isCustomProvider {
 			return openaiReq
@@ -337,6 +338,22 @@ func (req *OpenAIChatRequest) stripReasoningDetailsExceptToolCalls() {
 			continue
 		}
 		assistantMessage.Reasoning = nil
+	}
+}
+
+// forwardReasoningDetails replays assistant reasoning_details to destinations without a
+// curated OpenAI dialect (OpenRouter, self-hosted servers, custom providers), which accept
+// the field and need it for signed reasoning replay. The dialects handled above never get
+// it: they either reject unknown message fields or read reasoning only from
+// reasoning_content. messages is the Bifrost input the request was converted from, so it
+// lines up index for index with req.Messages.
+func (req *OpenAIChatRequest) forwardReasoningDetails(messages []schemas.ChatMessage) {
+	for i := range req.Messages {
+		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
+		if assistantMessage == nil || messages[i].ChatAssistantMessage == nil {
+			continue
+		}
+		assistantMessage.ReasoningDetails = messages[i].ReasoningDetails
 	}
 }
 

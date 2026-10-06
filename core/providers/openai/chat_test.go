@@ -2110,6 +2110,63 @@ func TestToOpenAIChatRequest_DoesNotEmitInboundReasoningAliases(t *testing.T) {
 	}
 }
 
+// TestToOpenAIChatRequest_ForwardsReasoningDetails covers the outbound half of #5274:
+// destinations without a curated OpenAI dialect (OpenRouter, custom providers) receive
+// replayed reasoning_details verbatim, signature included, so signed reasoning survives
+// the hop. The curated dialects stay pinned by DoesNotEmitInboundReasoningAliases.
+func TestToOpenAIChatRequest_ForwardsReasoningDetails(t *testing.T) {
+	signature := "Eu8Bsig"
+	reasoning := "thinking about Paris weather"
+
+	tests := []struct {
+		name     string
+		provider schemas.ModelProvider
+		custom   bool
+	}{
+		{name: "openrouter", provider: schemas.OpenRouter},
+		{name: "custom provider", provider: schemas.ModelProvider("my-vllm"), custom: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			if tt.custom {
+				ctx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+			}
+
+			bifrostReq := &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "some-model",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("weather in paris?")}},
+					{
+						Role: schemas.ChatMessageRoleAssistant,
+						ChatAssistantMessage: &schemas.ChatAssistantMessage{
+							ReasoningDetails: []schemas.ChatReasoningDetails{
+								{Index: 0, Type: schemas.BifrostReasoningDetailsTypeText, Text: &reasoning, Signature: &signature},
+								{Index: 1, Type: schemas.BifrostReasoningDetailsTypeEncrypted, Data: schemas.Ptr("ENCRYPTED_PAYLOAD")},
+							},
+						},
+					},
+				},
+			}
+
+			wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, bifrostReq))
+			require.NoError(t, err)
+
+			require.False(t, providerUtils.GetJSONField(wireBody, "messages.0.reasoning_details").Exists(),
+				"a user message must not grow reasoning_details")
+			details := providerUtils.GetJSONField(wireBody, "messages.1.reasoning_details")
+			require.Equal(t, 2, len(details.Array()), "wire body: %s", wireBody)
+			require.Equal(t, "reasoning.text", details.Get("0.type").String())
+			require.Equal(t, reasoning, details.Get("0.text").String())
+			require.Equal(t, signature, details.Get("0.signature").String())
+			require.Equal(t, "reasoning.encrypted", details.Get("1.type").String())
+			require.Equal(t, "ENCRYPTED_PAYLOAD", details.Get("1.data").String())
+		})
+	}
+}
+
 // TestXAIReasoningEffortEndToEnd pins reasoning_effort through the FULL conversion
 // pipeline, not just applyXAICompatibility. filterOpenAISpecificParameters runs
 // normalizeReasoningEffort BEFORE the xAI compat pass, so a value can be rewritten

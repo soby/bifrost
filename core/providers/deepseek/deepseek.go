@@ -106,8 +106,8 @@ func applyDeepSeekThinkingCompatibility(request *schemas.BifrostChatRequest) *sc
 //  2. A history containing an assistant tool_call turn that carries no replayable
 //     reasoning. DeepSeek requires reasoning_content to be replayed on tool_call turns and
 //     400s without it; when the caller cannot supply it, thinking has to stay off. Only
-//     ChatAssistantMessage.Reasoning counts here - reasoning_details is inbound-only and
-//     never reaches the wire - and this is judged from the messages alone, since a caller
+//     ChatAssistantMessage.Reasoning counts here - reasoning_details never reaches the
+//     DeepSeek wire - and this is judged from the messages alone, since a caller
 //     may replay tool_call turns without re-declaring Params.Tools.
 //
 // Everything else keeps thinking on. In particular, a plain multi-turn conversation needs no
@@ -145,8 +145,8 @@ func requiresDeepSeekThinkingDisabled(request *schemas.BifrostChatRequest) bool 
 		}
 		// Only Reasoning can satisfy the replay requirement: it is the sole field
 		// ConvertBifrostMessagesToOpenAIMessages copies onto the outbound assistant
-		// message, as reasoning_content. ReasoningDetails is inbound-only and never
-		// reaches the wire (see core/providers/openai/types.go), so a details-only turn
+		// message, as reasoning_content. ReasoningDetails never reaches the DeepSeek
+		// wire (see core/providers/openai/types.go), so a details-only turn
 		// would keep thinking on and then 400 for the missing reasoning_content.
 		if msg.ChatAssistantMessage.Reasoning == nil {
 			return true
