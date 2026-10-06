@@ -36,7 +36,7 @@ Sources:
 - [x] **Logprobs** (`logprobs: true, top_logprobs: N`) — audited: covered (weak: status/shape assertions only)
 - [x] **Logit bias** (`logit_bias: { token_id: bias }`) — built: folder 144.2
 - [x] **Seed for deterministic output** (`seed: 12345`) — audited: covered (weak: status/shape assertions only)
-- [x] **Stop sequences** (`stop: ["END"]`) — audited: covered (weak: status/shape assertions only)
+- [x] **Stop sequences** (`stop: ["END"]`) — audited: covered (weak: status/shape assertions only); scalar string and empty-string streaming decoding in folder 93 (#7219)
 - [x] **N completions** (`n: 3`) — built: folder 144.1
 - [x] **Temperature / top_p / frequency_penalty / presence_penalty** — audited: covered (weak: status/shape assertions only)
 - [x] **Stream options with usage** (`stream_options: { include_usage: true }`) — audited: covered (weak: status/shape assertions only)
