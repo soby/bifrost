@@ -166,3 +166,64 @@ func TestAttemptRequestTimeout_ClearedBeforeFallback(t *testing.T) {
 		t.Errorf("the fallback attempt found attempt timeout %s on the context, want it cleared", got)
 	}
 }
+
+// TestAttemptRequestTimeout_ReleasesSlotAndShutdown pins that a request-scoped attempt cut off
+// by its attempt timeout gives back its slot and its place among the attempts Shutdown waits
+// for: Shutdown, started while the attempt hangs, returns once the timeout fires rather than
+// when the upstream gives up.
+func TestAttemptRequestTimeout_ReleasesSlotAndShutdown(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", streaming), func(t *testing.T) {
+			var calls atomic.Int64
+			upstream := hangingUpstream(t, &calls)
+			plugin := &attemptTimeoutPlugin{t: t, urls: [2]string{upstream.URL, upstream.URL}, timeouts: [2]time.Duration{200 * time.Millisecond, 0}}
+			client := newRequestScopedTestClient(t, NewMockAccount(), plugin, nil)
+			instance, err := client.getRequestScopedProvider(requestScopedClass{provider: schemas.OpenAI, allowPrivateNetwork: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			result := make(chan *schemas.BifrostError, 1)
+			go func() {
+				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				if streaming {
+					stream, err := client.ChatCompletionStreamRequest(ctx, requestScopedChat(schemas.OpenAI, "model-a"))
+					if err == nil {
+						for chunk := range stream {
+							if chunk.BifrostError != nil {
+								err = chunk.BifrostError
+							}
+						}
+					}
+					result <- err
+					return
+				}
+				_, err := client.ChatCompletionRequest(ctx, requestScopedChat(schemas.OpenAI, "model-a"))
+				result <- err
+			}()
+			for calls.Load() == 0 {
+				time.Sleep(time.Millisecond)
+			}
+			started := time.Now()
+			shutdown := make(chan struct{})
+			go func() {
+				client.Shutdown()
+				close(shutdown)
+			}()
+			select {
+			case <-shutdown:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Shutdown still waiting 5s after a timed-out attempt")
+			}
+			if elapsed := time.Since(started); elapsed > 2*time.Second {
+				t.Errorf("Shutdown took %s, want it to return near the 200ms attempt timeout", elapsed)
+			}
+			if err := <-result; err == nil || err.StatusCode == nil || *err.StatusCode != http.StatusGatewayTimeout {
+				t.Errorf("error = %v, want the 504 attempt timeout", err)
+			}
+			if n := len(instance.slots); n != 0 {
+				t.Errorf("%d request-scoped slots still taken after the attempt timed out", n)
+			}
+		})
+	}
+}
