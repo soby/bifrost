@@ -5814,6 +5814,26 @@ func (bifrost *Bifrost) prepareFallbackRequest(req *schemas.BifrostRequest, fall
 	return &fallbackReq
 }
 
+// setEffectiveRequest records req as the request an attempt runs with, when the caller asked.
+func setEffectiveRequest(effective **schemas.BifrostRequest, req *schemas.BifrostRequest) {
+	if effective != nil && req != nil {
+		*effective = req
+	}
+}
+
+// effectiveFallbacks returns the fallbacks of the request the primary attempt ran with.
+// Fork-only: a plugin's PreLLMHook may replace the request and attach the fallbacks it
+// chose for the primary attempt (the gateway's supervision runtime selects its route
+// there); upstream reads them only after PreRequestHook. A request whose pre-hooks did not
+// run keeps the fallbacks read after PreRequestHook.
+func effectiveFallbacks(effective *schemas.BifrostRequest, current []schemas.Fallback) []schemas.Fallback {
+	if effective == nil {
+		return current
+	}
+	_, _, fallbacks := effective.GetRequestFields()
+	return fallbacks
+}
+
 // shouldContinueWithFallbacks processes errors from fallback attempts
 // Returns true if we should continue with more fallbacks, false if we should stop
 func (bifrost *Bifrost) shouldContinueWithFallbacks(fallback schemas.Fallback, fallbackErr *schemas.BifrostError) bool {
@@ -5942,7 +5962,11 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 
 	bifrost.logger.Debug("primary provider %s with model %s and %d fallbacks", provider, model, len(fallbacks))
 
-	primaryResult, primaryErr := bifrost.tryRequest(ctx, req)
+	// Fork-only: the primary's LLM pre-hooks may replace the request and attach its
+	// fallbacks; the fallbacks and their requests follow the request the primary ran with.
+	effectiveReq := req
+	primaryResult, primaryErr := bifrost.tryRequest(ctx, req, &effectiveReq)
+	fallbacks = effectiveFallbacks(effectiveReq, fallbacks)
 	if primaryErr != nil {
 		// GetErrorString, not %v on the error itself: BifrostError.String marshals the
 		// whole struct, and ExtraFields.RawRequest/RawResponse carry the outbound provider
@@ -5955,7 +5979,7 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 	}
 
 	// Check if we should proceed with fallbacks
-	shouldTryFallbacks := bifrost.shouldTryFallbacks(req, primaryErr)
+	shouldTryFallbacks := bifrost.shouldTryFallbacks(effectiveReq, primaryErr)
 	if !shouldTryFallbacks {
 		if primaryErr == nil {
 			served = &schemas.Route{Provider: provider, Model: model}
@@ -5997,7 +6021,7 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		tracer.SetAttribute(handle, "fallback.index", i+1)
 		ctx.SetValue(schemas.BifrostContextKeySpanID, spanCtx.Value(schemas.BifrostContextKeySpanID))
 
-		fallbackReq := bifrost.prepareFallbackRequest(req, fallback)
+		fallbackReq := bifrost.prepareFallbackRequest(effectiveReq, fallback)
 		if fallbackReq == nil {
 			bifrost.logger.Debug("fallback provider %s with model %s is nil", fallback.Provider, fallback.Model)
 			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelWarn, fmt.Sprintf("Fallback %s/%s skipped: missing provider config or unsupported request type", fallback.Provider, fallback.Model))
@@ -6007,7 +6031,7 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		}
 
 		// Try the fallback provider
-		result, fallbackErr := bifrost.tryRequest(ctx, fallbackReq)
+		result, fallbackErr := bifrost.tryRequest(ctx, fallbackReq, nil)
 		// Layer on Primary/IsFallback — the per-attempt code populates only
 		// attempt-level RoutingInfo (Provider/Model/Key/ResolvedKeyAlias);
 		// fallback-relative signals belong to the orchestrator scope.
@@ -6129,7 +6153,10 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		return firstTokenTimeout
 	}
 
-	primaryResult, primaryErr := bifrost.tryStreamRequest(ctx, req, attemptFirstTokenTimeout(len(fallbacks) > 0))
+	// Fork-only: fallbacks follow the request the primary ran with, as in handleRequest.
+	effectiveReq := req
+	primaryResult, primaryErr := bifrost.tryStreamRequest(ctx, req, attemptFirstTokenTimeout(len(fallbacks) > 0), &effectiveReq)
+	fallbacks = effectiveFallbacks(effectiveReq, fallbacks)
 	if primaryErr != nil {
 		// GetErrorString, not %v on the error itself: BifrostError.String marshals the
 		// whole struct, and ExtraFields.RawRequest/RawResponse carry the outbound provider
@@ -6142,7 +6169,7 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 	}
 
 	// Check if we should proceed with fallbacks
-	shouldTryFallbacks := bifrost.shouldTryFallbacks(req, primaryErr)
+	shouldTryFallbacks := bifrost.shouldTryFallbacks(effectiveReq, primaryErr)
 	if !shouldTryFallbacks {
 		if primaryErr == nil {
 			served = &schemas.Route{Provider: provider, Model: model}
@@ -6180,7 +6207,7 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		tracer.SetAttribute(handle, "fallback.index", i+1)
 		ctx.SetValue(schemas.BifrostContextKeySpanID, spanCtx.Value(schemas.BifrostContextKeySpanID))
 
-		fallbackReq := bifrost.prepareFallbackRequest(req, fallback)
+		fallbackReq := bifrost.prepareFallbackRequest(effectiveReq, fallback)
 		if fallbackReq == nil {
 			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelWarn, fmt.Sprintf("Fallback %s/%s skipped: missing provider config or unsupported request type", fallback.Provider, fallback.Model))
 			tracer.SetAttribute(handle, "error", "fallback request preparation failed")
@@ -6189,7 +6216,7 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		}
 
 		// Try the fallback provider
-		result, fallbackErr := bifrost.tryStreamRequest(ctx, fallbackReq, attemptFirstTokenTimeout(i < len(fallbacks)-1))
+		result, fallbackErr := bifrost.tryStreamRequest(ctx, fallbackReq, attemptFirstTokenTimeout(i < len(fallbacks)-1), nil)
 		// Layer on Primary/IsFallback on errors. For the success case the
 		// result is a chan of stream chunks emitted asynchronously — those
 		// chunks already carry per-attempt RoutingInfo populated upstream,
@@ -6242,7 +6269,12 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 
 // tryRequest is a generic function that handles common request processing logic
 // It consolidates queue setup, plugin pipeline execution, enqueue logic, and response handling
-func (bifrost *Bifrost) tryRequest(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostResponse, *schemas.BifrostError) {
+//
+// When effective is non-nil it receives the request the attempt ran with: the one the LLM
+// pre-hooks returned, or req when they did not run. Fork-only: handleRequest builds the
+// fallbacks of the primary attempt from it (see effectiveFallbackRequest).
+func (bifrost *Bifrost) tryRequest(ctx *schemas.BifrostContext, req *schemas.BifrostRequest, effective **schemas.BifrostRequest) (*schemas.BifrostResponse, *schemas.BifrostError) {
+	setEffectiveRequest(effective, req)
 	provider, model, _ := req.GetRequestFields()
 	// A request carrying request-scoped configuration only looks up an existing queue here:
 	// its PreLLMHook may configure this attempt, which then needs no queue, so a provider
@@ -6264,6 +6296,7 @@ func (bifrost *Bifrost) tryRequest(ctx *schemas.BifrostContext, req *schemas.Bif
 	if bifrost.MCPManager != nil {
 		mcpSpan := bifrost.startCoreSpan(ctx, "miscellaneous")
 		req = bifrost.MCPManager.AddToolsToRequest(ctx, req)
+		setEffectiveRequest(effective, req)
 		bifrost.endCoreSpan(mcpSpan)
 	}
 
@@ -6290,6 +6323,9 @@ func (bifrost *Bifrost) tryRequest(ctx *schemas.BifrostContext, req *schemas.Bif
 	// overwritten around RunPostLLMHooks — plugin modifications to these 4 fields are
 	// no-ops by design; proper request metadata is preserved and tampering is discouraged.
 	preReq, shortCircuit, preCount := pipeline.RunLLMPreHooks(ctx, req)
+	if preReq != nil {
+		setEffectiveRequest(effective, preReq)
+	}
 	bifrost.endCoreSpan(prePipeSpan)
 	if shortCircuit != nil {
 		// Handle short-circuit with response (success case)
@@ -6554,7 +6590,10 @@ func (bifrost *Bifrost) tryRequest(ctx *schemas.BifrostContext, req *schemas.Bif
 // It consolidates queue setup, plugin pipeline execution, enqueue logic, and response handling
 //
 // firstTokenTimeout is this attempt's TTFT deadline; 0 disables it.
-func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostRequest, firstTokenTimeout time.Duration) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+//
+// effective receives the request the attempt ran with, as for tryRequest.
+func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostRequest, firstTokenTimeout time.Duration, effective **schemas.BifrostRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	setEffectiveRequest(effective, req)
 	provider, model, _ := req.GetRequestFields()
 	// A request carrying request-scoped configuration only looks up an existing queue here:
 	// its PreLLMHook may configure this attempt, which then needs no queue, so a provider
@@ -6576,6 +6615,7 @@ func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schem
 	if req.RequestType != schemas.SpeechStreamRequest && req.RequestType != schemas.TranscriptionStreamRequest && bifrost.MCPManager != nil {
 		mcpSpan := bifrost.startCoreSpan(ctx, "miscellaneous")
 		req = bifrost.MCPManager.AddToolsToRequest(ctx, req)
+		setEffectiveRequest(effective, req)
 		bifrost.endCoreSpan(mcpSpan)
 	}
 
@@ -6620,6 +6660,9 @@ func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schem
 	// overwritten around RunPostLLMHooks — plugin modifications to these 4 fields are
 	// no-ops by design; proper request metadata is preserved and tampering is discouraged.
 	preReq, shortCircuit, preCount := pipeline.RunLLMPreHooks(ctx, req)
+	if preReq != nil {
+		setEffectiveRequest(effective, preReq)
+	}
 	bifrost.endCoreSpan(prePipeSpan)
 	if shortCircuit != nil {
 		// Handle short-circuit with response (success case)
