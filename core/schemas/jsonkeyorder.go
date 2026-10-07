@@ -3,6 +3,8 @@ package schemas
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
+	"strings"
 )
 
 // JSONKeyOrder is a lightweight helper that preserves JSON key ordering through
@@ -53,10 +55,35 @@ func (o *JSONKeyOrder) Apply(data []byte) ([]byte, error) {
 	return ReorderJSONKeys(data, o.keys)
 }
 
+// JSONRawField is a top-level JSON object member kept as its raw value.
+type JSONRawField struct {
+	Key   string
+	Value json.RawMessage
+}
+
+// CaptureUnknown records the top-level key order like Capture and, from the same
+// scan, returns a copy of the raw value of every key not in known, in document
+// order. Structs use it to carry members they have no field for through a round trip.
+func (o *JSONKeyOrder) CaptureUnknown(data []byte, known map[string]bool) []JSONRawField {
+	var unknown []JSONRawField
+	o.keys = scanTopLevelKeys(data, func(key string, value []byte) {
+		if !known[key] {
+			unknown = append(unknown, JSONRawField{Key: key, Value: bytes.Clone(value)})
+		}
+	})
+	return unknown
+}
+
 // ExtractTopLevelKeyOrder parses a JSON object and returns its top-level keys in
 // document order. Useful for capturing key order before struct deserialization
 // loses it, so that re-serialization can preserve the original order.
 func ExtractTopLevelKeyOrder(data []byte) []string {
+	return scanTopLevelKeys(data, nil)
+}
+
+// scanTopLevelKeys returns the top-level keys of a JSON object in document order.
+// When visit is set, it receives each key with its raw value.
+func scanTopLevelKeys(data []byte, visit func(key string, value []byte)) []string {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil
@@ -79,12 +106,44 @@ func ExtractTopLevelKeyOrder(data []byte) []string {
 			break
 		}
 		keys = append(keys, key)
+		start := dec.InputOffset()
 		// Skip the value (handles nested objects/arrays)
 		if err := skipJSONValue(dec); err != nil {
 			break
 		}
+		if visit != nil {
+			// The span after the key holds the colon and any whitespace before the value.
+			visit(key, bytes.TrimLeft(trimmed[start:dec.InputOffset()], " \t\r\n:"))
+		}
 	}
 	return keys
+}
+
+// appendRawFields appends members to a serialized JSON object.
+func appendRawFields(object []byte, fields []JSONRawField) ([]byte, error) {
+	end := bytes.LastIndexByte(object, '}')
+	if end < 0 {
+		return object, nil
+	}
+	empty := len(bytes.TrimSpace(object[:end])) == 1
+	var buf bytes.Buffer
+	buf.Grow(len(object) + 16*len(fields))
+	buf.Write(object[:end])
+	for _, field := range fields {
+		if !empty {
+			buf.WriteByte(',')
+		}
+		empty = false
+		key, err := MarshalSorted(field.Key)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(key)
+		buf.WriteByte(':')
+		buf.Write(field.Value)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
 // skipJSONValue reads and discards a single JSON value from a decoder.
@@ -204,4 +263,23 @@ func ReorderJSONKeys(data []byte, order []string) ([]byte, error) {
 
 	buf.WriteByte('}')
 	return buf.Bytes(), nil
+}
+
+// jsonFieldNames returns the JSON member names of a struct type's serialized fields.
+func jsonFieldNames(t reflect.Type) map[string]bool {
+	names := make(map[string]bool, t.NumField())
+	for field := range t.Fields() {
+		if !field.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		switch name {
+		case "-":
+		case "":
+			names[field.Name] = true
+		default:
+			names[name] = true
+		}
+	}
+	return names
 }

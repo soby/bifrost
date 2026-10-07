@@ -2543,3 +2543,27 @@ func TestOpenAIChatRequestToBifrostRecordsLegacyMaxTokens(t *testing.T) {
 	require.NoError(t, sonic.Unmarshal([]byte(`{"model":"openai/gpt-4o","messages":[],"max_completion_tokens":100}`), &req))
 	require.False(t, req.ToBifrostChatRequest(nil).Params.LegacyMaxTokens)
 }
+
+// TestToOpenAIChatRequest_ToolSchemaKeepsUnknownKeywords pins the provider wire for a
+// tool schema carrying JSON Schema keywords without a typed field and a non-string enum.
+func TestToOpenAIChatRequest_ToolSchemaKeepsUnknownKeywords(t *testing.T) {
+	var tool schemas.ChatTool
+	require.NoError(t, sonic.Unmarshal([]byte(`{"type":"function","function":{"name":"f","parameters":`+
+		`{"type":"object","$comment":"v2","properties":{"n":{"type":"integer"}},"minProperties":1,"enum":[1,null]}}}`), &tool))
+
+	ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+	defer cancel()
+	wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+		Provider: schemas.OpenAI,
+		Model:    "gpt-4o",
+		Input: []schemas.ChatMessage{
+			{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+		},
+		Params: &schemas.ChatParameters{Tools: []schemas.ChatTool{tool}},
+	}))
+	require.NoError(t, err)
+	params := providerUtils.GetJSONField(wireBody, "tools.0.function.parameters")
+	require.Equal(t, "v2", params.Get(`\$comment`).String(), "wire body: %s", wireBody)
+	require.Equal(t, int64(1), params.Get("minProperties").Int())
+	require.Equal(t, `[1,null]`, params.Get("enum").Raw)
+}

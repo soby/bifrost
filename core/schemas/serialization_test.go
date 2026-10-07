@@ -297,6 +297,36 @@ func TestSonic_ToolFunctionParameters_FullSchemaRoundTrip(t *testing.T) {
 	assert.Equal(t, []string{"answer", "chain_of_thought", "citations", "is_unanswered"}, params.Properties.Keys())
 }
 
+// TestToolFunctionParameters_PreservesUnknownKeywords pins that top-level JSON Schema
+// keywords without a typed field survive a round trip verbatim and in place, and that
+// a non-string enum is kept rather than failing the whole schema.
+func TestToolFunctionParameters_PreservesUnknownKeywords(t *testing.T) {
+	input := `{"$schema":"https://json-schema.org/draft/2020-12/schema","$comment":"tool v2","type":"object",` +
+		`"properties":{"n":{"type":"integer"}},"minProperties":1,"not":{"required":["x"]},` +
+		`"const":{"n":1},"multipleOf":0.10,"enum":[1,"two",null],"x-vendor":{"k":[true]}}`
+
+	var params ToolFunctionParameters
+	require.NoError(t, Unmarshal([]byte(input), &params))
+	output, err := Marshal(params)
+	require.NoError(t, err)
+	assert.Equal(t, input, string(output))
+
+	normalized, err := Marshal(params.Normalized())
+	require.NoError(t, err)
+	for _, want := range []string{`"$schema":"https://json-schema.org/draft/2020-12/schema"`, `"$comment":"tool v2"`,
+		`"minProperties":1`, `"not":{"required":["x"]}`, `"const":{"n":1}`, `"multipleOf":0.10`, `"enum":[1,"two",null]`, `"x-vendor":{"k":[true]}`} {
+		assert.Contains(t, string(normalized), want)
+	}
+
+	copied, err := Marshal(DeepCopyToolFunctionParameters(&params))
+	require.NoError(t, err)
+	assert.Equal(t, input, string(copied))
+
+	var strEnum ToolFunctionParameters
+	require.NoError(t, Unmarshal([]byte(`{"type":"string","enum":["a","b"]}`), &strEnum))
+	assert.Equal(t, []string{"a", "b"}, strEnum.Enum)
+}
+
 // --- ChatTool end-to-end through sonic ---
 
 func TestSonic_ChatTool_ToolFunctionParametersPreservesOrder(t *testing.T) {

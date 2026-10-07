@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1161,6 +1162,7 @@ func DeepCopyToolFunctionParameters(original *ToolFunctionParameters) *ToolFunct
 		Type:                original.Type,
 		keyOrder:            JSONKeyOrder{keys: append([]string(nil), original.keyOrder.keys...)},
 		explicitEmptyObject: original.explicitEmptyObject,
+		extraKeywords:       slices.Clone(original.extraKeywords),
 	}
 
 	if original.Description != nil {

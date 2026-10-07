@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -684,7 +687,13 @@ type ToolFunctionParameters struct {
 	keyOrder JSONKeyOrder `json:"-"`
 	// explicitEmptyObject tracks a client-supplied raw {} schema.
 	explicitEmptyObject bool `json:"-"`
+	// extraKeywords holds top-level keywords without a typed field, verbatim.
+	extraKeywords []JSONRawField `json:"-"`
 }
+
+// toolFunctionParametersKeys is the set of top-level keywords ToolFunctionParameters
+// has a typed field for; every other keyword is carried verbatim in extraKeywords.
+var toolFunctionParametersKeys = jsonFieldNames(reflect.TypeFor[ToolFunctionParameters]())
 
 // MarshalJSON serializes ToolFunctionParameters while preserving the original
 // top-level key order when available. A client-supplied raw `{}` stays `{}`;
@@ -703,6 +712,11 @@ func (t ToolFunctionParameters) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(t.extraKeywords) > 0 {
+		if data, err = appendRawFields(data, t.extraKeywords); err != nil {
+			return nil, err
+		}
+	}
 	return t.keyOrder.Apply(data)
 }
 
@@ -717,11 +731,23 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 		data = []byte(jsonStr)
 	}
 	type Alias ToolFunctionParameters
-	var temp Alias
+	// enum is decoded raw: JSON Schema allows values of any type, the typed field
+	// only strings.
+	var temp struct {
+		Alias
+		Enum json.RawMessage `json:"enum"`
+	}
 	if err := Unmarshal(data, &temp); err != nil {
 		return fmt.Errorf("failed to unmarshal ToolFunctionParameters: %w", err)
 	}
-	*t = ToolFunctionParameters(temp)
+	*t = ToolFunctionParameters(temp.Alias)
+	t.extraKeywords = t.keyOrder.CaptureUnknown(data, toolFunctionParametersKeys)
+	if len(temp.Enum) > 0 {
+		if err := Unmarshal(temp.Enum, &t.Enum); err != nil {
+			t.Enum = nil
+			t.extraKeywords = append(t.extraKeywords, JSONRawField{Key: "enum", Value: temp.Enum})
+		}
+	}
 
 	// Normalize additionalProperties: null to omitted field
 	if t.AdditionalProperties != nil &&
@@ -737,7 +763,6 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 	} else {
 		t.explicitEmptyObject = false
 	}
-	t.keyOrder.Capture(data)
 	return nil
 }
 
@@ -763,6 +788,10 @@ func (t *ToolFunctionParameters) Normalized() *ToolFunctionParameters {
 	}
 	out := *t
 	out.keyOrder = JSONKeyOrder{}
+	if len(t.extraKeywords) > 1 {
+		out.extraKeywords = slices.Clone(t.extraKeywords)
+		slices.SortFunc(out.extraKeywords, func(a, b JSONRawField) int { return strings.Compare(a.Key, b.Key) })
+	}
 	// Properties contains user-defined field names whose order is semantically
 	// meaningful for LLM structured output generation. Preserve their key order
 	// while sorting nested schema structural keys for caching determinism.
@@ -818,7 +847,7 @@ func (t *ToolFunctionParameters) hasDefinedSchemaFields() bool {
 	if t == nil {
 		return false
 	}
-	if t.Type != "" || t.Description != nil || len(t.Required) > 0 || t.AdditionalProperties != nil || len(t.Enum) > 0 {
+	if t.Type != "" || t.Description != nil || len(t.Required) > 0 || t.AdditionalProperties != nil || len(t.Enum) > 0 || len(t.extraKeywords) > 0 {
 		return true
 	}
 	if t.Properties != nil || t.Defs != nil || t.Definitions != nil || t.Ref != nil {
