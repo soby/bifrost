@@ -57,7 +57,7 @@ New on this branch:
 | 1ecdac20d | Request-scoped Vertex with a caller-supplied OAuth access token (`VertexKeyConfig.AccessToken`) |
 | 012bd19ab | Per-attempt request timeout from the context (`BifrostContextKeyAttemptRequestTimeout`); expiry is a retryable timeout, so fallbacks run |
 | c64050487 | Fallbacks follow the request the primary attempt's `PreLLMHook` returned (fallback list, fallback decision and base request), as on the previous runtime branch |
-| (this commit) | The transport interceptor middleware, the request handler, the LLM hooks and the HTTP transport post-hook share one `BifrostContext` per request (`lib.EnsureSharedBifrostContext`), as `cbcdf67b8` did on the previous runtime branch |
+| 4d0091cca | The transport interceptor middleware, the request handler, the LLM hooks and the HTTP transport post-hook share one `BifrostContext` per request (`lib.EnsureSharedBifrostContext`), as `cbcdf67b8` did on the previous runtime branch |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's

@@ -300,7 +300,6 @@ func EnsureSharedBifrostContext(ctx *fasthttp.RequestCtx) (*schemas.BifrostConte
 	return bifrostCtx, cancel
 }
 
-
 func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*schemas.BifrostContext, context.CancelFunc) {
 	// "transport-context" overhead phase: building the request-scoped BifrostContext —
 	// child-context alloc, request-id resolution, and the full request-header iteration
