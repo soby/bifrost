@@ -5908,6 +5908,11 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		return nil, validateErr
 	}
 
+	// Providers that always forward extra params (DeepSeek, vLLM, SGL, ...) set the
+	// passthrough flag on this shared context for their own attempt. Every fallback
+	// restarts from the caller's choice instead of the flag the last attempt left.
+	passthroughExtraParams, _ := ctx.Value(schemas.BifrostContextKeyPassthroughExtraParams).(bool)
+
 	bifrost.logger.Debug("primary provider %s with model %s and %d fallbacks", provider, model, len(fallbacks))
 
 	primaryResult, primaryErr := bifrost.tryRequest(ctx, req)
@@ -5949,6 +5954,7 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Trying fallback %d/%d: %s/%s (previous attempt failed: %s)", i+1, len(fallbacks), fallback.Provider, fallback.Model, routingErrorSummary(lastErr)))
 		ctx.SetValue(schemas.BifrostContextKeyFallbackRequestID, uuid.New().String())
 		clearCtxForFallback(ctx)
+		ctx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, passthroughExtraParams)
 		// Re-pin after the clear: RunPreRequestHooks, which commits a target's pin, runs once per request, not per fallback.
 		if keyID := strings.TrimSpace(fallback.KeyID); keyID != "" {
 			ctx.SetFallbackPinnedAPIKeyID(keyID)
@@ -6079,6 +6085,11 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		return nil, validateErr
 	}
 
+	// Providers that always forward extra params (DeepSeek, vLLM, SGL, ...) set the
+	// passthrough flag on this shared context for their own attempt. Every fallback
+	// restarts from the caller's choice instead of the flag the last attempt left.
+	passthroughExtraParams, _ := ctx.Value(schemas.BifrostContextKeyPassthroughExtraParams).(bool)
+
 	bifrost.logger.Debug("primary provider %s with model %s and %d fallbacks", provider, model, len(fallbacks))
 
 	// TTFT deadline: every attempt but the last gets it, so a slow provider hands
@@ -6126,6 +6137,7 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Trying fallback %d/%d: %s/%s (previous attempt failed: %s)", i+1, len(fallbacks), fallback.Provider, fallback.Model, routingErrorSummary(lastErr)))
 		ctx.SetValue(schemas.BifrostContextKeyFallbackRequestID, uuid.New().String())
 		clearCtxForFallback(ctx)
+		ctx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, passthroughExtraParams)
 		// Re-pin after the clear: RunPreRequestHooks, which commits a target's pin, runs once per request, not per fallback.
 		if keyID := strings.TrimSpace(fallback.KeyID); keyID != "" {
 			ctx.SetFallbackPinnedAPIKeyID(keyID)

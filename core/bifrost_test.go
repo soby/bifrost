@@ -4395,6 +4395,81 @@ func TestFallbackUsesPinnedKey(t *testing.T) {
 	}
 }
 
+// TestFallbackDoesNotInheritProviderPassthroughExtraParams covers providers that force
+// extra-param passthrough for their own attempt (DeepSeek, vLLM, SGL, ...). The flag is
+// set on the shared request context, so without a per-attempt reset a fallback to a
+// provider that filters extra params received them anyway. Both orchestrator loops are
+// covered: they are independent copies.
+func TestFallbackDoesNotInheritProviderPassthroughExtraParams(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", streaming), func(t *testing.T) {
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = fmt.Fprint(w, `{"error":{"message":"rate limited","type":"rate_limit_error"}}`)
+			}))
+			defer primary.Close()
+
+			var fallbackBody atomic.Value
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				fallbackBody.Store(string(body))
+				if streaming {
+					sseHandler(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"id":"c","object":"chat.completion","created":1,"model":"gpt-4o-mini",`+
+					`"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+			}))
+			defer fallback.Close()
+
+			account := NewMockAccount()
+			account.AddProviderWithBaseURL(schemas.DeepSeek, 1, 1, primary.URL)
+			account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, fallback.URL)
+			account.configs[schemas.DeepSeek].NetworkConfig.MaxRetries = 0
+			account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
+			account.SetKeysForProvider(schemas.DeepSeek, []schemas.Key{
+				{ID: "deepseek-key", Value: *schemas.NewSecretVar("sk-deepseek"), Models: schemas.WhiteList{"*"}, Weight: 100},
+			})
+			account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+				{ID: "openai-key", Value: *schemas.NewSecretVar("sk-openai"), Models: schemas.WhiteList{"*"}, Weight: 100},
+			})
+			client := newStreamTestClient(t, account)
+
+			req := &schemas.BifrostChatRequest{
+				Provider: schemas.DeepSeek,
+				Model:    "deepseek-chat",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+				},
+				Params:    &schemas.ChatParameters{ExtraParams: map[string]interface{}{"deepseek_only": true}},
+				Fallbacks: []schemas.Fallback{{Provider: schemas.OpenAI, Model: "gpt-4o-mini"}},
+			}
+			ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+			if streaming {
+				stream, bifrostErr := client.ChatCompletionStreamRequest(ctx, req)
+				if bifrostErr != nil {
+					t.Fatalf("fallback stream failed: %s", bifrostErr.Error.Message)
+				}
+				if _, errs := drainChatStream(stream); len(errs) > 0 {
+					t.Fatalf("fallback stream emitted error chunks: %v", errs)
+				}
+			} else if _, bifrostErr := client.ChatCompletionRequest(ctx, req); bifrostErr != nil {
+				t.Fatalf("fallback failed: %s", bifrostErr.Error.Message)
+			}
+
+			body, _ := fallbackBody.Load().(string)
+			if body == "" {
+				t.Fatal("fallback provider was not called")
+			}
+			if strings.Contains(body, "deepseek_only") {
+				t.Fatalf("fallback inherited the primary provider's extra-param passthrough: %s", body)
+			}
+		})
+	}
+}
+
 // openAICompatFallbackServer answers chat completions in OpenAI shape, JSON or SSE, and records the
 // bearer token of every request so a test can tell which provider key served each attempt.
 func openAICompatFallbackServer(t *testing.T) (*httptest.Server, func() []string) {

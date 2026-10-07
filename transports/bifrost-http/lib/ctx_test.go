@@ -344,6 +344,35 @@ func TestConvertToBifrostContext_CompatHeaderForceReasoningOnlyToResponses(t *te
 	}
 }
 
+func TestConvertToBifrostContext_PassthroughExtraParamsHeader(t *testing.T) {
+	cases := []struct {
+		header string
+		want   bool
+	}{
+		{"true", true},
+		{"TRUE", true},
+		{"True", true},
+		{"1", true},
+		{"false", false},
+		{"0", false},
+		{"yes", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.header, func(t *testing.T) {
+			ctx := &fasthttp.RequestCtx{}
+			ctx.Request.Header.Set("x-bf-passthrough-extra-params", tc.header)
+
+			bifrostCtx, cancel := ConvertToBifrostContext(ctx, testHandlerStore{})
+			defer cancel()
+
+			got, _ := bifrostCtx.Value(schemas.BifrostContextKeyPassthroughExtraParams).(bool)
+			if got != tc.want {
+				t.Fatalf("passthrough extra params = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestConvertToBifrostContext_EmptyBaggageSessionIDIgnored(t *testing.T) {
 	ctx := &fasthttp.RequestCtx{}
 	ctx.Request.Header.Set("baggage", "session-id=   ")
