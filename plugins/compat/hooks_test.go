@@ -214,7 +214,7 @@ func TestReasoningWithToolsResponsesRouting(t *testing.T) {
 	}{
 		{name: "flag false with tools", enabled: true, model: "no-reasoning-with-tools", requestType: schemas.ChatCompletionRequest, withTools: true, wantConverted: true, wantReasoning: true},
 		{name: "flag false with tools stream", enabled: true, model: "no-reasoning-with-tools", requestType: schemas.ChatCompletionStreamRequest, withTools: true, wantConverted: true, wantReasoning: true},
-		{name: "flag false without tools", enabled: true, model: "no-reasoning-with-tools", requestType: schemas.ChatCompletionRequest, wantConverted: true, wantReasoning: true},
+		{name: "flag false without tools", enabled: true, model: "no-reasoning-with-tools", requestType: schemas.ChatCompletionRequest, wantReasoning: true},
 		{name: "reasoning with tools supported", enabled: true, model: "reasoning-with-tools", requestType: schemas.ChatCompletionRequest, withTools: true, wantReasoning: true},
 		{name: "no datasheet entry", enabled: true, model: "unknown", requestType: schemas.ChatCompletionRequest, withTools: true, wantReasoning: true},
 		{name: "toggle off forces reasoning off", model: "no-reasoning-with-tools", requestType: schemas.ChatCompletionRequest, withTools: true},
@@ -237,6 +237,62 @@ func TestReasoningWithToolsResponsesRouting(t *testing.T) {
 			}
 			if hasReasoning := got.ChatRequest.Params.Reasoning != nil; hasReasoning != tt.wantReasoning {
 				t.Errorf("reasoning preserved = %v, want %v", hasReasoning, tt.wantReasoning)
+			}
+		})
+	}
+}
+
+// TestReasoningWithToolsResponsesRoutingScope pins that the reroute applies only to
+// what it exists for: a chat request that asks for reasoning and carries tools, sent
+// to OpenAI or Azure, not carrying a raw body. A self-hosted or custom deployment
+// serving a model of the same name has no Responses endpoint to be routed to.
+func TestReasoningWithToolsResponsesRoutingScope(t *testing.T) {
+	ds := datasheet.NewTestStore(nil)
+	ds.SetSupportedParamsForTest(map[string][]string{"no-reasoning-with-tools": {"reasoning", "tools"}})
+	p, err := Init(Config{ForceReasoningOnlyModelsToResponses: true}, bifrost.NewNoOpLogger(), modelcatalog.NewTestCatalogWithDatasheet(ds))
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tools := []schemas.ChatTool{{Type: schemas.ChatToolTypeFunction, Function: &schemas.ChatToolFunction{Name: "lookup"}}}
+
+	tests := []struct {
+		name          string
+		provider      schemas.ModelProvider
+		reasoning     *schemas.ChatReasoning
+		tools         []schemas.ChatTool
+		rawBody       bool
+		wantConverted bool
+	}{
+		{name: "openai reasoning with tools", provider: schemas.OpenAI, reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}, tools: tools, wantConverted: true},
+		{name: "azure reasoning with tools", provider: schemas.Azure, reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}, tools: tools, wantConverted: true},
+		{name: "no reasoning requested", provider: schemas.OpenAI, tools: tools},
+		{name: "reasoning effort none", provider: schemas.OpenAI, reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("none")}, tools: tools},
+		{name: "reasoning disabled", provider: schemas.OpenAI, reasoning: &schemas.ChatReasoning{Enabled: schemas.Ptr(false)}, tools: tools},
+		{name: "no tools", provider: schemas.OpenAI, reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}},
+		{name: "vllm", provider: schemas.VLLM, reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}, tools: tools},
+		{name: "custom provider", provider: schemas.ModelProvider("my-deployment"), reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}, tools: tools},
+		{name: "raw body", provider: schemas.OpenAI, reasoning: &schemas.ChatReasoning{Effort: schemas.Ptr("high")}, tools: tools, rawBody: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newTestContext()
+			if tt.rawBody {
+				ctx.SetValue(schemas.BifrostContextKeyUseRawRequestBody, true)
+			}
+			req := &schemas.BifrostRequest{
+				RequestType: schemas.ChatCompletionRequest,
+				ChatRequest: &schemas.BifrostChatRequest{
+					Provider: tt.provider,
+					Model:    "no-reasoning-with-tools",
+					Params:   &schemas.ChatParameters{Reasoning: tt.reasoning, Tools: tt.tools},
+				},
+			}
+			if _, _, err := p.PreLLMHook(ctx, req); err != nil {
+				t.Fatalf("PreLLMHook: %v", err)
+			}
+			changeType, ok := ctx.Value(schemas.BifrostContextKeyChangeRequestType).(schemas.RequestType)
+			if converted := ok && changeType == schemas.ResponsesRequest; converted != tt.wantConverted {
+				t.Errorf("converted to responses = %v, want %v", converted, tt.wantConverted)
 			}
 		})
 	}

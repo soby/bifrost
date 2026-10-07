@@ -269,16 +269,29 @@ func (p *CompatPlugin) markForConversion(ctx *schemas.BifrostContext, provider s
 	}
 }
 
-// markReasoningWithToolsForResponses routes a chat request to Responses when the
-// datasheet sets supports_reasoning_with_tool_calls false for the model.
+// markReasoningWithToolsForResponses routes a chat request that asks for reasoning
+// and carries tools to Responses when the datasheet sets
+// supports_reasoning_with_tool_calls false for the model. Only OpenAI and Azure
+// are rerouted: the datasheet is keyed by model name, and a self-hosted or custom
+// deployment serving a model of that name has its own chat semantics and no
+// Responses endpoint to move to. Raw-body requests are sent as-is, never converted.
 func (p *CompatPlugin) markReasoningWithToolsForResponses(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) {
-	if p.modelCatalog == nil || req.ChatRequest == nil {
+	if p.modelCatalog == nil || req.ChatRequest == nil || req.ChatRequest.Params == nil {
 		return
 	}
 	if req.RequestType != schemas.ChatCompletionRequest && req.RequestType != schemas.ChatCompletionStreamRequest {
 		return
 	}
 	provider, model := req.ChatRequest.Provider, req.ChatRequest.Model
+	if provider != schemas.OpenAI && provider != schemas.Azure {
+		return
+	}
+	if useRaw, _ := ctx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool); useRaw {
+		return
+	}
+	if params := req.ChatRequest.Params; len(params.Tools) == 0 || !requestsReasoning(params.Reasoning) {
+		return
+	}
 	supported := p.modelCatalog.GetSupportedParameters(model)
 	// reasoning_with_tool_calls is listed unless the datasheet sets it explicitly false.
 	if supported == nil || !slices.Contains(supported, "reasoning") || slices.Contains(supported, "reasoning_with_tool_calls") {
@@ -286,4 +299,16 @@ func (p *CompatPlugin) markReasoningWithToolsForResponses(ctx *schemas.BifrostCo
 	}
 	ctx.SetValue(schemas.BifrostContextKeyChangeRequestType, schemas.ResponsesRequest)
 	ctx.Log(schemas.LogLevelInfo, fmt.Sprintf("model %s (%s) does not support reasoning with tool calls on %s, converting request to %s", model, provider, schemas.ChatCompletionRequest, schemas.ResponsesRequest))
+}
+
+// requestsReasoning reports whether the chat reasoning parameter asks for reasoning:
+// it is set and neither disables reasoning nor sets the "none" effort.
+func requestsReasoning(reasoning *schemas.ChatReasoning) bool {
+	if reasoning == nil {
+		return false
+	}
+	if reasoning.Enabled != nil && !*reasoning.Enabled {
+		return false
+	}
+	return reasoning.Effort == nil || *reasoning.Effort != schemas.ReasoningEffortNone
 }

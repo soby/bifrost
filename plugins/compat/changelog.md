@@ -1,0 +1,1 @@
+- [fix]: force_reasoning_only_models_to_responses reroutes only chat requests that ask for reasoning and carry tools, sent to OpenAI or Azure without a raw body. It matched by model name alone, so plain chat requests, and self-hosted or custom deployments serving a model of the same name, were converted to the Responses API [@soby](https://github.com/soby)
