@@ -252,6 +252,55 @@ func ResolveSessionIDFromRequest(h *fasthttp.RequestHeader) string {
 //	// Maxim tracing data, MCP filters, governance keys, API keys, cache settings,
 //	// session stickiness, and extra headers
 
+// EnsureSharedBifrostContext returns the request-scoped BifrostContext stored on ctx and its
+// cancel func, creating and storing them when absent. ConvertToBifrostContext and the transport
+// interceptor middleware both call it, so the HTTP transport pre-hook, the request handler, the
+// LLM hooks and the HTTP transport post-hook all read and write one context: a value a plugin
+// writes during the request is visible to its transport post-hook.
+//
+// A context seeded without a cancel func (large-payload detection) gets a cancellable child that
+// becomes the shared context. Every context created here watches the client socket and is
+// cancelled when the client leaves (#7035). The cancel func is idempotent.
+//
+// Fork-only: upstream's transport middleware builds its own context, separate from the handler's.
+func EnsureSharedBifrostContext(ctx *fasthttp.RequestCtx) (*schemas.BifrostContext, context.CancelFunc) {
+	var bifrostCtx *schemas.BifrostContext
+	var cancel context.CancelFunc
+	if existing, ok := ctx.UserValue(FastHTTPUserValueBifrostContext).(*schemas.BifrostContext); ok && existing != nil {
+		if existingCancel, ok := ctx.UserValue(FastHTTPUserValueBifrostCancel).(context.CancelFunc); ok && existingCancel != nil {
+			return existing, existingCancel
+		}
+		// Create one cancellable child context and promote it as the shared context.
+		// A context seeded by a transport hook (large-payload detection) takes this
+		// path, so the client socket is watched here too; the branch above, where a
+		// cancel func already exists, means a watcher is already running.
+		bifrostCtx, cancel = schemas.NewBifrostContextWithCancel(existing)
+		startClientDisconnectWatcher(ctx.Conn(), bifrostCtx, cancel)
+		ctx.SetUserValue(FastHTTPUserValueBifrostContext, bifrostCtx)
+		ctx.SetUserValue(FastHTTPUserValueBifrostCancel, cancel)
+		return bifrostCtx, cancel
+	}
+	// Create cancellable context for requests that don't have a shared context yet.
+	parent := context.Context(ctx)
+	func() {
+		// Zero-value fasthttp.RequestCtx can panic on Done(); fall back safely.
+		defer func() {
+			if recover() != nil {
+				parent = context.Background()
+			}
+		}()
+		_ = ctx.Done()
+	}()
+	bifrostCtx, cancel = schemas.NewBifrostContextWithCancel(parent)
+	// Cancel the request when the client closes its socket while the handler
+	// is still waiting on core; fasthttp offers no per-request Done (#7035).
+	startClientDisconnectWatcher(ctx.Conn(), bifrostCtx, cancel)
+	ctx.SetUserValue(FastHTTPUserValueBifrostContext, bifrostCtx)
+	ctx.SetUserValue(FastHTTPUserValueBifrostCancel, cancel)
+	return bifrostCtx, cancel
+}
+
+
 func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*schemas.BifrostContext, context.CancelFunc) {
 	// "transport-context" overhead phase: building the request-scoped BifrostContext —
 	// child-context alloc, request-id resolution, and the full request-header iteration
@@ -276,42 +325,7 @@ func ConvertToBifrostContext(ctx *fasthttp.RequestCtx, store HandlerStore) (*sch
 		allowPerRequestRawOverride = store.ShouldAllowPerRequestRawOverride()
 	}
 	// Reuse a shared request-scoped context when available.
-	var bifrostCtx *schemas.BifrostContext
-	var cancel context.CancelFunc
-	if existing, ok := ctx.UserValue(FastHTTPUserValueBifrostContext).(*schemas.BifrostContext); ok && existing != nil {
-		if existingCancel, ok := ctx.UserValue(FastHTTPUserValueBifrostCancel).(context.CancelFunc); ok && existingCancel != nil {
-			bifrostCtx = existing
-			cancel = existingCancel
-		} else {
-			// Create one cancellable child context and promote it as the shared context.
-			// A context seeded by a transport hook (large-payload detection) takes this
-			// path, so the client socket is watched here too; the branch above, where a
-			// cancel func already exists, means a watcher is already running.
-			bifrostCtx, cancel = schemas.NewBifrostContextWithCancel(existing)
-			startClientDisconnectWatcher(ctx.Conn(), bifrostCtx, cancel)
-			ctx.SetUserValue(FastHTTPUserValueBifrostContext, bifrostCtx)
-			ctx.SetUserValue(FastHTTPUserValueBifrostCancel, cancel)
-		}
-	}
-	if bifrostCtx == nil {
-		// Create cancellable context for requests that don't have a shared context yet.
-		parent := context.Context(ctx)
-		func() {
-			// Zero-value fasthttp.RequestCtx can panic on Done(); fall back safely.
-			defer func() {
-				if recover() != nil {
-					parent = context.Background()
-				}
-			}()
-			_ = ctx.Done()
-		}()
-		bifrostCtx, cancel = schemas.NewBifrostContextWithCancel(parent)
-		// Cancel the request when the client closes its socket while the handler
-		// is still waiting on core; fasthttp offers no per-request Done (#7035).
-		startClientDisconnectWatcher(ctx.Conn(), bifrostCtx, cancel)
-		ctx.SetUserValue(FastHTTPUserValueBifrostContext, bifrostCtx)
-		ctx.SetUserValue(FastHTTPUserValueBifrostCancel, cancel)
-	}
+	bifrostCtx, cancel := EnsureSharedBifrostContext(ctx)
 
 	// Preserve existing request-id if already present on the shared context.
 	if existingRequestID, ok := bifrostCtx.Value(schemas.BifrostContextKeyRequestID).(string); !ok || existingRequestID == "" {

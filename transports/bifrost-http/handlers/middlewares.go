@@ -641,8 +641,19 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 				next(ctx)
 				return
 			}
-			// Get or create BifrostContext from fasthttp context
-			bifrostCtx := getBifrostContextFromFastHTTP(ctx)
+			// Fork-only: the pre-hook, the request handler (lib.ConvertToBifrostContext
+			// reuses the stored context), the LLM hooks and the post-hook share one
+			// context, so a value written during the request reaches the post-hook.
+			bifrostCtx, cancelBifrostCtx := lib.EnsureSharedBifrostContext(ctx)
+			// Release it on return, except on the streaming path: the stream is still
+			// being produced after this handler returns and the streaming machinery
+			// owns its cancellation.
+			streamingDeferred := false
+			defer func() {
+				if !streamingDeferred {
+					cancelBifrostCtx()
+				}
+			}()
 			// Transport pre-hooks run before the inference path stamps the
 			// catalog, so stamp it here too — otherwise ctx.GetModelInfo would
 			// be nil in HTTPTransportPreHook but populated in every other hook.
@@ -694,6 +705,7 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 			next(ctx)
 
 			deferred, _ := ctx.UserValue(schemas.BifrostContextKeyDeferTraceCompletion).(bool)
+			streamingDeferred = deferred
 			if !deferred && len(plugins) > 0 {
 				_ = runTransportPostHooks(ctx, plugins, bifrostCtx, true)
 			}
