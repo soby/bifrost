@@ -1545,6 +1545,10 @@
                 "type": "boolean",
                 "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
               },
+              "ignore_provider_cost": {
+                "type": "boolean",
+                "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+              },
               "network_config": {
                 "$ref": "#/$defs/network_config"
               },
@@ -3172,6 +3176,12 @@
                     "minimum": 1,
                     "default": 10000
                   },
+                  "max_query_size": {
+                    "type": "integer",
+                    "description": "ClickHouse max_query_size setting in bytes, the longest SQL text the server will parse (default: 16777216)",
+                    "minimum": 1,
+                    "default": 16777216
+                  },
                   "cluster": {
                     "type": "string",
                     "description": "Optional cluster name; when set, DDL runs ON CLUSTER with replicated table engines"
@@ -3661,6 +3671,13 @@
               "compress": true
             },
             "additionalProperties": false
+          }
+        },
+        "object_storage_exclude_request_types": {
+          "type": "array",
+          "description": "Request types (log object type, e.g. list_models, embedding) whose logs are not offloaded to object storage. These logs are written to the logs database in full instead. Hidden logs (content logging disabled with client.retain_content_in_object_storage on) are still offloaded, so their content never lands in the database.",
+          "items": {
+            "type": "string"
           }
         },
         "object_storage_exclude_fields": {
@@ -7179,6 +7196,10 @@
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
         },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+        },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
         }
@@ -7219,6 +7240,10 @@
         "store_raw_request_response": {
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
+        },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
         },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
@@ -7261,6 +7286,10 @@
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
         },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+        },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
         }
@@ -7301,6 +7330,10 @@
         "store_raw_request_response": {
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
+        },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
         },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
@@ -7343,6 +7376,10 @@
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
         },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+        },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
         }
@@ -7383,6 +7420,10 @@
         "store_raw_request_response": {
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
+        },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
         },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
@@ -7425,6 +7466,10 @@
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
         },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+        },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
         }
@@ -7465,6 +7510,10 @@
         "store_raw_request_response": {
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
+        },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
         },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
@@ -7507,6 +7556,10 @@
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
         },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+        },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
         }
@@ -7548,6 +7601,10 @@
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
         },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+        },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
         }
@@ -7586,6 +7643,10 @@
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
         },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
+        },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
         }
@@ -7623,6 +7684,10 @@
         "store_raw_request_response": {
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
+        },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
         },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
@@ -7664,6 +7729,10 @@
         "store_raw_request_response": {
           "type": "boolean",
           "description": "Capture raw request/response for internal logging only; strip from API responses returned to clients (default: false)"
+        },
+        "ignore_provider_cost": {
+          "type": "boolean",
+          "description": "Ignore the provider-reported usage.cost and calculate cost from Bifrost's model pricing and pricing overrides (default: false)"
         },
         "custom_provider_config": {
           "$ref": "#/$defs/custom_provider_config"
