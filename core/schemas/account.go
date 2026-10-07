@@ -836,6 +836,13 @@ type VertexKeyConfig struct {
 	ForceSingleRegion bool `json:"force_single_region,omitempty"`
 	// AWSWorkloadIdentity federates the workload's AWS identity into GCP; see VertexAWSWorkloadIdentityConfig.
 	AWSWorkloadIdentity *VertexAWSWorkloadIdentityConfig `json:"aws_workload_identity,omitempty"`
+	// AccessToken is a ready OAuth 2.0 access token with the cloud-platform scope, minted and
+	// refreshed by the caller (fork-only). When set, every Vertex call authenticates with it
+	// as given: no token source is built or cached, and AuthCredentials, AWSWorkloadIdentity
+	// and Application Default Credentials are never consulted. It is the only credential a
+	// request-scoped Vertex key (BifrostRequest.UpdateProviderKey) may carry. Runtime-only:
+	// it is never serialized, persisted or returned by the API.
+	AccessToken string `json:"-"`
 }
 
 // VertexAWSWorkloadIdentityConfig configures GCP Workload Identity Federation from an AWS identity.

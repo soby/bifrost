@@ -163,6 +163,10 @@ func getClientKey(credentialIdentity string) string {
 // - Token acquisition fails (tokenSource.Token() error)
 // This forces the next request to re-create the token source from scratch.
 func (provider *VertexProvider) removeVertexClient(key schemas.Key) {
+	if hasCallerAccessToken(key) {
+		// A caller-supplied token has no cached source to evict (see getAuthTokenSource).
+		return
+	}
 	clientKey := getClientKey(vertexCredentialIdentity(key))
 	provider.tokenSources.Delete(clientKey)
 }
@@ -203,7 +207,7 @@ func NewVertexProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*
 		DisablePathNormalizing: true,
 	}
 	client = providerUtils.ConfigureProxy(client, config.ProxyConfig, logger)
-	client = providerUtils.ConfigureDialer(client, config.NetworkConfig.AllowPrivateNetwork)
+	client = providerUtils.ConfigureDialerFor(client, config.NetworkConfig)
 	client = providerUtils.ConfigureTLS(client, config.NetworkConfig, logger)
 	streamingClient := providerUtils.BuildStreamingClient(client)
 	return &VertexProvider{
@@ -234,6 +238,11 @@ const cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
 // credentials (GCE, GKE workload identity) use the metadata package's own client,
 // which is right: link-local metadata traffic must never be proxied.
 func (provider *VertexProvider) getAuthTokenSource(key schemas.Key) (oauth2.TokenSource, error) {
+	if hasCallerAccessToken(key) {
+		// Fork-only: the caller minted the token and owns its refresh. It is used as given,
+		// never cached, and no other credential is consulted.
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: key.VertexKeyConfig.AccessToken, TokenType: "Bearer"}), nil
+	}
 	authCredentials := key.VertexKeyConfig.AuthCredentials
 	clientKey := getClientKey(vertexCredentialIdentity(key))
 

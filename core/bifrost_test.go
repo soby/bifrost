@@ -5083,6 +5083,15 @@ func TestRequestScopedProviderRules(t *testing.T) {
 		}
 		return schemas.Key{Value: *schemas.NewSecretVar("bedrock-api-key"), BedrockKeyConfig: cfg}
 	}
+	vertexToken := func(mutate func(*schemas.Key)) schemas.Key {
+		k := schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{
+			ProjectID: *schemas.NewSecretVar("my-project"), Region: *schemas.NewSecretVar("us-central1"), AccessToken: "ya29.test-token",
+		}}
+		if mutate != nil {
+			mutate(&k)
+		}
+		return k
+	}
 	bedrockStatic := schemas.Key{BedrockKeyConfig: &schemas.BedrockKeyConfig{
 		AccessKey: *schemas.NewSecretVar("AKIAEXAMPLE"), SecretKey: *schemas.NewSecretVar("secret"), Region: region("eu-west-2"),
 	}}
@@ -5126,6 +5135,44 @@ func TestRequestScopedProviderRules(t *testing.T) {
 			c.Endpoints = &schemas.BedrockEndpoints{Runtime: schemas.NewSecretVar("vpce.example.com")}
 		}), wantErr: "endpoint overrides"},
 		{name: "bedrock base URL", provider: schemas.Bedrock, requestType: schemas.ChatCompletionRequest, key: bedrockBearer(nil), baseURL: "https://x.example.com", wantErr: "not a base URL"},
+		// Fork-only: Vertex with a caller-supplied access token.
+		{name: "vertex access token chat", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(nil)},
+		{name: "vertex access token batch", provider: schemas.Vertex, requestType: schemas.BatchCreateRequest, key: vertexToken(nil)},
+		{name: "vertex access token files", provider: schemas.Vertex, requestType: schemas.FileUploadRequest, key: vertexToken(nil)},
+		{name: "vertex access token list models", provider: schemas.Vertex, requestType: schemas.ListModelsRequest, key: vertexToken(nil)},
+		{name: "vertex domain-scoped project", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.VertexKeyConfig.ProjectID = *schemas.NewSecretVar("example.com:my-project")
+		})},
+		{name: "vertex no key config", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: schemas.Key{}, wantErr: "vertex_key_config"},
+		{name: "vertex empty token", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) { k.VertexKeyConfig.AccessToken = "" }), wantErr: "non-empty"},
+		{name: "vertex token with newline", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.VertexKeyConfig.AccessToken = "ya29.x\r\nX-Injected: 1"
+		}), wantErr: "control characters"},
+		{name: "vertex API key", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) { k.Value = *schemas.NewSecretVar("AIza") }), wantErr: "API keys"},
+		{name: "vertex service account", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.VertexKeyConfig.AuthCredentials = *schemas.NewSecretVar(`{"type":"service_account"}`)
+		}), wantErr: "service-account"},
+		{name: "vertex AWS workload identity", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.VertexKeyConfig.AWSWorkloadIdentity = &schemas.VertexAWSWorkloadIdentityConfig{Audience: *schemas.NewSecretVar("//iam.googleapis.com/x")}
+		}), wantErr: "AWS workload identity"},
+		{name: "vertex no region", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) { k.VertexKeyConfig.Region = schemas.SecretVar{} }), wantErr: "region"},
+		{name: "vertex crafted region", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.VertexKeyConfig.Region = *schemas.NewSecretVar("evil.com/#")
+		}), wantErr: "region"},
+		{name: "vertex no project", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) { k.VertexKeyConfig.ProjectID = schemas.SecretVar{} }), wantErr: "project_id"},
+		{name: "vertex crafted project", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.VertexKeyConfig.ProjectID = *schemas.NewSecretVar("p/../../x")
+		}), wantErr: "project_id"},
+		{name: "vertex crafted project number", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.VertexKeyConfig.ProjectNumber = *schemas.NewSecretVar("12/34")
+		}), wantErr: "project_number"},
+		{name: "vertex crafted alias region", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.Aliases = schemas.KeyAliases{"m": {ModelID: "m", Region: region("evil.com/#")}}
+		}), wantErr: "alias regions"},
+		{name: "vertex crafted alias project", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(func(k *schemas.Key) {
+			k.Aliases = schemas.KeyAliases{"m": {ModelID: "m", VertexAliasCfg: &schemas.VertexAliasCfg{ProjectID: region("a?b")}}}
+		}), wantErr: "alias project IDs"},
+		{name: "vertex base URL", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(nil), baseURL: "https://x.example.com", wantErr: "not a base URL"},
 	}
 	b := &Bifrost{logger: NewDefaultLogger(schemas.LogLevelError)}
 	for _, tt := range tests {
@@ -5149,7 +5196,8 @@ func TestRequestScopedProviderRules(t *testing.T) {
 
 	// These fall back to ambient credentials or cache tokens per credential, so none of them
 	// can be configured per request.
-	for _, provider := range []schemas.ModelProvider{schemas.Vertex, schemas.BedrockMantle, schemas.Databricks, schemas.GithubCopilot} {
+	// Vertex is served per request in the fork with a caller-supplied access token only.
+	for _, provider := range []schemas.ModelProvider{schemas.BedrockMantle, schemas.Databricks, schemas.GithubCopilot} {
 		instance, err := b.createBaseProvider(provider, requestScopedProviderConfig(false))
 		if err != nil {
 			t.Fatalf("createBaseProvider(%s): %v", provider, err)
@@ -5724,9 +5772,14 @@ func TestRequestScopedConfiguration_FailsClosed(t *testing.T) {
 		attempt   func(req *schemas.BifrostRequest)
 		wantErr   string
 	}{
-		{name: "provider without support", provider: schemas.Vertex, configure: func(req *schemas.BifrostRequest) error {
-			return req.UpdateProviderKey(schemas.Vertex, schemas.Key{Value: *schemas.NewSecretVar("token")})
+		{name: "provider without support", provider: schemas.BedrockMantle, configure: func(req *schemas.BifrostRequest) error {
+			return req.UpdateProviderKey(schemas.BedrockMantle, schemas.Key{Value: *schemas.NewSecretVar("token")})
 		}, wantErr: "does not support request-scoped configuration"},
+		{name: "vertex without an access token", provider: schemas.Vertex, configure: func(req *schemas.BifrostRequest) error {
+			return req.UpdateProviderKey(schemas.Vertex, schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{
+				ProjectID: *schemas.NewSecretVar("my-project"), Region: *schemas.NewSecretVar("us-central1"),
+			}})
+		}, wantErr: "non-empty vertex_key_config access token"},
 		{name: "unknown provider", provider: "not-a-provider", configure: func(req *schemas.BifrostRequest) error {
 			return req.UpdateProviderKey("not-a-provider", schemas.Key{Value: *schemas.NewSecretVar("k")})
 		}, wantErr: "unsupported provider"},
