@@ -2567,3 +2567,64 @@ func TestToOpenAIChatRequest_ToolSchemaKeepsUnknownKeywords(t *testing.T) {
 	require.Equal(t, int64(1), params.Get("minProperties").Int())
 	require.Equal(t, `[1,null]`, params.Get("enum").Raw)
 }
+
+// TestToOpenAIChatRequest_AudioVoiceObjectAndAssistantAudio pins the provider wire for
+// audio replay: an object-valued output voice ({"id": ...}, custom voices) reaches the
+// wire as sent, and a prior assistant turn's audio reference is replayed as {"id": ...}
+// to OpenAI and to destinations without a curated dialect, but not to curated
+// dialects that do not define it.
+func TestToOpenAIChatRequest_AudioVoiceObjectAndAssistantAudio(t *testing.T) {
+	var params schemas.ChatParameters
+	require.NoError(t, sonic.Unmarshal([]byte(`{"modalities":["text","audio"],"audio":{"voice":{"id":"voice_123"},"format":"wav"}}`), &params))
+	var messages []schemas.ChatMessage
+	require.NoError(t, sonic.Unmarshal([]byte(`[{"role":"user","content":"hi"},`+
+		`{"role":"assistant","content":null,"audio":{"id":"audio_abc"}},{"role":"user","content":"again"}]`), &messages))
+
+	for _, tt := range []struct {
+		provider       schemas.ModelProvider
+		assistantAudio bool
+	}{
+		{provider: schemas.OpenAI, assistantAudio: true},
+		{provider: schemas.Azure, assistantAudio: true},
+		{provider: schemas.OpenRouter, assistantAudio: true},
+		{provider: schemas.Groq, assistantAudio: false},
+	} {
+		t.Run(string(tt.provider), func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			paramsCopy := params
+			wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "gpt-4o-audio-preview",
+				Input:    messages,
+				Params:   &paramsCopy,
+			}))
+			require.NoError(t, err)
+			require.JSONEq(t, `{"voice":{"id":"voice_123"},"format":"wav"}`, providerUtils.GetJSONField(wireBody, "audio").Raw, "wire body: %s", wireBody)
+			audio := providerUtils.GetJSONField(wireBody, "messages.1.audio")
+			if tt.assistantAudio {
+				require.JSONEq(t, `{"id":"audio_abc"}`, audio.Raw, "wire body: %s", wireBody)
+			} else {
+				require.False(t, audio.Exists(), "wire body: %s", wireBody)
+			}
+		})
+	}
+
+	var named schemas.ChatParameters
+	require.NoError(t, sonic.Unmarshal([]byte(`{"audio":{"voice":"alloy","format":"mp3"}}`), &named))
+	require.Equal(t, "alloy", named.Audio.Voice)
+	encoded, err := sonic.Marshal(named.Audio)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"voice":"alloy","format":"mp3"}`, string(encoded))
+}
+
+// TestConvertOpenAIMessagesToBifrostMessages_AssistantAudio pins that the OpenAI
+// integration keeps a replayed assistant audio reference.
+func TestConvertOpenAIMessagesToBifrostMessages_AssistantAudio(t *testing.T) {
+	var msg OpenAIMessage
+	require.NoError(t, sonic.Unmarshal([]byte(`{"role":"assistant","content":null,"audio":{"id":"audio_abc"}}`), &msg))
+	converted := ConvertOpenAIMessagesToBifrostMessages([]OpenAIMessage{msg})
+	require.NotNil(t, converted[0].ChatAssistantMessage)
+	require.NotNil(t, converted[0].Audio)
+	require.Equal(t, "audio_abc", converted[0].Audio.ID)
+}

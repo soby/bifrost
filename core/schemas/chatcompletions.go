@@ -351,8 +351,41 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 
 // ChatAudioParameters represents the parameters for a chat audio completion. (Only supported by OpenAI Models that support audio input)
 type ChatAudioParameters struct {
-	Format string `json:"format,omitempty"` // Format for the audio completion
-	Voice  string `json:"voice,omitempty"`  // Voice to use for the audio completion
+	Format      string          `json:"format,omitempty"` // Format for the audio completion
+	Voice       string          `json:"voice,omitempty"`  // Voice to use for the audio completion
+	VoiceObject json.RawMessage `json:"-"`                // Object-form voice (e.g. {"id":"voice_123"}), sent instead of Voice when set
+}
+
+// UnmarshalJSON accepts the voice as a built-in voice name or as an object
+// (custom voices), keeping the object verbatim in VoiceObject.
+func (a *ChatAudioParameters) UnmarshalJSON(data []byte) error {
+	type Alias ChatAudioParameters
+	var aux struct {
+		Alias
+		Voice json.RawMessage `json:"voice"`
+	}
+	if err := Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*a = ChatAudioParameters(aux.Alias)
+	if voice := bytes.TrimSpace(aux.Voice); len(voice) > 0 && voice[0] == '{' {
+		a.VoiceObject = voice
+	} else if len(voice) > 0 {
+		return Unmarshal(voice, &a.Voice)
+	}
+	return nil
+}
+
+// MarshalJSON emits VoiceObject as the voice when set, otherwise the voice name.
+func (a ChatAudioParameters) MarshalJSON() ([]byte, error) {
+	type Alias ChatAudioParameters
+	if len(a.VoiceObject) == 0 {
+		return MarshalSorted(Alias(a))
+	}
+	return MarshalSorted(struct {
+		Alias
+		Voice json.RawMessage `json:"voice"`
+	}{Alias: Alias(a), Voice: a.VoiceObject})
 }
 
 // Not in OpenAI's spec, but needed to support extra parameters for reasoning.

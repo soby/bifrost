@@ -101,6 +101,7 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 
 	switch bifrostReq.Provider {
 	case schemas.OpenAI, schemas.Azure:
+		openaiReq.forwardAssistantAudio(bifrostReq.Input)
 		if openaiReq.MaxCompletionTokens != nil && *openaiReq.MaxCompletionTokens < MinMaxCompletionTokens {
 			openaiReq.MaxCompletionTokens = schemas.Ptr(MinMaxCompletionTokens)
 		}
@@ -189,6 +190,7 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		return openaiReq
 	default:
 		openaiReq.forwardReasoningDetails(bifrostReq.Input)
+		openaiReq.forwardAssistantAudio(bifrostReq.Input)
 		// Destinations without a curated dialect get the limit under the name the
 		// caller used; not every OpenAI-compatible server reads max_completion_tokens.
 		if openaiReq.LegacyMaxTokens && openaiReq.MaxCompletionTokens != nil {
@@ -361,6 +363,21 @@ func (req *OpenAIChatRequest) forwardReasoningDetails(messages []schemas.ChatMes
 			continue
 		}
 		assistantMessage.ReasoningDetails = messages[i].ReasoningDetails
+	}
+}
+
+// forwardAssistantAudio replays the audio reference ({"id": ...}) of previous
+// assistant audio responses, which OpenAI needs to continue an audio conversation.
+// Like reasoning_details it goes only to OpenAI, Azure and destinations without a
+// curated dialect. messages lines up index for index with req.Messages.
+func (req *OpenAIChatRequest) forwardAssistantAudio(messages []schemas.ChatMessage) {
+	for i := range req.Messages {
+		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
+		if assistantMessage == nil || messages[i].ChatAssistantMessage == nil ||
+			messages[i].Audio == nil || messages[i].Audio.ID == "" {
+			continue
+		}
+		assistantMessage.Audio = &OpenAIChatAssistantAudio{ID: messages[i].Audio.ID}
 	}
 }
 

@@ -260,6 +260,14 @@ type OpenAIChatAssistantMessage struct {
 
 	Annotations []schemas.ChatAssistantMessageAnnotation `json:"annotations,omitempty"`
 	ToolCalls   []schemas.ChatAssistantMessageToolCall   `json:"tool_calls,omitempty"`
+
+	Audio *OpenAIChatAssistantAudio `json:"audio,omitempty"` // Reference to a previous audio response
+}
+
+// OpenAIChatAssistantAudio references the audio of a previous assistant response
+// when it is replayed in a later request.
+type OpenAIChatAssistantAudio struct {
+	ID string `json:"id"`
 }
 
 // MarshalJSON implements custom JSON marshalling for OpenAIChatRequest.
