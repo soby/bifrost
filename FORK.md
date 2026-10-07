@@ -137,3 +137,5 @@ not compensate:
   absent.
 - The legacy assistant `function_call` (pre-tools OpenAI format) on replayed assistant
   messages is dropped; use `tool_calls`.
+- An empty assistant `reasoning` / `reasoning_content` string is treated as absent, and empty
+  `reasoning_details` entries are pruned (upstream #7294).
