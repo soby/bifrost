@@ -2571,16 +2571,9 @@ func (bifrost *Bifrost) BatchCreateRequest(ctx *schemas.BifrostContext, req *sch
 		ctx = bifrost.ctx
 	}
 
-	provider := bifrost.getProviderByKey(req.Provider)
-	if provider == nil {
-		return nil, &schemas.BifrostError{
-			IsBifrostError: false,
-			Error: &schemas.ErrorField{
-				Message: "provider not found for batch create request",
-			},
-		}
-	}
-
+	// The provider check runs in handleRequest after PreRequestHook (see
+	// errBatchCreateProviderNotFound), so a request the hooks give request-scoped
+	// configuration never initializes a provider instance.
 	bifrostReq := bifrost.getBifrostRequest()
 	bifrostReq.RequestType = schemas.BatchCreateRequest
 	bifrostReq.BatchCreateRequest = req
@@ -5218,6 +5211,35 @@ func (bifrost *Bifrost) processRequestScoped(providerKey schemas.ModelProvider, 
 	bifrost.processChannelMessage(provider, instance.config, msg, nil)
 }
 
+// errBatchCreateProviderNotFound is the message BatchCreateRequest fails with when its
+// provider is neither configured nor dynamically configurable.
+const errBatchCreateProviderNotFound = "provider not found for batch create request"
+
+// checkBatchCreateProvider runs BatchCreateRequest's provider check for req, a request that
+// has been through PreRequestHook. It returns nil for any other request type and for a
+// request carrying request-scoped configuration, which runs on a request-scoped instance
+// (or resolves its provider after PreLLMHook, as tryRequest does) and must not initialize a
+// provider. Otherwise getProviderByKey resolves the provider, initializing a dynamically
+// configurable one with default settings, and an unknown provider fails before the LLM hooks.
+//
+// Fork-only: upstream runs this check in BatchCreateRequest before PreRequestHook, where a
+// plugin cannot yet have configured the request, so every batch create initialized a
+// provider instance even when the request was request-scoped.
+func (bifrost *Bifrost) checkBatchCreateProvider(req *schemas.BifrostRequest, provider schemas.ModelProvider) *schemas.BifrostError {
+	if req.RequestType != schemas.BatchCreateRequest || len(req.ProviderOverrides) > 0 {
+		return nil
+	}
+	if bifrost.getProviderByKey(provider) != nil {
+		return nil
+	}
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: false,
+		Error:          &schemas.ErrorField{Message: errBatchCreateProviderNotFound},
+	}
+	bifrostErr.PopulateExtraFields(req.RequestType, provider, "", "")
+	return bifrostErr
+}
+
 // GetProviderByKey returns the provider instance for the given provider key.
 // Returns nil if no provider with the given key exists.
 func (bifrost *Bifrost) GetProviderByKey(providerKey schemas.ModelProvider) schemas.Provider {
@@ -5906,6 +5928,11 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		flushPluginLogs(ctx)
 		validateErr.PopulateExtraFields(req.RequestType, provider, model, model)
 		return nil, validateErr
+	}
+
+	if batchErr := bifrost.checkBatchCreateProvider(req, provider); batchErr != nil {
+		flushPluginLogs(ctx)
+		return nil, batchErr
 	}
 
 	// Providers that always forward extra params (DeepSeek, vLLM, SGL, ...) set the

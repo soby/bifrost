@@ -5282,6 +5282,10 @@ func requestScopedTestServer(t *testing.T) (*httptest.Server, func() []requestSc
 			_, _ = fmt.Fprint(w, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"m","usage":{"prompt_tokens":1,"total_tokens":1}}`)
 		case strings.HasSuffix(r.URL.Path, "/v1/models"):
 			openAIStyleModelsHandler("m")(w, r)
+		case strings.HasSuffix(r.URL.Path, "/v1/batches"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"batch_1","object":"batch","endpoint":"/v1/chat/completions","input_file_id":"file-1",`+
+				`"completion_window":"24h","status":"validating","created_at":1}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -5971,33 +5975,70 @@ func TestRequestScopedConfiguration_Concurrent(t *testing.T) {
 	}
 }
 
-// TestRequestScopedConfiguration_BatchCreateChecksProviderFirst pins that BatchCreateRequest keeps
-// checking its provider before any plugin runs, so a provider that is neither configured nor
-// dynamically configurable fails there even when a plugin would configure it per request.
-func TestRequestScopedConfiguration_BatchCreateChecksProviderFirst(t *testing.T) {
+// TestRequestScopedConfiguration_BatchCreateSkipsProviderCheck pins the fork's BatchCreateRequest
+// provider check: it runs after PreRequestHook, so a batch create the hook configured per request
+// runs on the request-scoped instance and initializes no provider, even for a dynamically
+// configurable provider the check would otherwise initialize with default settings.
+func TestRequestScopedConfiguration_BatchCreateSkipsProviderCheck(t *testing.T) {
 	server, calls := requestScopedTestServer(t)
 	plugin := &requestScopedTestPlugin{configure: func(_ *schemas.BifrostContext, req *schemas.BifrostRequest) {
-		if err := req.UpdateProviderKey(schemas.Ollama, schemas.Key{Value: *schemas.NewSecretVar("k")}); err != nil {
-			t.Errorf("UpdateProviderKey: %v", err)
-		}
-		if err := req.UpdateProviderBaseURL(schemas.Ollama, server.URL); err != nil {
-			t.Errorf("UpdateProviderBaseURL: %v", err)
-		}
+		mustConfigureOpenAI(t, req, "sk-batch", server.URL)
 	}}
+	account := &countingAccount{MockAccount: NewMockAccount()}
+	client := newRequestScopedTestClient(t, account, plugin, nil)
+
+	resp, bifrostErr := client.BatchCreateRequest(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), &schemas.BifrostBatchCreateRequest{
+		Provider:    schemas.OpenAI,
+		InputFileID: "file-1",
+		Endpoint:    schemas.BatchEndpointChatCompletions,
+	})
+	if bifrostErr != nil {
+		t.Fatalf("BatchCreateRequest: %s", bifrostErr.GetErrorString())
+	}
+	if resp == nil || resp.ID != "batch_1" {
+		t.Fatalf("response = %+v, want batch_1", resp)
+	}
+	if got := calls(); len(got) != 1 || got[0].path != "/v1/batches" || got[0].auth != "Bearer sk-batch" {
+		t.Fatalf("upstream calls = %+v, want one POST /v1/batches with the request-scoped key", got)
+	}
+	if providers := client.providers.Load(); providers != nil && len(*providers) != 0 {
+		t.Errorf("%d providers were registered", len(*providers))
+	}
+	if _, ok := client.requestQueues.Load(schemas.OpenAI); ok {
+		t.Error("a provider queue was created for openai")
+	}
+	if n := account.configLookups.Load(); n != 0 {
+		t.Errorf("the account was asked for provider config %d times", n)
+	}
+}
+
+// TestRequestScopedConfiguration_BatchCreateChecksProvider pins that a batch create without
+// request-scoped configuration keeps BatchCreateRequest's provider check: a provider that is
+// neither configured nor dynamically configurable fails with the same error, after
+// PreRequestHook and before the LLM hooks or any upstream call.
+func TestRequestScopedConfiguration_BatchCreateChecksProvider(t *testing.T) {
+	_, calls := requestScopedTestServer(t)
+	plugin := &requestScopedTestPlugin{}
 	client := newRequestScopedTestClient(t, NewMockAccount(), plugin, nil)
 
 	_, bifrostErr := client.BatchCreateRequest(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), &schemas.BifrostBatchCreateRequest{
 		Provider: schemas.Ollama,
 		Requests: []schemas.BatchRequestItem{{CustomID: "1", Body: map[string]any{"model": "m"}}},
 	})
-	if bifrostErr == nil || bifrostErr.Error == nil || bifrostErr.Error.Message != "provider not found for batch create request" {
+	if bifrostErr == nil || bifrostErr.Error == nil || bifrostErr.Error.Message != errBatchCreateProviderNotFound {
 		t.Fatalf("error = %v, want the batch create provider check", bifrostErr)
 	}
-	if n := plugin.preRequestCalls.Load(); n != 0 {
-		t.Errorf("PreRequestHook ran %d times before the provider check failed", n)
+	if n := plugin.preRequestCalls.Load(); n != 1 {
+		t.Errorf("PreRequestHook ran %d times, want once before the check", n)
+	}
+	if pre, post := plugin.preLLMCalls.Load(), plugin.postLLMCalls.Load(); pre != 0 || post != 0 {
+		t.Errorf("LLM hooks ran (%d pre, %d post), want none", pre, post)
 	}
 	if got := calls(); len(got) != 0 {
 		t.Errorf("upstream was reached: %+v", got)
+	}
+	if providers := client.providers.Load(); providers != nil && len(*providers) != 0 {
+		t.Errorf("%d providers were registered", len(*providers))
 	}
 }
 
