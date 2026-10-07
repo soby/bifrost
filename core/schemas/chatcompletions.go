@@ -1843,6 +1843,7 @@ type BifrostResponseChoice struct {
 	FinishReason         *string          `json:"finish_reason"`
 	LogProbs             *BifrostLogProbs `json:"logprobs"`
 	ContentFilterResults json.RawMessage  `json:"content_filter_results,omitempty"` // Azure content-filter annotations for this choice, passed through untouched
+	Error                json.RawMessage  `json:"error,omitempty"`                  // In-band failure of this choice on a 200 (OpenRouter), passed through untouched
 
 	*TextCompletionResponseChoice
 	*ChatNonStreamResponseChoice
