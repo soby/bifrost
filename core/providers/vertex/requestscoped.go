@@ -107,7 +107,7 @@ func isVertexProjectID(s string) bool {
 		return false
 	}
 	for i := 0; i < len(domain); i++ {
-		if c := domain[i]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '.') {
+		if c := domain[i]; (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '.' {
 			return false
 		}
 	}
@@ -115,7 +115,7 @@ func isVertexProjectID(s string) bool {
 		return false
 	}
 	for i := 0; i < len(project); i++ {
-		if c := project[i]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+		if c := project[i]; (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
 			return false
 		}
 	}

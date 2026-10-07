@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -100,7 +101,7 @@ func TestToOpenAIChatRequest_OpenRouterProviderRouting(t *testing.T) {
 		}
 	}
 
-	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
+	ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
 	defer cancel()
 
 	openRouterRequest := ToOpenAIChatRequest(ctx, makeRequest(schemas.OpenRouter))
