@@ -55,6 +55,8 @@ New on this branch:
 |---|---|
 | dff2db37c | `BatchCreateRequest`'s provider check runs after `PreRequestHook` and is skipped for a request carrying request-scoped configuration, so a request-scoped batch create initializes no provider |
 | 1ecdac20d | Request-scoped Vertex with a caller-supplied OAuth access token (`VertexKeyConfig.AccessToken`) |
+| 012bd19ab | Per-attempt request timeout from the context (`BifrostContextKeyAttemptRequestTimeout`); expiry is a retryable timeout, so fallbacks run |
+| c64050487 | Fallbacks follow the request the primary attempt's `PreLLMHook` returned (fallback list, fallback decision and base request), as on the previous runtime branch |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
@@ -73,11 +75,15 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
 - Set them in `PreRequestHook`. A request that leaves `PreRequestHook` with no request-scoped
   configuration resolves its provider before `PreLLMHook`, so an unconfigured provider fails
   there; `PreLLMHook` can only change the configuration of a request that already carries some.
+- Fallbacks come from the request the primary attempt ran with (fork-only): a `PreLLMHook`
+  that returns a replacement request on the primary attempt sets the fallbacks, and every
+  fallback attempt starts from a copy of that request.
 - Key fields must be literal values; `env.` and `vault.` references are rejected. A key without
   an ID is reported as `request-scoped`.
 - Request-scoped attempts run on an unregistered instance built with default network settings
   (`DefaultNetworkConfig`: 300 s request timeout, 0 retries). There is no per-request
-  timeout, retry count or backoff; bound a request with its context deadline. Loopback and
+  retry count or backoff; bound a request with its context deadline and an attempt with
+  `BifrostContextKeyAttemptRequestTimeout` (below). Loopback and
   RFC 1918 destinations need `UpdateProviderAllowPrivateNetwork`; link-local is always refused.
 - WebSocket and realtime routes do not honor request-scoped configuration.
 - Supported: OpenAI, Anthropic, Gemini, Cohere, Cerebras, Groq, Mistral, Nebius, OpenRouter,
@@ -99,9 +105,17 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
 ### Per-request context keys
 
 - `schemas.BifrostContextKeyExtraHeaders` (`map[string][]string`): extra provider request
-  headers. They take priority over the provider's configured extra headers; hop-by-hop headers
-  are filtered. The key is cleared before each fallback attempt, so set it in `PreLLMHook`
-  for every attempt that needs it.
+  headers. They are set after the provider's configured extra headers and replace a header of
+  the same name, including a version header the adapter set before them; hop-by-hop headers are
+  filtered. The key is not cleared between attempts: a plugin that varies it per provider sets
+  the whole map in `PreLLMHook` for every attempt.
+- `schemas.BifrostContextKeyAttemptRequestTimeout` (`time.Duration`, fork-only): bounds each
+  provider HTTP round trip of the current attempt, the whole call for a unary request and the
+  wait for response headers for a stream, like `default_request_timeout_in_seconds` for a
+  configured provider. Expiry closes the socket and fails the attempt with a retryable timeout
+  (504 `request_timed_out`), so fallbacks run; cancelling the request stays a cancellation.
+  Cleared before each fallback, so set it in `PreLLMHook` for every attempt that needs it.
+  Bedrock's net/http requests are not bounded by it.
 - `schemas.BifrostContextKeyStreamIdleTimeout` (`time.Duration`): per-chunk idle timeout for
   streams. A positive value set before the attempt wins over the provider's configured
   `stream_idle_timeout_in_seconds` (default 120 s).
