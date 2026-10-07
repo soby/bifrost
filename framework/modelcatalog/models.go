@@ -34,6 +34,14 @@ func (mc *ModelCatalog) GetModelsForProvider(provider schemas.ModelProvider) []s
 	})
 }
 
+// modelsForProviderShared is GetModelsForProvider without the defensive clone,
+// for callers that only read the result; they must not modify it.
+func (mc *ModelCatalog) modelsForProviderShared(provider schemas.ModelProvider) []string {
+	return mc.modelsForProvider.GetOrComputeShared(string(provider), func() []string {
+		return mc.computeModelsForProvider(provider)
+	})
+}
+
 func (mc *ModelCatalog) computeModelsForProvider(provider schemas.ModelProvider) []string {
 	blacklisted := mc.keyconf.BlacklistedFor(provider)
 	allowed := mc.keyconf.AllowedFor(provider)
@@ -48,10 +56,10 @@ func (mc *ModelCatalog) computeModelsForProvider(provider schemas.ModelProvider)
 		// chat family) aren't shadowed by the incomplete live list.
 		datasheetModelsToAppend := mc.datasheet.DeprecatedDatasheetModelsForProvider(provider)
 		if providersWithPartialListModels[provider] {
-			datasheetModelsToAppend = mc.datasheet.DatasheetModelsForProvider(provider)
+			datasheetModelsToAppend = mc.datasheet.DatasheetModelsView(provider)
 		}
 		out = mc.appendAllowedDatasheetModels(out, datasheetModelsToAppend, allowed, blacklisted)
-	} else if datasheetModels := mc.datasheet.DatasheetModelsForProvider(provider); len(datasheetModels) > 0 && allowed != nil {
+	} else if datasheetModels := mc.datasheet.DatasheetModelsView(provider); len(datasheetModels) > 0 && allowed != nil {
 		out = make([]string, 0, len(datasheetModels))
 		for _, m := range datasheetModels {
 			if blacklisted.IsBlocked(m) {
@@ -215,7 +223,7 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 	providers := make([]schemas.ModelProvider, 0)
 	seen := make(map[schemas.ModelProvider]struct{})
 	for _, p := range mc.knownProviders() {
-		models := mc.GetModelsForProvider(p)
+		models := mc.modelsForProviderShared(p)
 		matched := false
 		for _, m := range models {
 			if m == model || mc.datasheet.BaseModelName(m) == baseModel {
@@ -233,7 +241,7 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 
 	// Cross-provider special cases
 	if _, ok := seen[schemas.OpenRouter]; !ok {
-		openRouterModels := mc.GetModelsForProvider(schemas.OpenRouter)
+		openRouterModels := mc.modelsForProviderShared(schemas.OpenRouter)
 		for _, p := range providers {
 			if slices.Contains(openRouterModels, string(p)+"/"+model) {
 				providers = append(providers, schemas.OpenRouter)
@@ -243,7 +251,7 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 		}
 	}
 	if _, ok := seen[schemas.Vertex]; !ok {
-		vertexModels := mc.GetModelsForProvider(schemas.Vertex)
+		vertexModels := mc.modelsForProviderShared(schemas.Vertex)
 		for _, p := range providers {
 			if slices.Contains(vertexModels, string(p)+"/"+model) {
 				providers = append(providers, schemas.Vertex)
@@ -253,12 +261,12 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 		}
 	}
 	if _, ok := seen[schemas.Groq]; !ok && strings.Contains(model, "gpt-") {
-		if slices.Contains(mc.GetModelsForProvider(schemas.Groq), "openai/"+model) {
+		if slices.Contains(mc.modelsForProviderShared(schemas.Groq), "openai/"+model) {
 			providers = append(providers, schemas.Groq)
 		}
 	}
 	if _, ok := seen[schemas.Bedrock]; !ok && strings.Contains(model, "claude") {
-		for _, bedrockModel := range mc.GetModelsForProvider(schemas.Bedrock) {
+		for _, bedrockModel := range mc.modelsForProviderShared(schemas.Bedrock) {
 			if strings.Contains(bedrockModel, model) {
 				providers = append(providers, schemas.Bedrock)
 				break
@@ -280,7 +288,7 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 		} else if allowed.Contains(model) {
 			matched = true
 		} else if allowed.IsUnrestricted() &&
-			len(mc.datasheet.DatasheetModelsForProvider(p)) == 0 &&
+			len(mc.datasheet.DatasheetModelsView(p)) == 0 &&
 			len(mc.live.UnfilteredModelsForProvider(p)) == 0 {
 			matched = true
 		}

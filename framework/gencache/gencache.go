@@ -104,18 +104,24 @@ func (c *Cache[V]) Get(key string) (V, bool) {
 // cached). compute may run concurrently for the same key under load; it must be
 // safe to call redundantly and its results must be equivalent.
 func (c *Cache[V]) GetOrCompute(key string, compute func() V) V {
+	return c.out(c.GetOrComputeShared(key, compute))
+}
+
+// GetOrComputeShared is GetOrCompute without WithClone: it returns the stored value
+// itself, for callers that only read it. The caller must not modify the result.
+func (c *Cache[V]) GetOrComputeShared(key string, compute func() V) V {
 	gen := c.gen()
 
 	c.mu.RLock()
 	e, ok := c.m[key]
 	c.mu.RUnlock()
 	if ok && e.gen == gen {
-		return c.out(e.val)
+		return e.val
 	}
 
 	val := compute()
 	if c.skipStore != nil && c.skipStore(val) {
-		return c.out(val)
+		return val
 	}
 
 	c.mu.Lock()
@@ -127,7 +133,7 @@ func (c *Cache[V]) GetOrCompute(key string, compute func() V) V {
 	c.m[key] = entry[V]{gen: gen, val: val}
 	c.mu.Unlock()
 
-	return c.out(val)
+	return val
 }
 
 // Len returns the number of entries currently held, counting stale ones that have

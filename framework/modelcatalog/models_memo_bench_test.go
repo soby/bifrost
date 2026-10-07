@@ -129,6 +129,19 @@ func BenchmarkProvidersForModel_Cached(b *testing.B) {
 	}
 }
 
+// BenchmarkProvidersForModel_UnknownModel covers a model no provider lists (a
+// custom deployment's own model name, a typo). An empty answer is never memoized,
+// so this compute path runs on every request for such a model.
+func BenchmarkProvidersForModel_UnknownModel(b *testing.B) {
+	mc, _ := benchCatalog(b, 30, 150)
+	b.ReportAllocs()
+	for b.Loop() {
+		if got := mc.GetProvidersForModel("not-in-any-catalog"); len(got) != 0 {
+			b.Fatalf("unexpected providers %v", got)
+		}
+	}
+}
+
 // IsModelAllowedForProvider with ["*"] is the exact call governance and the
 // loadbalancer make per request; measure it uncached vs cached.
 func BenchmarkIsModelAllowed_Uncached(b *testing.B) {

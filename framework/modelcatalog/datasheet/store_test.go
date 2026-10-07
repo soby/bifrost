@@ -41,6 +41,13 @@ func TestPricingLookupsNormalizeRuntimeProvider(t *testing.T) {
 	if got := s.DatasheetModelsForProvider(provider); !slices.Equal(got, []string{model}) {
 		t.Fatalf("DatasheetModelsForProvider() = %v, want [%s]", got, model)
 	}
+	view := s.DatasheetModelsView(provider)
+	if !slices.Equal(view, []string{model}) {
+		t.Fatalf("DatasheetModelsView() = %v, want [%s]", view, model)
+	}
+	if _ = append(view, "appended"); !slices.Equal(s.DatasheetModelsView(provider), []string{model}) {
+		t.Fatal("appending to the view must not write into the store's slice")
+	}
 	if got := s.DatasheetProviders(); !slices.Equal(got, []schemas.ModelProvider{provider}) {
 		t.Fatalf("DatasheetProviders() = %v, want [%s]", got, provider)
 	}

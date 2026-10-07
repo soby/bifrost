@@ -121,6 +121,21 @@ func TestWithClone_IsolatesCallerFromCache(t *testing.T) {
 	}
 }
 
+func TestGetOrComputeShared_SkipsClone(t *testing.T) {
+	var gen uint64
+	var clones int
+	c := New[[]int](func() uint64 { return gen }, 0, WithClone(func(v []int) []int { clones++; return slices.Clone(v) }))
+
+	stored := c.GetOrComputeShared("k", func() []int { return []int{1, 2, 3} })
+	again := c.GetOrComputeShared("k", func() []int { t.Fatal("unexpected recompute"); return nil })
+	if &stored[0] != &again[0] || clones != 0 {
+		t.Fatalf("shared reads must return the stored slice without cloning (clones=%d)", clones)
+	}
+	if cloned := c.GetOrCompute("k", nil); &cloned[0] == &stored[0] || clones != 1 {
+		t.Fatalf("GetOrCompute must still clone (clones=%d)", clones)
+	}
+}
+
 func TestGet_MissOnStaleAndAbsent(t *testing.T) {
 	var gen uint64
 	c := New[int](func() uint64 { return gen }, 0)

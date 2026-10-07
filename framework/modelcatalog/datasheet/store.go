@@ -296,6 +296,16 @@ func (s *Store) DatasheetModelsForProvider(provider schemas.ModelProvider) []str
 	return out
 }
 
+// DatasheetModelsView returns the same models as DatasheetModelsForProvider
+// without copying, for callers that only read them. The slice is shared with the
+// store: a reload replaces it and never modifies it, so it stays valid, but the
+// caller must not modify it.
+func (s *Store) DatasheetModelsView(provider schemas.ModelProvider) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clip(s.datasheetByProvider[provider])
+}
+
 // DeprecatedDatasheetModelsForProvider returns deprecated models from the
 // datasheet view for provider. Deprecated models may disappear from provider
 // list-models APIs but must remain visible in Bifrost catalog listings.
