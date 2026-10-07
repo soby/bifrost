@@ -7832,7 +7832,8 @@ func (bifrost *Bifrost) processChannelMessage(provider schemas.Provider, config 
 	if cfg := config.CustomProviderConfig; cfg != nil && cfg.BaseProviderType != "" {
 		baseProvider = cfg.BaseProviderType
 	}
-	req.Context.SetValue(schemas.BifrostContextKeyIsCustomProvider, !IsStandardProvider(baseProvider))
+	// A custom provider keeps its custom identity whatever base type it is built on.
+	req.Context.SetValue(schemas.BifrostContextKeyIsCustomProvider, config.CustomProviderConfig != nil || !IsStandardProvider(baseProvider))
 	// Lets downstream converters resolve a custom provider key back to the built-in provider it wraps.
 	req.Context.SetValue(schemas.BifrostContextKeyBaseProviderType, baseProvider)
 	// Re-stamped per attempt so a fallback cannot inherit the previous provider's opt-in.

@@ -2458,3 +2458,88 @@ func TestToOpenAIChatRequest_GPT56CacheBreakpoint(t *testing.T) {
 		require.Falsef(t, present, "the earliest marker (system) must be the one dropped; raw=%s", raw)
 	})
 }
+
+// TestToOpenAIChatRequest_MinCompletionTokensClampScope pins that the 16-token floor
+// OpenAI enforces on max_completion_tokens is applied only for OpenAI and Azure. Other
+// OpenAI-wire destinations accept smaller limits and get the caller's value.
+func TestToOpenAIChatRequest_MinCompletionTokensClampScope(t *testing.T) {
+	tests := []struct {
+		provider schemas.ModelProvider
+		custom   bool
+		want     int
+	}{
+		{provider: schemas.OpenAI, want: MinMaxCompletionTokens},
+		{provider: schemas.Azure, want: MinMaxCompletionTokens},
+		{provider: schemas.Groq, want: 5},
+		{provider: schemas.VLLM, want: 5},
+		{provider: schemas.ModelProvider("my-vllm"), custom: true, want: 5},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.provider), func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			if tt.custom {
+				ctx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+			}
+			result := ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "some-model",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+				},
+				Params: &schemas.ChatParameters{MaxCompletionTokens: schemas.Ptr(5)},
+			})
+			require.NotNil(t, result.MaxCompletionTokens)
+			require.Equal(t, tt.want, *result.MaxCompletionTokens)
+		})
+	}
+}
+
+// TestToOpenAIChatRequest_LegacyMaxTokens pins that a limit the caller sent as
+// max_tokens reaches OpenAI-compatible destinations without a curated dialect under
+// that name, while OpenAI keeps max_completion_tokens.
+func TestToOpenAIChatRequest_LegacyMaxTokens(t *testing.T) {
+	tests := []struct {
+		provider  schemas.ModelProvider
+		custom    bool
+		wantField string
+		dropField string
+	}{
+		{provider: schemas.OpenAI, wantField: "max_completion_tokens", dropField: "max_tokens"},
+		{provider: schemas.OpenRouter, wantField: "max_tokens", dropField: "max_completion_tokens"},
+		{provider: schemas.ModelProvider("my-vllm"), custom: true, wantField: "max_tokens", dropField: "max_completion_tokens"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.provider), func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			if tt.custom {
+				ctx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+			}
+			wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "some-model",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+				},
+				Params: &schemas.ChatParameters{MaxCompletionTokens: schemas.Ptr(100), LegacyMaxTokens: true},
+			}))
+			require.NoError(t, err)
+			require.Equal(t, int64(100), providerUtils.GetJSONField(wireBody, tt.wantField).Int(), "wire body: %s", wireBody)
+			require.False(t, providerUtils.GetJSONField(wireBody, tt.dropField).Exists(), "wire body: %s", wireBody)
+		})
+	}
+}
+
+// TestOpenAIChatRequestToBifrostRecordsLegacyMaxTokens pins that the OpenAI
+// integration records a max_tokens limit so it can be replayed under that name.
+func TestOpenAIChatRequestToBifrostRecordsLegacyMaxTokens(t *testing.T) {
+	var req OpenAIChatRequest
+	require.NoError(t, sonic.Unmarshal([]byte(`{"model":"openai/gpt-4o","messages":[],"max_tokens":100}`), &req))
+	params := req.ToBifrostChatRequest(nil).Params
+	require.Equal(t, 100, *params.MaxCompletionTokens)
+	require.True(t, params.LegacyMaxTokens)
+
+	require.NoError(t, sonic.Unmarshal([]byte(`{"model":"openai/gpt-4o","messages":[],"max_completion_tokens":100}`), &req))
+	require.False(t, req.ToBifrostChatRequest(nil).Params.LegacyMaxTokens)
+}

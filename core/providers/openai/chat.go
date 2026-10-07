@@ -13,6 +13,7 @@ func (req *OpenAIChatRequest) ToBifrostChatRequest(ctx *schemas.BifrostContext) 
 	params := req.ChatParameters
 	if params.MaxCompletionTokens == nil && req.MaxTokens != nil {
 		params.MaxCompletionTokens = req.MaxTokens
+		params.LegacyMaxTokens = true
 	}
 
 	return &schemas.BifrostChatRequest{
@@ -43,9 +44,6 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 	if bifrostReq.Params != nil {
 		openaiReq.ChatParameters = *bifrostReq.Params
 		openaiReq.ServiceTier = serviceTierForModel(caps, openaiReq.ServiceTier)
-		if openaiReq.ChatParameters.MaxCompletionTokens != nil && *openaiReq.ChatParameters.MaxCompletionTokens < MinMaxCompletionTokens {
-			openaiReq.ChatParameters.MaxCompletionTokens = schemas.Ptr(MinMaxCompletionTokens)
-		}
 		// Drop user field if it exceeds OpenAI's 64 character limit
 		openaiReq.ChatParameters.User = SanitizeUserField(openaiReq.ChatParameters.User)
 		// Fable 5.1+ rejects forced tool use outright. Drop the choice so the model
@@ -103,6 +101,9 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 
 	switch bifrostReq.Provider {
 	case schemas.OpenAI, schemas.Azure:
+		if openaiReq.MaxCompletionTokens != nil && *openaiReq.MaxCompletionTokens < MinMaxCompletionTokens {
+			openaiReq.MaxCompletionTokens = schemas.Ptr(MinMaxCompletionTokens)
+		}
 		openaiReq.normalizeReasoningEffort(caps)
 		openaiReq.stripUnsupportedSamplingParams(caps)
 		// URL-sourced documents are NOT inlined here. Chat Completions rejects file_url, so they
@@ -188,6 +189,12 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		return openaiReq
 	default:
 		openaiReq.forwardReasoningDetails(bifrostReq.Input)
+		// Destinations without a curated dialect get the limit under the name the
+		// caller used; not every OpenAI-compatible server reads max_completion_tokens.
+		if openaiReq.LegacyMaxTokens && openaiReq.MaxCompletionTokens != nil {
+			openaiReq.MaxTokens = openaiReq.MaxCompletionTokens
+			openaiReq.MaxCompletionTokens = nil
+		}
 		// Check if provider is a custom provider
 		if isCustomProvider, ok := ctx.Value(schemas.BifrostContextKeyIsCustomProvider).(bool); ok && isCustomProvider {
 			return openaiReq

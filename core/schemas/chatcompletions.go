@@ -245,6 +245,8 @@ type ChatParameters struct {
 	// the combination; providers without the concept ignore it.
 	IncludeServerSideToolInvocations *bool `json:"include_server_side_tool_invocations,omitempty"`
 
+	LegacyMaxTokens bool `json:"-"` // Caller sent MaxCompletionTokens as max_tokens
+
 	// Dynamic parameters that can be provider-specific, they are directly
 	// added to the request as is.
 	ExtraParams map[string]interface{} `json:"-"`

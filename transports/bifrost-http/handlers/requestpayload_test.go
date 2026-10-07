@@ -833,3 +833,30 @@ func TestPrepareChatCompletionRequestExactNumbers(t *testing.T) {
 		}
 	}
 }
+
+// TestPrepareChatCompletionRequestLegacyMaxTokens pins that a max_tokens limit is
+// recorded as such, so OpenAI-compatible destinations get it back under that name.
+func TestPrepareChatCompletionRequestLegacyMaxTokens(t *testing.T) {
+	for _, tt := range []struct {
+		field  string
+		legacy bool
+	}{
+		{field: "max_tokens", legacy: true},
+		{field: "max_completion_tokens", legacy: false},
+	} {
+		t.Run(tt.field, func(t *testing.T) {
+			ctx := &fasthttp.RequestCtx{}
+			ctx.Request.SetBodyString(`{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}],"` + tt.field + `":100}`)
+			_, req, err := prepareChatCompletionRequest(ctx, nil)
+			if err != nil {
+				t.Fatalf("prepareChatCompletionRequest: %v", err)
+			}
+			if req.Params.MaxCompletionTokens == nil || *req.Params.MaxCompletionTokens != 100 {
+				t.Fatalf("max_completion_tokens = %v, want 100", req.Params.MaxCompletionTokens)
+			}
+			if req.Params.LegacyMaxTokens != tt.legacy {
+				t.Fatalf("LegacyMaxTokens = %v, want %v", req.Params.LegacyMaxTokens, tt.legacy)
+			}
+		})
+	}
+}

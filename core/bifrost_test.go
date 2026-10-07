@@ -657,6 +657,56 @@ func TestHandleProviderRequest_OCROperationNotAllowed(t *testing.T) {
 // making semantic progress. custom_provider_config.does_not_send_done_marker is the operator's
 // declaration that finish_reason is terminal for this upstream; this pins the whole path, from
 // the account config through the per-attempt context stamp to the provider's read loop.
+// TestCustomProviderOnOpenAIBaseKeepsCallerFields pins that a custom provider built on
+// the OpenAI base is treated as custom: its requests skip the OpenAI-specific field
+// filter, so caller fields such as store and prediction reach the upstream. The
+// custom-provider flag used to follow the base type, which is always standard.
+func TestCustomProviderOnOpenAIBaseKeepsCallerFields(t *testing.T) {
+	var body atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body.Store(string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"c","object":"chat.completion","created":1,"model":"m",`+
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	const customProvider = schemas.ModelProvider("custom-openai")
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(customProvider, 1, 1, server.URL)
+	account.configs[customProvider].NetworkConfig.MaxRetries = 0
+	account.SetCustomProviderConfig(customProvider, &schemas.CustomProviderConfig{BaseProviderType: schemas.OpenAI})
+	account.SetKeysForProvider(customProvider, []schemas.Key{
+		{ID: "custom-key", Value: *schemas.NewSecretVar("sk-custom"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
+	client := newStreamTestClient(t, account)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+	_, bifrostErr := client.ChatCompletionRequest(ctx, &schemas.BifrostChatRequest{
+		Provider: customProvider,
+		Model:    "m",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: Ptr("hi")},
+		}},
+		Params: &schemas.ChatParameters{
+			Store:      Ptr(true),
+			Prediction: &schemas.ChatPrediction{Type: "content", Content: "hello"},
+		},
+	})
+	if bifrostErr != nil {
+		t.Fatalf("request failed: %s", bifrostErr.Error.Message)
+	}
+
+	wire, _ := body.Load().(string)
+	for _, want := range []string{`"store":true`, `"prediction":`} {
+		if !strings.Contains(wire, want) {
+			t.Fatalf("custom provider wire body %s lost %s", wire, want)
+		}
+	}
+}
+
 func TestCustomProviderDoesNotSendDoneMarkerEndsParkedStream(t *testing.T) {
 	const chunk = `data: {"id":"chatcmpl-repro","object":"chat.completion.chunk","created":1,"model":"repro-model",` +
 		`"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}` + "\n\n" +

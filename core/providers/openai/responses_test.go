@@ -4184,3 +4184,30 @@ func TestToOpenAIResponsesRequest_SanitizesGeminiShapedHarnessBodies(t *testing.
 		})
 	}
 }
+
+// TestToOpenAIResponsesRequest_MinOutputTokensClampScope pins that the 16-token
+// floor on max_output_tokens is applied only for OpenAI and Azure.
+func TestToOpenAIResponsesRequest_MinOutputTokensClampScope(t *testing.T) {
+	for provider, want := range map[schemas.ModelProvider]int{
+		schemas.OpenAI:     MinMaxCompletionTokens,
+		schemas.Azure:      MinMaxCompletionTokens,
+		schemas.OpenRouter: 5,
+		schemas.VLLM:       5,
+	} {
+		t.Run(string(provider), func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			result := ToOpenAIResponsesRequest(ctx, &schemas.BifrostResponsesRequest{
+				Provider: provider,
+				Model:    "some-model",
+				Input: []schemas.ResponsesMessage{{
+					Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+					Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("hi")},
+				}},
+				Params: &schemas.ResponsesParameters{MaxOutputTokens: schemas.Ptr(5)},
+			})
+			require.NotNil(t, result.MaxOutputTokens)
+			require.Equal(t, want, *result.MaxOutputTokens)
+		})
+	}
+}

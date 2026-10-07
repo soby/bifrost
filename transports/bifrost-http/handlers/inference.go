@@ -1244,6 +1244,7 @@ func prepareChatCompletionRequest(ctx *fasthttp.RequestCtx, config *lib.Config) 
 			if req.ChatParameters.MaxCompletionTokens == nil {
 				if maxTokens, ok := schemas.SafeExtractIntPointer(maxTokensVal); ok {
 					req.MaxCompletionTokens = maxTokens
+					req.LegacyMaxTokens = true
 				}
 			}
 		}
