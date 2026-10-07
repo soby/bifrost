@@ -455,7 +455,12 @@ func makeRequestWithDoFunc(ctx context.Context, do func() error) (time.Duration,
 // request or response objects. On the normal path it is a no-op. On the context-cancellation
 // path it blocks until the background client.Do goroutine finishes, preventing a data race
 // between the still-running goroutine and the caller's release of req/resp.
+//
+// A per-attempt request timeout (BifrostContextKeyAttemptRequestTimeout) bounds the call: it
+// runs on a child context with that deadline, so expiry closes the socket and is reported as
+// a timeout, which lets fallbacks run.
 func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) (time.Duration, *schemas.BifrostError, func()) {
+	ctx, cancel := withAttemptRequestTimeout(ctx)
 	// Bound to the goroutine that runs client.Do: the binding must outlive a
 	// ctx-cancelled return of makeRequestWithDoFunc and be gone before the
 	// caller's wait() returns, since req is pooled.
@@ -464,17 +469,41 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 		defer unbind()
 		return client.Do(req, resp)
 	})
+	// Released only once makeRequestWithDoFunc has chosen its outcome: cancelling earlier
+	// would race a completed call against the cancellation. On a timed-out return the
+	// child is already done, so this does not cut the still-running call short.
+	cancel()
 	return latency, bifrostErr, wait
+}
+
+// withAttemptRequestTimeout returns ctx bounded by the attempt's request timeout
+// (BifrostContextKeyAttemptRequestTimeout) and the function that releases it. Without a
+// positive timeout it returns ctx unchanged. The child keeps ctx's values and is cancelled
+// with it; a deadline already earlier on ctx still wins.
+//
+// Fork-only: upstream has no per-request timeout for an attempt; a request-scoped attempt runs
+// with the default network settings' 300 s timeout.
+func withAttemptRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return ctx, func() {}
+	}
+	timeout, _ := ctx.Value(schemas.BifrostContextKeyAttemptRequestTimeout).(time.Duration)
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // MakeRequestWithContextFollowRedirects is like MakeRequestWithContext but follows up to
 // maxRedirects HTTP redirects automatically (equivalent to curl's -L flag).
 func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) (time.Duration, *schemas.BifrostError, func()) {
+	ctx, cancel := withAttemptRequestTimeout(ctx)
 	unbind := bindRequestContext(req, ctx)
 	latency, bifrostErr, wait := makeRequestWithDoFunc(ctx, func() error {
 		defer unbind()
 		return client.DoRedirects(req, resp, maxRedirects)
 	})
+	cancel()
 	return latency, bifrostErr, wait
 }
 
@@ -498,10 +527,15 @@ func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp
 // Returns client.Do's error untouched so callers keep their own error
 // classification and latency bookkeeping.
 func DoStreamingRequest(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) error {
-	unbind := bindRequestContext(req, ctx)
+	// A per-attempt request timeout bounds the header wait only: the transport stops
+	// watching the context once headers are parsed, so releasing it here leaves the body
+	// to the stream idle timeout.
+	attemptCtx, cancel := withAttemptRequestTimeout(ctx)
+	unbind := bindRequestContext(req, attemptCtx)
 	startTime := time.Now()
 	err := client.Do(req, resp)
 	unbind()
+	cancel()
 	schemas.ObserveUpstreamWait(ctx, startTime)
 	return err
 }
