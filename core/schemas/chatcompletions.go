@@ -48,7 +48,7 @@ type BifrostChatResponse struct {
 	Diagnostics         *CacheDiagnostics          `json:"diagnostics,omitempty"`   // Anthropic cache diagnostics (cache-diagnosis-2026-04-07); first prompt-cache prefix divergence point
 	SystemFingerprint   string                     `json:"system_fingerprint"`
 	PromptFilterResults json.RawMessage            `json:"prompt_filter_results,omitempty"` // Azure content-filter annotations for the prompt, passed through untouched
-	Usage               *BifrostLLMUsage           `json:"usage"`
+	Usage               *BifrostLLMUsage           `json:"usage,omitempty"`
 	ExtraFields         BifrostResponseExtraFields `json:"extra_fields"`
 	ExtraParams         map[string]interface{}     `json:"-"`
 

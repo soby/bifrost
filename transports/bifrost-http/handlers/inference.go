@@ -2159,7 +2159,7 @@ func (h *CompletionHandler) handleStreamingTextCompletion(ctx *fasthttp.RequestC
 		return h.client.TextCompletionStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.TextCompletionStreamRequest, getStream, cancel)
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.TextCompletionStreamRequest, false, getStream, cancel)
 }
 
 // handleStreamingChatCompletion handles streaming chat completion requests using Server-Sent Events (SSE)
@@ -2171,7 +2171,12 @@ func (h *CompletionHandler) handleStreamingChatCompletion(ctx *fasthttp.RequestC
 		return h.client.ChatCompletionStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ChatCompletionStreamRequest, getStream, cancel)
+	// The stream's wire usage contract follows the caller's stream_options.include_usage.
+	includeUsage := req.Params != nil &&
+		req.Params.StreamOptions != nil &&
+		req.Params.StreamOptions.IncludeUsage != nil &&
+		*req.Params.StreamOptions.IncludeUsage
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ChatCompletionStreamRequest, includeUsage, getStream, cancel)
 }
 
 // handleStreamingResponses handles streaming responses requests using Server-Sent Events (SSE)
@@ -2183,7 +2188,7 @@ func (h *CompletionHandler) handleStreamingResponses(ctx *fasthttp.RequestCtx, r
 		return h.client.ResponsesStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ResponsesStreamRequest, getStream, cancel)
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ResponsesStreamRequest, false, getStream, cancel)
 }
 
 // handleStreamingResponsesRetrieve handles streaming retrieval of a stored response (GET
@@ -2193,7 +2198,7 @@ func (h *CompletionHandler) handleStreamingResponsesRetrieve(ctx *fasthttp.Reque
 		return h.client.ResponsesRetrieveStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ResponsesRetrieveStreamRequest, getStream, cancel)
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ResponsesRetrieveStreamRequest, false, getStream, cancel)
 }
 
 // handleStreamingSpeech handles streaming speech requests using Server-Sent Events (SSE)
@@ -2205,7 +2210,7 @@ func (h *CompletionHandler) handleStreamingSpeech(ctx *fasthttp.RequestCtx, req 
 		return h.client.SpeechStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.SpeechStreamRequest, getStream, cancel)
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.SpeechStreamRequest, false, getStream, cancel)
 }
 
 // handleStreamingTranscriptionRequest handles streaming transcription requests using Server-Sent Events (SSE)
@@ -2217,7 +2222,7 @@ func (h *CompletionHandler) handleStreamingTranscriptionRequest(ctx *fasthttp.Re
 		return h.client.TranscriptionStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.TranscriptionStreamRequest, getStream, cancel)
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.TranscriptionStreamRequest, false, getStream, cancel)
 }
 
 // handleStreamingResponse is a generic function to handle streaming responses using Server-Sent Events (SSE)
@@ -2225,7 +2230,7 @@ func (h *CompletionHandler) handleStreamingTranscriptionRequest(ctx *fasthttp.Re
 // a client that closes its socket before the first write is caught by the socket watcher started
 // in lib.ConvertToBifrostContext. Bifrost handles cleanup internally for normal completion and
 // errors, so we only cancel upstream streams when the client has disconnected.
-func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, requestType schemas.RequestType, getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError), cancel context.CancelFunc) {
+func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, requestType schemas.RequestType, includeChatUsage bool, getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError), cancel context.CancelFunc) {
 	// Get the streaming channel — called BEFORE setting SSE headers so that
 	// provider errors return proper HTTP status codes + JSON content type.
 	stream, bifrostErr := getStream()
@@ -2432,8 +2437,16 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 			}
 
 			// Convert response to JSON (transport-goroutine CPU).
+			// A chat chunk is normalized into the OpenAI wire contract: usage is
+			// omitted unless requested, and requested usage is its own final event.
 			cpuStart := time.Now()
-			chunkJSON, err := sonic.Marshal(chunk)
+			var chunkJSON, usageJSON []byte
+			var err error
+			if requestType == schemas.ChatCompletionStreamRequest && chunk.BifrostChatResponse != nil {
+				chunkJSON, usageJSON, err = marshalChatCompletionStreamEvents(chunk.BifrostChatResponse, includeChatUsage)
+			} else {
+				chunkJSON, err = sonic.Marshal(chunk)
+			}
 			streamTransportCPUNs += time.Since(cpuStart).Nanoseconds()
 			if err != nil {
 				logger.Warn("Failed to marshal streaming response: %v", err)
@@ -2460,7 +2473,10 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 			}
 
 			writeStart := time.Now()
-			sent := reader.SendEvent(eventType, chunkJSON)
+			sent := len(chunkJSON) == 0 || reader.SendEvent(eventType, chunkJSON)
+			if sent && len(usageJSON) > 0 {
+				sent = reader.SendEvent("", usageJSON)
+			}
 			streamClientWriteNs += time.Since(writeStart).Nanoseconds()
 			if !sent {
 				cancel() // Client disconnected, cancel upstream stream
@@ -2647,7 +2663,7 @@ func (h *CompletionHandler) handleStreamingImageGeneration(ctx *fasthttp.Request
 		return h.client.ImageGenerationStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ImageGenerationStreamRequest, getStream, cancel)
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ImageGenerationStreamRequest, false, getStream, cancel)
 }
 
 // parseImageEditMultipartForm fills req from an OpenAI-style multipart image edit form. Uploaded
@@ -2921,7 +2937,7 @@ func (h *CompletionHandler) handleStreamingImageEditRequest(ctx *fasthttp.Reques
 		return h.client.ImageEditStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ImageEditStreamRequest, getStream, cancel)
+	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ImageEditStreamRequest, false, getStream, cancel)
 }
 
 // prepareImageVariationRequest prepares a BifrostImageVariationRequest from a multipart form
