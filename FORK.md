@@ -73,6 +73,7 @@ New on this branch:
 | ac586030d | Chat/Responses conversions carry logprobs (`logprobs: true` is `include: message.output_text.logprobs`; `choices[].logprobs` are the `output_text` logprobs, unary and streaming) and the chat fallback takes a Responses `extra_params.seed` as `seed`. A chat request a plugin converts to Responses is a 400 when it sets chat parameters Responses cannot carry (PLATFORM-4071) |
 | d83eb4ef8 | GenAI ingress: `generationConfig.responseLogprobs` becomes the Responses `include` instead of an extra param; `generationConfig.seed` rides `extra_params.seed` (Responses has no seed field), which the Gemini Responses conversion maps back to `generationConfig.seed` (PLATFORM-4071) |
 | 555aaa420 | gofmt and lint cleanup of the files the PLATFORM-4071 commits touch |
+| db03fc273 | Bedrock's AWS-signed net/http calls honor the per-attempt deadline (`DoAttemptHTTPRequest` for unary calls, body included; `DoAttemptStreamingHTTPRequest` for a stream's header wait), and with context-bound reads that client has no total or response-header timeout (PLATFORM-4085) |
 | 72337b79d | Per-request stream frame tap: an `io.Writer` at `schemas.BifrostContextKeyStreamFrameTap` receives every byte the SSE stream writer releases (events, heartbeat comments, `[DONE]`), in order and one `Write` per release; absent or nil costs no allocation |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
@@ -106,8 +107,9 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
   a call runs until the response arrives, the attempt's request timeout expires, or the
   request context ends. It still bounds the dial and TLS handshake, the request write and the
   wait for a pooled connection, and a request whose context can never end keeps it as its read
-  bound. Bedrock's net/http client (Converse and the other AWS-signed calls; the attempt
-  timeout does not reach it either) keeps its 300 s total timeout.
+  bound. Bedrock's AWS-signed net/http client (Converse and the other signed calls) has no
+  total or response-header timeout there; the 300 s bounds its dial and the TLS handshake
+  keeps its own 10 s timeout.
 - Loopback and RFC 1918 destinations need `UpdateProviderAllowPrivateNetwork`; link-local is always refused.
 - WebSocket and realtime routes do not honor request-scoped configuration.
 - Supported: OpenAI, Anthropic, Gemini, Cohere, Cerebras, Groq, Mistral, Nebius, OpenRouter,
@@ -139,7 +141,8 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
   configured provider. Expiry closes the socket and fails the attempt with a retryable timeout
   (504 `request_timed_out`), so fallbacks run; cancelling the request stays a cancellation.
   Cleared before each fallback, so set it in `PreLLMHook` for every attempt that needs it.
-  Bedrock's net/http requests are not bounded by it.
+  Bedrock's AWS-signed net/http calls honor it the same way: expiry fails the attempt with a
+  504 `request_timed_out` whose error matches `context.DeadlineExceeded`.
 - `schemas.BifrostContextKeyStreamIdleTimeout` (`time.Duration`): per-chunk idle timeout for
   streams. A positive value set before the attempt wins over the provider's configured
   `stream_idle_timeout_in_seconds` (default 120 s).
