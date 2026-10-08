@@ -1028,7 +1028,8 @@ func (m *Manager) CardHandler(name, requestOrigin string) (http.Handler, bool) {
 			AgentName:   name,
 		}
 		start := time.Now()
-		gateCtx := gateContext(ctx)
+		gateCtx, releaseGate := gateContext(ctx)
+		defer releaseGate()
 		var opErr error
 		response, gateErr := m.RunWithPluginPipeline(gateCtx, envelope, func(*schemas.BifrostA2ARequest, func(*schemas.BifrostA2AEvent)) (*schemas.BifrostA2AResponse, error) {
 			card, err := m.resolveCard(gateCtx, r.config.agentCardURL, r.config.discoveryAuth, upstreamCredentialID(r.config.name, "discovery"))
@@ -2544,7 +2545,8 @@ func forwardUpstream[T any](
 	var opErr error
 	opRan := false
 	start := time.Now()
-	gateCtx := gateContext(ctx)
+	gateCtx, releaseGate := gateContext(ctx)
+	defer releaseGate()
 	_, gateErr := h.manager.RunWithPluginPipeline(gateCtx, envelope, func(*schemas.BifrostA2ARequest, func(*schemas.BifrostA2AEvent)) (*schemas.BifrostA2AResponse, error) {
 		opRan = true
 		// One a2a.prepare phase span covers prepared-client acquire plus the first
@@ -2716,7 +2718,8 @@ func gateOutcomeError(ctx *schemas.BifrostContext, gateErr *schemas.BifrostError
 func forwardUpstreamStream(ctx context.Context, h *proxyRequestHandler, envelope *schemas.BifrostA2ARequest, call func(context.Context, sdkClient) iter.Seq2[a2a.Event, error]) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
 		start := time.Now()
-		gateCtx := gateContext(ctx)
+		gateCtx, releaseGate := gateContext(ctx)
+		defer releaseGate()
 		// Per-event describe/observe CPU is accumulated on the shared stream
 		// overhead accumulator and stamped at stream completion, exactly like the
 		// LLM streaming path's per-chunk mapping.

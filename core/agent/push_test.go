@@ -9,6 +9,7 @@ import (
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,13 +88,15 @@ func TestPushTimingLateTracerProvider(t *testing.T) {
 	var current schemas.Tracer
 	m := &Manager{tracerProvider: func() schemas.Tracer { return current }}
 
-	ctx := gateContext(context.Background())
+	ctx, releaseGate := gateContext(context.Background())
 	m.startPushTrace(ctx, "before-tracer")(nil)
+	releaseGate()
 	require.Empty(t, tracer.traces)
 
 	current = tracer
-	ctx = gateContext(context.Background())
+	ctx, releaseGate = gateContext(context.Background())
 	m.startPushTrace(ctx, "after-tracer")(nil)
+	releaseGate()
 	require.Len(t, tracer.traces, 1)
 	require.Equal(t, "after-tracer", tracer.traces[0].RootSpan.Name)
 }
@@ -1192,4 +1195,72 @@ func TestPushRelayRetriesThenDeadLetters(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 	dead := store.delivery(t, deliveryID)
 	require.Contains(t, dead.LastError, "push configuration no longer exists")
+}
+
+// settledGoroutines samples runtime.NumGoroutine until it stops falling, so
+// goroutines that are already exiting are not counted against the caller.
+func settledGoroutines() int {
+	n := runtime.NumGoroutine()
+	for range 50 {
+		time.Sleep(10 * time.Millisecond)
+		next := runtime.NumGoroutine()
+		if next >= n {
+			return next
+		}
+		n = next
+	}
+	return n
+}
+
+// Every relay pass, ingress accept and delivery derives a gate context from a
+// long-lived parent: the manager's lifetime context, or an inbound context that
+// may never be cancelled. Each gate context's cancellation watcher must end with
+// its operation; otherwise an idle relay, which polls every pushPollInterval,
+// strands one goroutine (and the context's values) per pass for the life of
+// the process.
+func TestPushRelayPassesDoNotAccumulateGoroutines(t *testing.T) {
+	managerCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newMemoryPushStore()
+	tracer := &pushTimingTracer{active: map[string]*schemas.Trace{}}
+	m := &Manager{ctx: managerCtx, pushStore: store, pushRelayID: "runner", externalURL: "https://gateway.example", tracer: tracer, pushDeliveryClient: &http.Client{Transport: pushInstantTransport{}}}
+	m.runtimes.store("agent", &runtimeAgent{})
+	require.NoError(t, store.SaveAgentPushConfig(context.Background(), &schemas.AgentPushConfig{AgentName: "agent", TaskID: "task", ConfigID: "config", IngressTokenHash: hashPushIngressToken("token"), URL: "https://callback.example"}))
+	relay := newPushRelay(m)
+
+	// Warm up once so lazily started runtime goroutines are not attributed to
+	// the passes under test.
+	relay.prune()
+	relay.processDue()
+	before := settledGoroutines()
+
+	const passes = 200
+	for i := range passes {
+		relay.processDue()
+		if i%20 == 0 {
+			relay.prune()
+		}
+		body, err := json.Marshal(&a2a.StreamResponse{Event: &a2a.Task{ID: "task", ContextID: fmt.Sprintf("ctx-%d", i)}})
+		require.NoError(t, err)
+		// The inbound context is never cancelled, like a pooled server context.
+		status, err := m.AcceptPushCallback(context.Background(), "agent", "token", body)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusAccepted, status)
+	}
+	relay.processDue()
+	for _, row := range store.deliveries {
+		require.Equal(t, schemas.AgentPushDeliveryStatusDelivered, row.Status)
+	}
+	require.Len(t, store.deliveries, passes)
+
+	after := settledGoroutines()
+	// Without the release every gate context left its watcher behind (over 400
+	// goroutines here); allow only a small amount of unrelated runtime noise.
+	require.LessOrEqual(t, after-before, 5, "gate contexts leaked %d goroutines over %d relay passes", after-before, passes)
+}
+
+type pushInstantTransport struct{}
+
+func (pushInstantTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}, Request: req}, nil
 }
