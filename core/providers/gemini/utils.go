@@ -103,6 +103,10 @@ func defaultBudgetControl(model string) *schemas.BudgetControl {
 // NormalizeRawGenerateContentRequestForCompatibility applies the same
 // provider-compatibility cleanup expected by the typed conversion path, while
 // preserving JSON key order with gjson/sjson-style byte edits.
+//
+// generationConfig.responseLogprobs and generationConfig.logprobs are kept: they are
+// native generateContent fields the caller sent, and the typed path maps them too. A
+// model that does not serve logprobs answers with its own error.
 func NormalizeRawGenerateContentRequestForCompatibility(jsonBody []byte) []byte {
 	if len(jsonBody) == 0 {
 		return jsonBody
@@ -110,8 +114,6 @@ func NormalizeRawGenerateContentRequestForCompatibility(jsonBody []byte) []byte 
 
 	out := jsonBody
 	for _, path := range []string{
-		"generationConfig.responseLogprobs",
-		"generationConfig.logprobs",
 		"generationConfig.presencePenalty",
 		"generationConfig.frequencyPenalty",
 		"fallbacks",

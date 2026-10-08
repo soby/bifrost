@@ -4600,8 +4600,8 @@ func TestGenAIFallbacks_PreservedInBifrostResponsesRequest(t *testing.T) {
 }
 
 // TestNormalizeRawGenerateContentRequestForCompatibility tests that Bifrost-internal fields
-// (fallbacks) and provider-incompatible OpenAI fields (responseLogprobs, logprobs, presencePenalty,
-// frequencyPenalty) are stripped before the raw body is forwarded to the Gemini API.
+// (fallbacks) and presencePenalty/frequencyPenalty are stripped before the raw body is
+// forwarded to the Gemini API, while the caller's responseLogprobs/logprobs are kept.
 //
 // Regression: fallbacks was forwarded verbatim, causing Gemini to return 400
 // "Unknown name \"fallbacks\": Cannot find field."
@@ -4631,13 +4631,13 @@ func TestNormalizeRawGenerateContentRequestForCompatibility(t *testing.T) {
 			},
 		},
 		{
-			name:  "StripsGenerationConfigCompatFields",
+			name:  "StripsPenaltiesKeepsLogprobs",
 			input: `{"contents":[{"parts":[{"text":"Hi"}]}],"generationConfig":{"temperature":0.7,"responseLogprobs":true,"logprobs":5,"presencePenalty":0.5,"frequencyPenalty":0.3}}`,
 			validate: func(t *testing.T, m map[string]interface{}) {
 				gc := genConfig(m)
 				require.NotNil(t, gc)
-				assert.NotContains(t, gc, "responseLogprobs")
-				assert.NotContains(t, gc, "logprobs")
+				assert.Equal(t, true, gc["responseLogprobs"], "the caller's responseLogprobs must reach Gemini")
+				assert.Equal(t, float64(5), gc["logprobs"], "the caller's logprobs count must reach Gemini")
 				assert.NotContains(t, gc, "presencePenalty")
 				assert.NotContains(t, gc, "frequencyPenalty")
 				assert.Contains(t, gc, "temperature", "valid fields must be preserved")
