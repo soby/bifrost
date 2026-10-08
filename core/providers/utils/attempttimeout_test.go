@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -201,5 +203,80 @@ func TestWithAttemptRequestTimeout_KeepsValuesAndEarlierDeadline(t *testing.T) {
 	deadline, ok := child.Deadline()
 	if !ok || time.Until(deadline) > time.Second {
 		t.Errorf("child deadline = %v (set %v), want the request's earlier deadline", deadline, ok)
+	}
+}
+
+func TestDoAttemptHTTPRequest_AttemptTimeoutCutsBody(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ctx := attemptTimeoutContext(200 * time.Millisecond)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	resp, err := DoAttemptHTTPRequest(srv.Client(), req)
+	if err != nil {
+		t.Fatalf("DoAttemptHTTPRequest: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if _, ok := resp.Body.(*upstreamTimingBody); !ok {
+		t.Errorf("body is %T, want DoHTTPRequest's timing wrapper outermost", resp.Body)
+	}
+	started := time.Now()
+	_, err = io.ReadAll(resp.Body)
+	if !errors.Is(err, errAttemptRequestTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("body read error = %v, want the attempt timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Errorf("body read lasted %s, want about the 200ms attempt timeout", elapsed)
+	}
+	if ctx.Err() != nil {
+		t.Errorf("the attempt timeout cancelled the request context: %v", ctx.Err())
+	}
+}
+
+func TestDoAttemptHTTPRequest_RequestDeadlineStaysRequestDeadline(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(150*time.Millisecond))
+	defer ctx.Cancel()
+	ctx.SetValue(schemas.BifrostContextKeyAttemptRequestTimeout, 5*time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	for name, do := range map[string]func(*http.Client, *http.Request) (*http.Response, error){
+		"unary": DoAttemptHTTPRequest, "streaming": DoAttemptStreamingHTTPRequest,
+	} {
+		resp, err := do(srv.Client(), req)
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Fatalf("%s: no error past the request deadline", name)
+		}
+		if errors.Is(err, errAttemptRequestTimeout) {
+			t.Errorf("%s: the request deadline was reported as the attempt timeout", name)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s: error = %v, want the request's deadline", name, err)
+		}
 	}
 }

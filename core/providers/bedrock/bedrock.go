@@ -81,6 +81,16 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 	config.CheckAndSetDefaults()
 
 	requestTimeout := time.Second * time.Duration(config.NetworkConfig.DefaultRequestTimeoutInSeconds)
+	// Fork-only: on an instance with context-bound reads (request-scoped configuration) the
+	// request timeout does not bound the wait for a response, unary or a stream's headers; the
+	// request context and the attempt's request timeout do (DoAttemptHTTPRequest). It still
+	// bounds the dial, and the TLS handshake keeps its own timeout.
+	responseTimeout := requestTimeout
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if config.NetworkConfig.ContextBoundReads {
+		responseTimeout = 0
+		dialContext = (&net.Dialer{Timeout: requestTimeout}).DialContext
+	}
 
 	// Bedrock's runtime client is net/http, so proxy_config has to be applied here
 	// explicitly; ConfigureProxy below only covers the fasthttp Mantle clients. With
@@ -95,13 +105,14 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 
 	transport := &http.Transport{
 		Proxy:                 proxy,
+		DialContext:           dialContext,
 		TLSClientConfig:       proxyTLS,
 		MaxConnsPerHost:       config.NetworkConfig.MaxConnsPerHost,
 		MaxIdleConns:          schemas.DefaultMaxIdleConnsPerHost,
 		MaxIdleConnsPerHost:   schemas.DefaultMaxIdleConnsPerHost,
 		IdleConnTimeout:       time.Second * time.Duration(config.NetworkConfig.KeepAliveTimeoutInSeconds),
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: requestTimeout,
+		ResponseHeaderTimeout: responseTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     config.NetworkConfig.EnforceHTTP2,
 	}
@@ -154,7 +165,7 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 		}
 	}
 
-	client := &http.Client{Transport: transport, Timeout: requestTimeout}
+	client := &http.Client{Transport: transport, Timeout: responseTimeout}
 	streamingClient := providerUtils.BuildStreamingHTTPClient(client)
 
 	// fasthttp clients for Bedrock Mantle (shared by OpenAI-compatible and native-Anthropic paths).
@@ -414,7 +425,7 @@ func (provider *BedrockProvider) completeRequest(ctx *schemas.BifrostContext, js
 func (provider *BedrockProvider) executeBedrockRequest(req *http.Request) ([]byte, time.Duration, map[string]string, *schemas.BifrostError) {
 	// Execute the request and measure latency
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -471,6 +482,10 @@ func (provider *BedrockProvider) executeBedrockRequest(req *http.Request) ([]byt
 		}
 	}
 	if err != nil {
+		// The attempt's request timeout or the request deadline expired mid-body.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), latency)
+		}
 		return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(&schemas.BifrostError{
 			IsBifrostError: true,
 			Error: &schemas.ErrorField{
@@ -519,7 +534,7 @@ func (provider *BedrockProvider) completeAgentRuntimeRequest(ctx *schemas.Bifros
 	}
 
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -565,6 +580,10 @@ func (provider *BedrockProvider) completeAgentRuntimeRequest(ctx *schemas.Bifros
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		// The attempt's request timeout or the request deadline expired mid-body.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), latency)
+		}
 		return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(&schemas.BifrostError{
 			IsBifrostError: true,
 			Error: &schemas.ErrorField{
@@ -621,7 +640,7 @@ func (provider *BedrockProvider) makeStreamingRequest(ctx *schemas.BifrostContex
 
 	// Make the request
 	startTime := time.Now()
-	resp, respErr := providerUtils.DoHTTPRequest(provider.streamingClient, req)
+	resp, respErr := providerUtils.DoAttemptStreamingHTTPRequest(provider.streamingClient, req)
 	latency := time.Since(startTime)
 	if respErr != nil {
 		if errors.Is(respErr, context.Canceled) {
@@ -930,7 +949,7 @@ func (provider *BedrockProvider) listMantleModels(ctx *schemas.BifrostContext, k
 		return nil
 	}
 
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	if err != nil {
 		provider.logger.Warn("mantle list-models request failed: %v", err)
 		return nil
@@ -1011,7 +1030,7 @@ func (provider *BedrockProvider) listModelsByKey(ctx *schemas.BifrostContext, ke
 	startTime := time.Now()
 
 	// Execute the request
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -2961,7 +2980,7 @@ func (provider *BedrockProvider) FileUpload(ctx *schemas.BifrostContext, key sch
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3093,7 +3112,7 @@ func (provider *BedrockProvider) FileList(ctx *schemas.BifrostContext, keys []sc
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3208,7 +3227,7 @@ func (provider *BedrockProvider) FileRetrieve(ctx *schemas.BifrostContext, keys 
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -3309,7 +3328,7 @@ func (provider *BedrockProvider) FileDelete(ctx *schemas.BifrostContext, keys []
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -3393,7 +3412,7 @@ func (provider *BedrockProvider) FileContent(ctx *schemas.BifrostContext, keys [
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -3602,7 +3621,7 @@ func (provider *BedrockProvider) BatchCreate(ctx *schemas.BifrostContext, key sc
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3732,7 +3751,7 @@ func (provider *BedrockProvider) BatchList(ctx *schemas.BifrostContext, keys []s
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3850,7 +3869,7 @@ func (provider *BedrockProvider) fetchBatchManifest(ctx *schemas.BifrostContext,
 		return nil
 	}
 
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	if err != nil {
 		provider.logger.Error("failed to fetch manifest: %v", err)
 		return nil
@@ -3926,7 +3945,7 @@ func (provider *BedrockProvider) BatchRetrieve(ctx *schemas.BifrostContext, keys
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -4074,7 +4093,7 @@ func (provider *BedrockProvider) BatchCancel(ctx *schemas.BifrostContext, keys [
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
