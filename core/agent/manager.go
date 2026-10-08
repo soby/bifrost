@@ -91,7 +91,7 @@ var (
 
 // invalidRegistrationError marks request validation and upstream discovery failures as client-correctable.
 func invalidRegistrationError(err error) error {
-	return fmt.Errorf("%w: %v", ErrInvalidRegistration, err)
+	return fmt.Errorf("%w: %w", ErrInvalidRegistration, err)
 }
 
 // Store is the narrow persistence contract the Agent Gateway needs, declared here
