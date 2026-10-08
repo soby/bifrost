@@ -63,6 +63,7 @@ New on this branch:
 | 012bd19ab | Per-attempt request timeout from the context (`BifrostContextKeyAttemptRequestTimeout`); expiry is a retryable timeout, so fallbacks run |
 | c64050487 | **Fork-only, upstream candidate.** Fallbacks follow the request the primary attempt's `PreLLMHook` returned (fallback list, fallback decision and base request), as on the previous runtime branch |
 | 4d0091cca | **Fork-only, upstream candidate.** The transport interceptor middleware, the request handler, the LLM hooks and the HTTP transport post-hook share one `BifrostContext` per request (`lib.EnsureSharedBifrostContext`), as `cbcdf67b8` did on the previous runtime branch |
+| 4daa16e37 | Request-scoped instances have context-bound reads (`NetworkConfig.ContextBoundReads`): the default request timeout no longer caps a unary response or a stream's header wait; the request context and the attempt's request timeout do (PLATFORM-4058) |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
@@ -89,8 +90,15 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
 - Request-scoped attempts run on an unregistered instance built with default network settings
   (`DefaultNetworkConfig`: 300 s request timeout, 0 retries). There is no per-request
   retry count or backoff; bound a request with its context deadline and an attempt with
-  `BifrostContextKeyAttemptRequestTimeout` (below). Loopback and
-  RFC 1918 destinations need `UpdateProviderAllowPrivateNetwork`; link-local is always refused.
+  `BifrostContextKeyAttemptRequestTimeout` (below).
+- Reads on those instances are context-bound (fork-only, `NetworkConfig.ContextBoundReads`):
+  the 300 s timeout does not bound the wait for a response, unary or a stream's headers, so
+  a call runs until the response arrives, the attempt's request timeout expires, or the
+  request context ends. It still bounds the dial and TLS handshake, the request write and the
+  wait for a pooled connection, and a request whose context can never end keeps it as its read
+  bound. Bedrock's net/http client (Converse and the other AWS-signed calls; the attempt
+  timeout does not reach it either) keeps its 300 s total timeout.
+- Loopback and RFC 1918 destinations need `UpdateProviderAllowPrivateNetwork`; link-local is always refused.
 - WebSocket and realtime routes do not honor request-scoped configuration.
 - Supported: OpenAI, Anthropic, Gemini, Cohere, Cerebras, Groq, Mistral, Nebius, OpenRouter,
   Parasail, Perplexity, xAI, Replicate, Hugging Face, Ollama, SGL, vLLM (URL on the key),
