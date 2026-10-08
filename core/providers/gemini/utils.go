@@ -103,6 +103,10 @@ func defaultBudgetControl(model string) *schemas.BudgetControl {
 // NormalizeRawGenerateContentRequestForCompatibility applies the same
 // provider-compatibility cleanup expected by the typed conversion path, while
 // preserving JSON key order with gjson/sjson-style byte edits.
+//
+// generationConfig.responseLogprobs and generationConfig.logprobs are kept: they are
+// native generateContent fields the caller sent, and the typed path maps them too. A
+// model that does not serve logprobs answers with its own error.
 func NormalizeRawGenerateContentRequestForCompatibility(jsonBody []byte) []byte {
 	if len(jsonBody) == 0 {
 		return jsonBody
@@ -110,8 +114,6 @@ func NormalizeRawGenerateContentRequestForCompatibility(jsonBody []byte) []byte 
 
 	out := jsonBody
 	for _, path := range []string{
-		"generationConfig.responseLogprobs",
-		"generationConfig.logprobs",
 		"generationConfig.presencePenalty",
 		"generationConfig.frequencyPenalty",
 		"fallbacks",
@@ -464,6 +466,9 @@ func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters(p
 	if config.FrequencyPenalty != nil {
 		params.ExtraParams["frequency_penalty"] = config.FrequencyPenalty
 	}
+	// The Responses API has no seed field, so the seed rides extra_params.seed: the
+	// Gemini Responses conversion maps it back to generationConfig.seed, Cohere's to
+	// seed, and the chat fallback (ToChatRequest) to Chat's typed seed.
 	if config.Seed != nil {
 		params.ExtraParams["seed"] = int(*config.Seed)
 	}
@@ -485,8 +490,10 @@ func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters(p
 	if config.ResponseJSONSchema != nil {
 		params.ExtraParams["response_json_schema"] = config.ResponseJSONSchema
 	}
+	// responseLogprobs is the Responses include "message.output_text.logprobs", which
+	// every provider conversion reads (logprobs above is top_logprobs).
 	if config.ResponseLogprobs {
-		params.ExtraParams["response_logprobs"] = config.ResponseLogprobs
+		params.Include = append(params.Include, schemas.ResponsesIncludeOutputTextLogprobs)
 	}
 	return params
 }
@@ -3236,6 +3243,17 @@ func ConvertGeminiLogprobsResultToBifrost(result *LogprobsResult) *schemas.Bifro
 		}
 	}
 	return &schemas.BifrostLogProbs{Content: content}
+}
+
+// convertGeminiLogprobsResultToResponses converts a Gemini logprobsResult to the
+// logprobs of a Responses output_text part, one entry per decoding step. nil when
+// the candidate carries none.
+func convertGeminiLogprobsResultToResponses(result *LogprobsResult) []schemas.ResponsesOutputMessageContentTextLogProb {
+	logProbs := ConvertGeminiLogprobsResultToBifrost(result)
+	if logProbs == nil {
+		return nil
+	}
+	return schemas.ResponsesLogProbsFromChat(logProbs.Content)
 }
 
 // mimeTypeFromURI returns the IANA MIME type a URI's own file extension declares, or "" when the

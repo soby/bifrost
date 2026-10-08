@@ -8609,15 +8609,7 @@ func routeChatReasoningMode(ctx *schemas.BifrostContext, provider schemas.Provid
 		// The Responses API has no equivalent for these chat parameters, so the conversion
 		// would drop them silently and serve a weaker contract than the caller asked for.
 		if unsupported := chatParamsWithoutResponsesEquivalent(req.Params); len(unsupported) > 0 {
-			sc := fasthttp.StatusBadRequest
-			return &schemas.BifrostError{
-				IsBifrostError: false,
-				StatusCode:     &sc,
-				Error: &schemas.ErrorField{
-					Type:    new("invalid_request_error"),
-					Message: "reasoning.mode is served by the Responses API, which does not support: " + strings.Join(unsupported, ", ") + "; remove them or drop reasoning.mode",
-				},
-			}
+			return chatParamsWithoutResponsesEquivalentError("reasoning.mode is served by the Responses API, which does not support: " + strings.Join(unsupported, ", ") + "; remove them or drop reasoning.mode")
 		}
 		ctx.SetValue(schemas.BifrostContextKeyChangeRequestType, schemas.ResponsesRequest)
 		return nil
@@ -8629,9 +8621,40 @@ func routeChatReasoningMode(ctx *schemas.BifrostContext, provider schemas.Provid
 	return nil
 }
 
+// refuseChatParamsLostToResponses refuses a chat request that is converted to the
+// Responses API (BifrostContextKeyChangeRequestType, set by a plugin such as compat's
+// chat-to-responses conversion) while it sets chat parameters the Responses API has no
+// equivalent for: the conversion would drop them and serve a different request than
+// the caller sent. A raw-body request is left alone: its body is sent as is.
+func refuseChatParamsLostToResponses(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) *schemas.BifrostError {
+	if req == nil || req.Params == nil {
+		return nil
+	}
+	if useRawBody, _ := ctx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool); useRawBody {
+		return nil
+	}
+	if unsupported := chatParamsWithoutResponsesEquivalent(req.Params); len(unsupported) > 0 {
+		return chatParamsWithoutResponsesEquivalentError("this chat request is served by the Responses API, which does not support: " + strings.Join(unsupported, ", ") + "; remove them")
+	}
+	return nil
+}
+
+func chatParamsWithoutResponsesEquivalentError(message string) *schemas.BifrostError {
+	sc := fasthttp.StatusBadRequest
+	return &schemas.BifrostError{
+		IsBifrostError: false,
+		StatusCode:     &sc,
+		Error: &schemas.ErrorField{
+			Type:    new("invalid_request_error"),
+			Message: message,
+		},
+	}
+}
+
 // chatParamsWithoutResponsesEquivalent lists the set chat parameters that
 // ToResponsesRequest cannot carry to the Responses API. user is left out: it only
 // buckets caching and abuse detection and does not change the output contract.
+// logprobs is carried (include "message.output_text.logprobs"), as is top_logprobs.
 func chatParamsWithoutResponsesEquivalent(p *schemas.ChatParameters) []string {
 	var out []string
 	if p.N != nil && *p.N > 1 {
@@ -8651,9 +8674,6 @@ func chatParamsWithoutResponsesEquivalent(p *schemas.ChatParameters) []string {
 	}
 	if p.FrequencyPenalty != nil {
 		out = append(out, "frequency_penalty")
-	}
-	if p.LogProbs != nil && *p.LogProbs {
-		out = append(out, "logprobs")
 	}
 	if p.Audio != nil || slices.Contains(p.Modalities, "audio") {
 		out = append(out, "audio")
@@ -8827,6 +8847,9 @@ func (bifrost *Bifrost) handleProviderRequest(provider schemas.Provider, config 
 			return nil, bifrostError
 		}
 		if changeType, ok := req.Context.Value(schemas.BifrostContextKeyChangeRequestType).(schemas.RequestType); ok && changeType == schemas.ResponsesRequest {
+			if bifrostError := refuseChatParamsLostToResponses(req.Context, req.ChatRequest); bifrostError != nil {
+				return nil, bifrostError
+			}
 			responsesRequest := req.BifrostRequest.ChatRequest.ToResponsesRequest()
 			if responsesRequest != nil {
 				responsesRequest, bifrostError := prepareResponsesRequest(req.Context, config, provider, key, responsesRequest)
@@ -9264,6 +9287,9 @@ func (bifrost *Bifrost) handleProviderStreamRequest(provider schemas.Provider, c
 			return nil, bifrostError
 		}
 		if changeType, ok := req.Context.Value(schemas.BifrostContextKeyChangeRequestType).(schemas.RequestType); ok && changeType == schemas.ResponsesRequest {
+			if bifrostError := refuseChatParamsLostToResponses(req.Context, req.ChatRequest); bifrostError != nil {
+				return nil, bifrostError
+			}
 			responsesRequest := req.BifrostRequest.ChatRequest.ToResponsesRequest()
 			if responsesRequest != nil {
 				responsesRequest, bifrostError := prepareResponsesRequest(req.Context, config, provider, key, responsesRequest)

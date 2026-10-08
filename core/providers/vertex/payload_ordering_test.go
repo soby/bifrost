@@ -3,6 +3,7 @@ package vertex
 import (
 	"testing"
 
+	"github.com/maximhq/bifrost/core/providers/gemini"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -34,4 +35,14 @@ func TestStripVertexCountTokensUnsupportedFields(t *testing.T) {
 	t.Run("handles empty body", func(t *testing.T) {
 		assert.Empty(t, stripVertexCountTokensUnsupportedFields(nil))
 	})
+}
+
+// A raw Vertex Gemini body goes through the Gemini normalizer and then the Vertex
+// strip; the caller's responseLogprobs and logprobs survive both.
+func TestVertexRawGeminiBodyKeepsLogprobs(t *testing.T) {
+	raw := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"responseLogprobs":true,"logprobs":4,"seed":7}}`)
+
+	got := stripVertexGeminiUnsupportedFieldsRaw(gemini.NormalizeRawGenerateContentRequestForCompatibility(raw))
+
+	assert.Equal(t, string(raw), string(got))
 }

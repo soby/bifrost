@@ -1014,7 +1014,6 @@ func TestChatReasoningModeDispatch(t *testing.T) {
 		{name: "logit_bias", want: []string{"logit_bias"}, params: schemas.ChatParameters{LogitBias: &map[string]float64{"50256": -100}}},
 		{name: "presence_penalty", want: []string{"presence_penalty"}, params: schemas.ChatParameters{PresencePenalty: new(0.5)}},
 		{name: "frequency_penalty", want: []string{"frequency_penalty"}, params: schemas.ChatParameters{FrequencyPenalty: new(0.5)}},
-		{name: "logprobs", want: []string{"logprobs"}, params: schemas.ChatParameters{LogProbs: new(true)}},
 		{name: "audio modality", want: []string{"audio"}, params: schemas.ChatParameters{Modalities: []string{"text", "audio"}}},
 		{name: "prediction", want: []string{"prediction"}, params: schemas.ChatParameters{Prediction: &schemas.ChatPrediction{Type: "content", Content: "x"}}},
 		{name: "web_search_options", want: []string{"web_search_options"}, params: schemas.ChatParameters{WebSearchOptions: &schemas.ChatWebSearchOptions{}}},

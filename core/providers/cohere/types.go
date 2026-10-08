@@ -37,7 +37,8 @@ type CohereChatRequest struct {
 	PresencePenalty  *float64                `json:"presence_penalty,omitempty"`   // Optional: Presence penalty
 	Stream           *bool                   `json:"stream,omitempty"`             // Optional: Enable streaming
 	SafetyMode       *string                 `json:"safety_mode,omitempty"`        // Optional: Safety mode
-	LogProbs         *bool                   `json:"log_probs,omitempty"`          // Optional: Log probabilities
+	LogProbs         *bool                   `json:"logprobs,omitempty"`           // Optional: include the generated tokens' log probabilities
+	Seed             *int                    `json:"seed,omitempty"`               // Optional: best-effort deterministic sampling
 	StrictToolChoice *bool                   `json:"strict_tool_choice,omitempty"` // Optional: Strict tool choice
 	Thinking         *CohereThinking         `json:"thinking,omitempty"`           // Optional: Reasoning configuration
 	ResponseFormat   *CohereResponseFormat   `json:"response_format,omitempty"`    // Optional: Format for the response
@@ -496,6 +497,9 @@ type CohereStreamEvent struct {
 	ID    *string               `json:"id,omitempty"`    // For message-start
 	Index *int                  `json:"index,omitempty"` // For indexed events
 	Delta *CohereStreamDelta    `json:"delta,omitempty"`
+	// LogProbs is the content-delta's text chunk logprobs (a single LogprobItem),
+	// present when the request set logprobs.
+	LogProbs *CohereLogProb `json:"logprobs,omitempty"`
 }
 
 // CohereStreamDelta represents the delta content in streaming events

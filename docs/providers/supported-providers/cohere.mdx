@@ -103,6 +103,9 @@ case schemas.Cohere:
 | `temperature`, `top_p` → `p` | Direct pass-through for temperature; `top_p` renamed to `p` |
 | `stop` | Renamed to `stop_sequences` |
 | `frequency_penalty`, `presence_penalty` | Direct pass-through |
+| `seed` | Direct pass-through |
+| `logprobs` | Direct pass-through; the response's token logprobs map to `choices[].logprobs.content` (one entry per Cohere text chunk, its logprob the sum of the chunk's token logprobs, `top_logprobs` empty) |
+| `top_logprobs` | Not supported: Cohere returns no alternative tokens, so a non-zero value is a 400 |
 | `response_format` | Converted to structured format (see [Response Format](#response-format)) |
 | `tools` | Schema structure adapted (see [Tool Conversion](#tool-conversion)) |
 | `tool_choice` | Type mapped (see [Tool Conversion](#tool-conversion)) |
@@ -112,7 +115,7 @@ case schemas.Cohere:
 
 ### Dropped Parameters
 
-The following parameters are silently ignored: `logit_bias`, `logprobs`, `top_logprobs`, `seed`, `parallel_tool_calls`, `service_tier`
+The following parameters are silently ignored: `logit_bias`, `parallel_tool_calls`, `service_tier`
 
 ### Extra Parameters
 
@@ -129,7 +132,6 @@ curl -X POST http://localhost:8080/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello"}],
     "top_k": 40,
     "safety_mode": "STRICT",
-    "log_probs": true,
     "strict_tool_choice": false
   }'
 ```
@@ -146,7 +148,6 @@ resp, err := client.ChatCompletionRequest(schemas.NewBifrostContext(ctx, schemas
         ExtraParams: map[string]interface{}{
             "top_k": 40,
             "safety_mode": "STRICT",
-            "log_probs": true,
             "strict_tool_choice": false,
         },
     },
@@ -284,6 +285,9 @@ The Responses API uses the same underlying `/v2/chat` endpoint but converts betw
 | `stop` | Via `extra_params`, renamed to `stop_sequences` |
 | `top_k` | Via `extra_params` (Cohere-specific) |
 | `frequency_penalty`, `presence_penalty` | Via `extra_params` |
+| `seed` | Via `extra_params` (the Responses API has no `seed` field) |
+| `include: ["message.output_text.logprobs"]` | Sets `logprobs`; the token logprobs reach the `output_text` part's `logprobs` (unary and streaming) |
+| `top_logprobs` | Not supported: a non-zero value is a 400 |
 
 ### Extra Parameters
 

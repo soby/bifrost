@@ -67,6 +67,12 @@ New on this branch:
 | c1b997e08 | **Fork-only, upstream candidate.** Agent-gateway gate contexts are released when their operation ends (`gateContext` returns a release func). Upstream leaks one cancellation-watcher goroutine per push-relay poll (every 3 s whenever a config store exists), prune and delivery (PLATFORM-4061) |
 | 27ff63169 | `invalidRegistrationError` wraps its cause with `%w`, as upstream dev already does, so `TestRegistrationDiscoveryUsesBuildTimeout` passes; drop at the next refresh |
 | 01a84d27d | Gemini and Vertex Gemini chat: `seed` maps to `generationConfig.seed` (a seed outside int32 is a 400, never truncated); `top_logprobs` is sent as given instead of being lowered to 20 (PLATFORM-4060) |
+| bef33d02b | Gemini and Vertex Gemini Responses: `include: message.output_text.logprobs` maps to `generationConfig.responseLogprobs` and a non-zero `top_logprobs` to `logprobs` (outside int32 is a 400); the candidate's `logprobsResult` reaches the `output_text` logprobs, unary and streaming (PLATFORM-4071) |
+| 5e0521278 | The raw generateContent normalizer keeps the caller's `generationConfig.responseLogprobs` / `logprobs` (Gemini and Vertex); it still removes the penalties and `fallbacks` (PLATFORM-4071) |
+| 816277d52 | Cohere: chat `logprobs` and `seed` reach Cohere v2's `logprobs` / `seed` (the wire field was `log_probs`); response logprobs reach `choices[].logprobs` and the Responses `output_text` logprobs, unary and streaming; a non-zero `top_logprobs` is a 400; the Responses path takes `include` logprobs and `extra_params.seed` (PLATFORM-4071) |
+| ac586030d | Chat/Responses conversions carry logprobs (`logprobs: true` is `include: message.output_text.logprobs`; `choices[].logprobs` are the `output_text` logprobs, unary and streaming) and the chat fallback takes a Responses `extra_params.seed` as `seed`. A chat request a plugin converts to Responses is a 400 when it sets chat parameters Responses cannot carry (PLATFORM-4071) |
+| d83eb4ef8 | GenAI ingress: `generationConfig.responseLogprobs` becomes the Responses `include` instead of an extra param; `generationConfig.seed` rides `extra_params.seed` (Responses has no seed field), which the Gemini Responses conversion maps back to `generationConfig.seed` (PLATFORM-4071) |
+| 555aaa420 | gofmt and lint cleanup of the files the PLATFORM-4071 commits touch |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
