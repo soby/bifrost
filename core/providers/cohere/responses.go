@@ -2,6 +2,8 @@ package cohere
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +32,7 @@ type CohereResponsesStreamState struct {
 	ToolPlanOutputIndex           *int                                                          // Output index for tool plan text item (if created)
 	OutputItems                   map[int]*schemas.ResponsesMessage                             // Maps output_index to accumulated output item for response.completed
 	AnnotationsByOutputIndex      map[int][]schemas.ResponsesOutputMessageContentTextAnnotation // Maps output_index to citation annotations for done events and response.completed
+	LogProbsByOutputIndex         map[int][]schemas.ResponsesOutputMessageContentTextLogProb    // Maps output_index to the text item's token logprobs for done events
 }
 
 // cohereResponsesStreamStatePool provides a pool for Cohere responses stream state objects.
@@ -45,6 +48,7 @@ var cohereResponsesStreamStatePool = sync.Pool{
 			TextBuffers:                   make(map[int]*strings.Builder),
 			OutputItems:                   make(map[int]*schemas.ResponsesMessage),
 			AnnotationsByOutputIndex:      make(map[int][]schemas.ResponsesOutputMessageContentTextAnnotation),
+			LogProbsByOutputIndex:         make(map[int][]schemas.ResponsesOutputMessageContentTextLogProb),
 			CurrentOutputIndex:            0,
 			CreatedAt:                     int(time.Now().Unix()),
 			HasEmittedCreated:             false,
@@ -103,6 +107,11 @@ func acquireCohereResponsesStreamState() *CohereResponsesStreamState {
 		state.AnnotationsByOutputIndex = make(map[int][]schemas.ResponsesOutputMessageContentTextAnnotation)
 	} else {
 		clear(state.AnnotationsByOutputIndex)
+	}
+	if state.LogProbsByOutputIndex == nil {
+		state.LogProbsByOutputIndex = make(map[int][]schemas.ResponsesOutputMessageContentTextLogProb)
+	} else {
+		clear(state.LogProbsByOutputIndex)
 	}
 	// Reset other fields
 	state.CurrentOutputIndex = 0
@@ -170,6 +179,11 @@ func (state *CohereResponsesStreamState) flush() {
 		state.AnnotationsByOutputIndex = make(map[int][]schemas.ResponsesOutputMessageContentTextAnnotation)
 	} else {
 		clear(state.AnnotationsByOutputIndex)
+	}
+	if state.LogProbsByOutputIndex == nil {
+		state.LogProbsByOutputIndex = make(map[int][]schemas.ResponsesOutputMessageContentTextLogProb)
+	} else {
+		clear(state.LogProbsByOutputIndex)
 	}
 	state.CurrentOutputIndex = 0
 	state.MessageID = nil
@@ -540,6 +554,12 @@ func (chunk *CohereStreamEvent) ToBifrostResponsesStream(sequenceNumber int, sta
 					Delta:          chunk.Delta.Message.Content.CohereStreamContentObject.Text,
 					LogProbs:       []schemas.ResponsesOutputMessageContentTextLogProb{},
 				}
+				if chunk.LogProbs != nil {
+					if logProbs := schemas.ResponsesLogProbsFromChat(convertCohereLogProbsToBifrost([]CohereLogProb{*chunk.LogProbs})); logProbs != nil {
+						response.LogProbs = logProbs
+						state.LogProbsByOutputIndex[outputIndex] = append(state.LogProbsByOutputIndex[outputIndex], logProbs...)
+					}
+				}
 				if itemID != "" {
 					response.ItemID = &itemID
 				}
@@ -582,11 +602,16 @@ func (chunk *CohereStreamEvent) ToBifrostResponsesStream(sequenceNumber int, sta
 			var responses []*schemas.BifrostResponsesStreamResponse
 			isReasoning := state.ReasoningContentIndices[*chunk.Index]
 
-			// Grab accumulated text up front
+			// Grab accumulated text and token logprobs up front
 			accText := ""
 			if buf := state.TextBuffers[outputIndex]; buf != nil {
 				accText = buf.String()
 			}
+			textLogProbs := state.LogProbsByOutputIndex[outputIndex]
+			if textLogProbs == nil {
+				textLogProbs = []schemas.ResponsesOutputMessageContentTextLogProb{}
+			}
+			delete(state.LogProbsByOutputIndex, outputIndex)
 
 			// Check if this content index is a reasoning block
 			if isReasoning {
@@ -635,7 +660,7 @@ func (chunk *CohereStreamEvent) ToBifrostResponsesStream(sequenceNumber int, sta
 					ContentIndex:   chunk.Index,
 					ItemID:         &itemID,
 					Text:           &accText,
-					LogProbs:       []schemas.ResponsesOutputMessageContentTextLogProb{},
+					LogProbs:       textLogProbs,
 				})
 
 				// Emit content_part.done with accumulated text and any
@@ -645,7 +670,7 @@ func (chunk *CohereStreamEvent) ToBifrostResponsesStream(sequenceNumber int, sta
 					Type: schemas.ResponsesOutputMessageContentTypeText,
 					Text: &partText,
 					ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
-						LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+						LogProbs:    textLogProbs,
 						Annotations: state.annotationsForOutputIndex(outputIndex),
 					},
 				}
@@ -698,7 +723,7 @@ func (chunk *CohereStreamEvent) ToBifrostResponsesStream(sequenceNumber int, sta
 							Text: &itemText,
 							ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
 								Annotations: state.annotationsForOutputIndex(outputIndex),
-								LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+								LogProbs:    textLogProbs,
 							},
 						},
 					}
@@ -1257,6 +1282,12 @@ func ToCohereResponsesRequest(bifrostReq *schemas.BifrostResponsesRequest) (*Coh
 		if bifrostReq.Params.TopP != nil {
 			cohereReq.P = bifrostReq.Params.TopP
 		}
+		if slices.Contains(bifrostReq.Params.Include, schemas.ResponsesIncludeOutputTextLogprobs) {
+			cohereReq.LogProbs = schemas.Ptr(true)
+		}
+		if err := refuseCohereTopLogProbs(bifrostReq.Params.TopLogProbs); err != nil {
+			return nil, err
+		}
 
 		// Convert reasoning
 		if bifrostReq.Params.Reasoning != nil {
@@ -1302,7 +1333,9 @@ func ToCohereResponsesRequest(bifrostReq *schemas.BifrostResponsesRequest) (*Coh
 			cohereReq.ResponseFormat = responseFormat
 		}
 		if bifrostReq.Params.ExtraParams != nil {
-			cohereReq.ExtraParams = bifrostReq.Params.ExtraParams
+			// A copy: the keys mapped below are removed from the outbound map only, so
+			// a retry or fallback attempt converting the same request still has them.
+			cohereReq.ExtraParams = maps.Clone(bifrostReq.Params.ExtraParams)
 			if topK, ok := schemas.SafeExtractIntPointer(bifrostReq.Params.ExtraParams["top_k"]); ok {
 				delete(cohereReq.ExtraParams, "top_k")
 				cohereReq.K = topK
@@ -1318,6 +1351,11 @@ func ToCohereResponsesRequest(bifrostReq *schemas.BifrostResponsesRequest) (*Coh
 			if presencePenalty, ok := schemas.SafeExtractFloat64Pointer(bifrostReq.Params.ExtraParams["presence_penalty"]); ok {
 				delete(cohereReq.ExtraParams, "presence_penalty")
 				cohereReq.PresencePenalty = presencePenalty
+			}
+			// The Responses API has no seed field; a seed rides extra_params.seed.
+			if seed, ok := schemas.SafeExtractIntPointer(bifrostReq.Params.ExtraParams["seed"]); ok {
+				delete(cohereReq.ExtraParams, "seed")
+				cohereReq.Seed = seed
 			}
 			if thinkingParam, ok := schemas.SafeExtractFromMap(bifrostReq.Params.ExtraParams, "thinking"); ok {
 				if thinkingMap, ok := thinkingParam.(map[string]interface{}); ok {
@@ -1414,6 +1452,9 @@ func (response *CohereChatResponse) ToBifrostResponsesResponse() *schemas.Bifros
 	if response.Message != nil {
 		outputMessages := ConvertCohereMessagesToBifrostMessages([]CohereMessage{*response.Message}, true)
 		bifrostResp.Output = outputMessages
+	}
+	if logProbs := schemas.ResponsesLogProbsFromChat(convertCohereLogProbsToBifrost(response.LogProbs)); logProbs != nil {
+		attachCohereLogProbsToFirstOutputText(bifrostResp.Output, logProbs)
 	}
 
 	return bifrostResp
@@ -2030,4 +2071,21 @@ func convertResponsesMessageContentBlocksToCohere(blocks []schemas.ResponsesMess
 	}
 
 	return cohereBlocks
+}
+
+// attachCohereLogProbsToFirstOutputText puts the response's token logprobs on its
+// first output_text part. Cohere reports them for the whole generated text.
+func attachCohereLogProbsToFirstOutputText(output []schemas.ResponsesMessage, logProbs []schemas.ResponsesOutputMessageContentTextLogProb) {
+	for i := range output {
+		if output[i].Content == nil {
+			continue
+		}
+		for j := range output[i].Content.ContentBlocks {
+			block := &output[i].Content.ContentBlocks[j]
+			if block.Type == schemas.ResponsesOutputMessageContentTypeText && block.ResponsesOutputMessageContentText != nil {
+				block.LogProbs = logProbs
+				return
+			}
+		}
+	}
 }

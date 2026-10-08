@@ -117,6 +117,11 @@ func ToCohereChatCompletionRequest(bifrostReq *schemas.BifrostChatRequest) (*Coh
 		cohereReq.StopSequences = bifrostReq.Params.Stop
 		cohereReq.FrequencyPenalty = bifrostReq.Params.FrequencyPenalty
 		cohereReq.PresencePenalty = bifrostReq.Params.PresencePenalty
+		cohereReq.Seed = bifrostReq.Params.Seed
+		cohereReq.LogProbs = bifrostReq.Params.LogProbs
+		if err := refuseCohereTopLogProbs(bifrostReq.Params.TopLogProbs); err != nil {
+			return nil, err
+		}
 
 		// Convert reasoning
 		if bifrostReq.Params.Reasoning != nil {
@@ -185,9 +190,12 @@ func ToCohereChatCompletionRequest(bifrostReq *schemas.BifrostChatRequest) (*Coh
 				cohereReq.SafetyMode = safetyMode
 			}
 
+			// extra_params.log_probs is the older spelling of logprobs; logprobs wins.
 			if logProbs, ok := schemas.SafeExtractBoolPointer(bifrostReq.Params.ExtraParams["log_probs"]); ok {
 				delete(cohereReq.ExtraParams, "log_probs")
-				cohereReq.LogProbs = logProbs
+				if cohereReq.LogProbs == nil {
+					cohereReq.LogProbs = logProbs
+				}
 			}
 
 			if strictToolChoice, ok := schemas.SafeExtractBoolPointer(bifrostReq.Params.ExtraParams["strict_tool_choice"]); ok {
@@ -284,6 +292,12 @@ func (req *CohereChatRequest) ToBifrostChatRequest(ctx *schemas.BifrostContext) 
 	if req.PresencePenalty != nil {
 		bifrostReq.Params.PresencePenalty = req.PresencePenalty
 	}
+	if req.Seed != nil {
+		bifrostReq.Params.Seed = req.Seed
+	}
+	if req.LogProbs != nil {
+		bifrostReq.Params.LogProbs = req.LogProbs
+	}
 
 	// Convert reasoning
 	if req.Thinking != nil {
@@ -350,9 +364,6 @@ func (req *CohereChatRequest) ToBifrostChatRequest(ctx *schemas.BifrostContext) 
 	if req.SafetyMode != nil {
 		extraParams["safety_mode"] = *req.SafetyMode
 	}
-	if req.LogProbs != nil {
-		extraParams["log_probs"] = *req.LogProbs
-	}
 	if req.StrictToolChoice != nil {
 		extraParams["strict_tool_choice"] = *req.StrictToolChoice
 	}
@@ -396,6 +407,9 @@ func (response *CohereChatResponse) ToBifrostChatResponse(model string) *schemas
 	if response.Message != nil {
 		bifrostMessage := response.Message.ToBifrostChatMessage()
 		bifrostResponse.Choices[0].ChatNonStreamResponseChoice.Message = bifrostMessage
+	}
+	if content := convertCohereLogProbsToBifrost(response.LogProbs); content != nil {
+		bifrostResponse.Choices[0].LogProbs = &schemas.BifrostLogProbs{Content: content}
 	}
 
 	// Convert finish reason
@@ -594,6 +608,11 @@ func (chunk *CohereStreamEvent) ToBifrostChatCompletionStream() (*schemas.Bifros
 							},
 						},
 					},
+				}
+				if chunk.LogProbs != nil {
+					streamResponse.Choices[0].LogProbs = &schemas.BifrostLogProbs{
+						Content: convertCohereLogProbsToBifrost([]CohereLogProb{*chunk.LogProbs}),
+					}
 				}
 
 				return streamResponse, nil, false
@@ -860,4 +879,47 @@ func (cm *CohereMessage) ToBifrostChatMessage() *schemas.ChatMessage {
 		}
 	}
 	return bifrostMessage
+}
+
+// refuseCohereTopLogProbs refuses a non-zero top_logprobs: Cohere returns the chosen
+// tokens' logprobs only, with no alternatives, so the request cannot be served as asked.
+func refuseCohereTopLogProbs(topLogProbs *int) error {
+	if topLogProbs != nil && *topLogProbs != 0 {
+		return providerUtils.InvalidRequestErrorf("top_logprobs is not supported by Cohere, which returns only the chosen tokens' logprobs (logprobs: true); got top_logprobs %d", *topLogProbs)
+	}
+	return nil
+}
+
+// convertCohereLogProbsToBifrost converts Cohere's logprobs items to Chat token
+// logprobs. Each item is a text chunk with one logprob per token it was built from;
+// Cohere does not split the text per token, so an item becomes one entry whose token
+// is the chunk text and whose logprob is the sum of its tokens' logprobs (the chunk's
+// joint log probability). Cohere returns no alternatives, so top_logprobs is empty.
+// nil when there are no items.
+func convertCohereLogProbsToBifrost(items []CohereLogProb) []schemas.ContentLogProb {
+	if len(items) == 0 {
+		return nil
+	}
+	content := make([]schemas.ContentLogProb, 0, len(items))
+	for _, item := range items {
+		var token string
+		if item.Text != nil {
+			token = *item.Text
+		}
+		var logProb float64
+		for _, lp := range item.LogProbs {
+			logProb += lp
+		}
+		bytes := make([]int, len(token))
+		for i := 0; i < len(token); i++ {
+			bytes[i] = int(token[i])
+		}
+		content = append(content, schemas.ContentLogProb{
+			Bytes:       bytes,
+			LogProb:     logProb,
+			Token:       token,
+			TopLogProbs: []schemas.LogProb{},
+		})
+	}
+	return content
 }
