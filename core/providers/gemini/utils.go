@@ -466,6 +466,9 @@ func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters(p
 	if config.FrequencyPenalty != nil {
 		params.ExtraParams["frequency_penalty"] = config.FrequencyPenalty
 	}
+	// The Responses API has no seed field, so the seed rides extra_params.seed: the
+	// Gemini Responses conversion maps it back to generationConfig.seed, Cohere's to
+	// seed, and the chat fallback (ToChatRequest) to Chat's typed seed.
 	if config.Seed != nil {
 		params.ExtraParams["seed"] = int(*config.Seed)
 	}
@@ -487,8 +490,10 @@ func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters(p
 	if config.ResponseJSONSchema != nil {
 		params.ExtraParams["response_json_schema"] = config.ResponseJSONSchema
 	}
+	// responseLogprobs is the Responses include "message.output_text.logprobs", which
+	// every provider conversion reads (logprobs above is top_logprobs).
 	if config.ResponseLogprobs {
-		params.ExtraParams["response_logprobs"] = config.ResponseLogprobs
+		params.Include = append(params.Include, schemas.ResponsesIncludeOutputTextLogprobs)
 	}
 	return params
 }

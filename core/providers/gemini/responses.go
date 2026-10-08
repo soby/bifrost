@@ -4377,6 +4377,15 @@ func (r *GeminiGenerationRequest) convertParamsToGenerationConfigResponses(param
 				config.MediaResolution = val
 			}
 		}
+		// The Responses API has no seed field; a seed rides extra_params.seed (the
+		// GenAI ingress puts generationConfig.seed there). generationConfig.seed is an
+		// int32, and a seed outside it is refused rather than truncated.
+		if seed, ok := schemas.SafeExtractIntPointer(params.ExtraParams["seed"]); ok {
+			if *seed < math.MinInt32 || *seed > math.MaxInt32 {
+				return config, providerUtils.InvalidRequestErrorf("seed must be between %d and %d for Gemini generationConfig.seed, got %d", math.MinInt32, math.MaxInt32, *seed)
+			}
+			config.Seed = schemas.Ptr(int32(*seed))
+		}
 	}
 
 	return config, nil
@@ -4392,6 +4401,7 @@ var responsesGenerationConfigExtraParamKeys = []string{
 	"presence_penalty",
 	"stop_sequences",
 	"media_resolution",
+	"seed",
 }
 
 // responsesExtraParamsWithoutGenerationConfigKeys returns the ExtraParams to
