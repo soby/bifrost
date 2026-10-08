@@ -217,7 +217,8 @@ func runPushLocal[T any](
 	var result T
 	var opErr error
 	start := time.Now()
-	gateCtx := gateContext(ctx)
+	gateCtx, releaseGate := gateContext(ctx)
+	defer releaseGate()
 	defer gateCtx.StampUpstreamLatency()
 	_, gateErr := h.manager.RunWithPluginPipeline(gateCtx, envelope, func(*schemas.BifrostA2ARequest, func(*schemas.BifrostA2AEvent)) (*schemas.BifrostA2AResponse, error) {
 		phase := startPhaseSpan(gateCtx, "a2a.push.db.local")
@@ -544,7 +545,8 @@ func (h *proxyRequestHandler) DeleteTaskPushConfig(ctx context.Context, req *a2a
 // the transport should write. Acceptance means queued, not delivered, so a
 // success is 202.
 func (m *Manager) AcceptPushCallback(ctx context.Context, agentName, token string, body []byte) (status int, resultErr error) {
-	gateCtx := gateContext(ctx)
+	gateCtx, releaseGate := gateContext(ctx)
+	defer releaseGate()
 	finish := m.startPushTrace(gateCtx, "a2a.push.callback")
 	defer func() { finish(resultErr) }()
 	ctx = gateCtx
@@ -745,7 +747,8 @@ func (r *pushRelay) run() {
 
 func (r *pushRelay) prune() {
 	m := r.manager
-	ctx := gateContext(m.ctx)
+	ctx, releaseGate := gateContext(m.ctx)
+	defer releaseGate()
 	finish := m.startPushTrace(ctx, "a2a.push.maintenance.prune")
 	phase := startPhaseSpan(ctx, "a2a.push.db.prune")
 	err := m.pushStore.PruneAgentPushDeliveries(m.ctx, time.Now().UTC().Add(-pushDeliveryRetention))
@@ -762,12 +765,13 @@ func (r *pushRelay) processDue() {
 	m := r.manager
 	for {
 		// Shared batch lookup has its own trace, not a delivery's plugin log row.
-		ctx := gateContext(m.ctx)
+		ctx, releaseGate := gateContext(m.ctx)
 		finish := m.startPushTrace(ctx, "a2a.push.maintenance.list-due")
 		phase := startPhaseSpan(ctx, "a2a.push.db.list-due")
 		due, err := m.pushStore.ListDueAgentPushDeliveries(m.ctx, time.Now().UTC(), pushDeliveryBatchSize)
 		endPhaseSpan(phase)
 		finish(err)
+		releaseGate()
 		if err != nil {
 			if m.logger != nil && m.ctx.Err() == nil {
 				m.logger.Error("push relay failed to list due deliveries: %v", err)
@@ -815,7 +819,8 @@ func (r *pushRelay) deliver(delivery *schemas.AgentPushDelivery, leaseUntil time
 		BifrostA2APushRequest: &schemas.BifrostA2APushRequest{PushConfigID: delivery.ConfigID, DeliveryID: delivery.ID, AttemptID: attemptID},
 	}
 	start := time.Now()
-	gateCtx := gateContext(m.ctx)
+	gateCtx, releaseGate := gateContext(m.ctx)
+	defer releaseGate()
 	finish := m.startPushTrace(gateCtx, "a2a.push.delivery")
 	var traceErr error
 	defer func() { finish(traceErr) }()
