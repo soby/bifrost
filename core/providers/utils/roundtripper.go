@@ -49,6 +49,12 @@ import (
 // ReadCloserWithError contract that NewIdleTimeoutReader, SetupStreamCancellation,
 // ReleaseStreamingResponse and Response.Body already rely on.
 //
+// A transport built with contextBoundReads (fork-only; NetworkConfig.ContextBoundReads, set on
+// the instances that serve request-scoped configuration) does not apply ReadTimeout to the
+// wait for a response, unary or streamed: the request context's deadline and cancellation,
+// tightened by the attempt's request timeout (withAttemptRequestTimeout), are the bound. A
+// request whose context can never end keeps ReadTimeout, so no read is left unbounded.
+//
 // Not supported, by design: per-request DoTimeout / DoDeadline (their deadline is
 // unexported; Bifrost never uses them), Response.SkipBody combined with streaming
 // beyond HEAD/204/304, and HTTP pipelining.
@@ -91,7 +97,21 @@ func NewContextTransport() fasthttp.RoundTripper {
 	return &contextTransport{}
 }
 
-type contextTransport struct{}
+type contextTransport struct {
+	// contextBoundReads drops ReadTimeout from the response wait of a request whose
+	// context can end (see readTimeout).
+	contextBoundReads bool
+}
+
+// readTimeout is the fixed timeout applied, with ctx's deadline, to the wait for a
+// response: the client's ReadTimeout, or none when reads are context-bound and ctx
+// can end.
+func (t *contextTransport) readTimeout(hc *fasthttp.HostClient, ctx context.Context) time.Duration {
+	if t.contextBoundReads && ctx.Done() != nil {
+		return 0
+	}
+	return hc.ReadTimeout
+}
 
 // maxInterimResponses mirrors fasthttp's unexported cap on 1xx responses parsed
 // before the final status line.
@@ -169,7 +189,7 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 
 	// Setting a deadline fails with "use of closed network connection" when the
 	// watcher closed the socket a moment ago; classify turns that into ctx.Err().
-	if err = conn.SetReadDeadline(deadlineFor(hc.ReadTimeout, ctx)); err != nil {
+	if err = conn.SetReadDeadline(deadlineFor(t.readTimeout(hc, ctx), ctx)); err != nil {
 		hc.CloseConn(cc)
 		return retryOn(err), watcher.classify(err)
 	}

@@ -82,6 +82,15 @@ type NetworkConfig struct {
 	// request-scoped configuration (see ProviderOverride), whose destinations come from
 	// requests rather than from the operator, and it is never serialized.
 	LoopbackIsPrivate bool `json:"-"`
+
+	// ContextBoundReads stops DefaultRequestTimeoutInSeconds from bounding the wait for a
+	// response: the request context's deadline and cancellation, and a per-attempt
+	// BifrostContextKeyAttemptRequestTimeout, bound it instead. The timeout still bounds the
+	// dial, the request write and the wait for a pooled connection, and a request whose
+	// context can never end keeps it as its read bound. Runtime-only and fork-only: Bifrost
+	// sets it on the provider instances that serve request-scoped configuration, whose
+	// callers bound each attempt themselves, and it is never serialized.
+	ContextBoundReads bool `json:"-"`
 }
 
 // UnmarshalJSON customizes JSON unmarshaling for NetworkConfig.
