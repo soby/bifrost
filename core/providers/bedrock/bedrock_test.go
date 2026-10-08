@@ -8036,10 +8036,10 @@ func TestAnthropicIngressMantleReplayUsesResponsesInputShapes(t *testing.T) {
 			// Mantle /v1 strips status/annotations from assistant items, so only input_text validates for gpt-oss.
 			assert.Equalf(t, "input_text", part.Type, "input[%d].content[%d]: replayed gpt-oss assistant text must be input_text on Mantle", i, j)
 		}
-		if assert.NotNilf(t, item.Status,
-			"input[%d]: an assistant output message item requires `status` (ResponseOutputMessageParam), got item: %s", i, mustItem(body, i)) {
-			assert.Equalf(t, "completed", *item.Status, "input[%d].status", i)
-		}
+		// With input_text content the item is an EasyInputMessage (role assistant), which has no
+		// status; ResponseOutputMessageParam would need output_text content. The converter strips
+		// status from input items.
+		assert.Nilf(t, item.Status, "input[%d]: an assistant EasyInputMessage carries no `status`, got item: %s", i, mustItem(body, i))
 	}
 	require.True(t, sawAssistant, "fixture must include a replayed assistant message")
 }
