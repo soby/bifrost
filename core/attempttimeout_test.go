@@ -227,3 +227,21 @@ func TestAttemptRequestTimeout_ReleasesSlotAndShutdown(t *testing.T) {
 		})
 	}
 }
+
+// Request-scoped instances leave the response wait to the request context and the attempt
+// timeout; configured providers keep default_request_timeout_in_seconds as their read bound.
+func TestRequestScopedProviderConfig_ContextBoundReads(t *testing.T) {
+	for _, allowPrivateNetwork := range []bool{true, false} {
+		config := requestScopedProviderConfig(allowPrivateNetwork)
+		if !config.NetworkConfig.ContextBoundReads {
+			t.Errorf("requestScopedProviderConfig(%v): ContextBoundReads = false, want true", allowPrivateNetwork)
+		}
+		if config.NetworkConfig.DefaultRequestTimeoutInSeconds != schemas.DefaultRequestTimeoutInSeconds {
+			t.Errorf("requestScopedProviderConfig(%v): DefaultRequestTimeoutInSeconds = %d, want %d (it still bounds dial and write)",
+				allowPrivateNetwork, config.NetworkConfig.DefaultRequestTimeoutInSeconds, schemas.DefaultRequestTimeoutInSeconds)
+		}
+	}
+	if schemas.DefaultNetworkConfig.ContextBoundReads {
+		t.Error("DefaultNetworkConfig.ContextBoundReads = true; configured providers must keep their read timeout")
+	}
+}

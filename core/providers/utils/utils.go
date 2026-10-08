@@ -622,27 +622,29 @@ func ConfigureRetry(client *fasthttp.Client) *fasthttp.Client {
 // Dead connections are detected within ~25s (10 + 5*3), before the 30s
 // MaxIdleConnDuration expires and the connection is reused.
 func ConfigureDialer(client *fasthttp.Client, allowPrivateNetwork bool) *fasthttp.Client {
-	return configureDialer(client, allowPrivateNetwork, false)
+	return configureDialer(client, allowPrivateNetwork, false, false)
 }
 
 // ConfigureDialerFor is ConfigureDialer driven by a provider's network config. Besides
-// AllowPrivateNetwork it honors LoopbackIsPrivate, which Bifrost sets on the instances that
-// serve request-scoped configuration; providers implementing schemas.RequestScopedProvider
-// must build their dialers with it.
+// AllowPrivateNetwork it honors LoopbackIsPrivate and ContextBoundReads, which Bifrost sets on
+// the instances that serve request-scoped configuration; providers implementing
+// schemas.RequestScopedProvider must build their dialers with it.
 func ConfigureDialerFor(client *fasthttp.Client, networkConfig schemas.NetworkConfig) *fasthttp.Client {
-	return configureDialer(client, networkConfig.AllowPrivateNetwork, networkConfig.LoopbackIsPrivate)
+	return configureDialer(client, networkConfig.AllowPrivateNetwork, networkConfig.LoopbackIsPrivate, networkConfig.ContextBoundReads)
 }
 
 // configureDialer implements ConfigureDialer. Loopback addresses are always reachable unless
 // loopbackIsPrivate is set, in which case they need allowPrivateNetwork like RFC 1918 ones.
-func configureDialer(client *fasthttp.Client, allowPrivateNetwork, loopbackIsPrivate bool) *fasthttp.Client {
+// With contextBoundReads the client's ReadTimeout no longer bounds the wait for a response
+// (see contextTransport); it still bounds the dial below.
+func configureDialer(client *fasthttp.Client, allowPrivateNetwork, loopbackIsPrivate, contextBoundReads bool) *fasthttp.Client {
 	// Configure stale-connection retry policy
 	client.RetryIfErr = network.StaleConnectionRetryIfErr
 
 	// Every Bifrost client goes through the context-aware transport: it applies
 	// the client's timeouts to the header phase only on streamed responses and
 	// closes the socket when the request context ends (see roundtripper.go).
-	client.Transport = NewContextTransport()
+	client.Transport = &contextTransport{contextBoundReads: contextBoundReads}
 
 	existingDial := client.Dial
 	existingDialTimeout := client.DialTimeout

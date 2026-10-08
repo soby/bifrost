@@ -5106,10 +5106,15 @@ type requestScopedProvider struct {
 // requestScopedProviderConfig returns the configuration request-scoped instances are built
 // with: default network settings, loopback treated as a private address, and the smallest
 // concurrency settings, since the instance has no queue or workers of its own.
+//
+// Fork-only: reads are context-bound (NetworkConfig.ContextBoundReads), so the default
+// request timeout does not cap a response; the request's context and the attempt's request
+// timeout bound it.
 func requestScopedProviderConfig(allowPrivateNetwork bool) *schemas.ProviderConfig {
 	networkConfig := schemas.DefaultNetworkConfig
 	networkConfig.AllowPrivateNetwork = allowPrivateNetwork
 	networkConfig.LoopbackIsPrivate = true
+	networkConfig.ContextBoundReads = true
 	return &schemas.ProviderConfig{
 		NetworkConfig:            networkConfig,
 		ConcurrencyAndBufferSize: schemas.ConcurrencyAndBufferSize{Concurrency: 1, BufferSize: 1},
