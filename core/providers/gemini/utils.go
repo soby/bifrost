@@ -3238,6 +3238,17 @@ func ConvertGeminiLogprobsResultToBifrost(result *LogprobsResult) *schemas.Bifro
 	return &schemas.BifrostLogProbs{Content: content}
 }
 
+// convertGeminiLogprobsResultToResponses converts a Gemini logprobsResult to the
+// logprobs of a Responses output_text part, one entry per decoding step. nil when
+// the candidate carries none.
+func convertGeminiLogprobsResultToResponses(result *LogprobsResult) []schemas.ResponsesOutputMessageContentTextLogProb {
+	logProbs := ConvertGeminiLogprobsResultToBifrost(result)
+	if logProbs == nil {
+		return nil
+	}
+	return schemas.ResponsesLogProbsFromChat(logProbs.Content)
+}
+
 // mimeTypeFromURI returns the IANA MIME type a URI's own file extension declares, or "" when the
 // URI does not state one.
 //

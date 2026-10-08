@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"slices"
 	"strconv"
@@ -1290,6 +1291,11 @@ type GeminiResponsesStreamState struct {
 	HasStartedText     bool            // Whether we've started text content
 	HasStartedToolCall bool            // Whether we've started a tool call
 	TextBuffer         strings.Builder // Accumulates text deltas for output_text.done
+	// Token logprobs of the current chunk's logprobsResult, not yet attached to an
+	// output_text.delta, and those of the open text item, for output_text.done and
+	// the item's output_text part.
+	PendingLogProbs []schemas.ResponsesOutputMessageContentTextLogProb
+	TextLogProbs    []schemas.ResponsesOutputMessageContentTextLogProb
 
 	CodeExecOutputIndex int    // -1 when no code_interpreter_call is open
 	CodeExecItemID      string // Item ID of the open code_interpreter_call
@@ -1402,6 +1408,17 @@ func (state *GeminiResponsesStreamState) flush() {
 	state.CodeExecItemID = ""
 	state.CodeExecCode = ""
 	state.TextBuffer.Reset()
+	state.PendingLogProbs = nil
+	state.TextLogProbs = nil
+}
+
+// textItemLogProbs returns the open text item's token logprobs, or an empty list
+// (the output_text logprobs field is always present) when it has none.
+func (state *GeminiResponsesStreamState) textItemLogProbs() []schemas.ResponsesOutputMessageContentTextLogProb {
+	if state.TextLogProbs == nil {
+		return []schemas.ResponsesOutputMessageContentTextLogProb{}
+	}
+	return state.TextLogProbs
 }
 
 // closeTextItemIfOpen closes the text item if it's open and returns the responses.
@@ -1482,12 +1499,21 @@ func (response *GenerateContentResponse) toBifrostResponsesStream(sequenceNumber
 	if len(response.Candidates) > 0 {
 		candidate := response.Candidates[0]
 
+		// A chunk's logprobsResult covers the tokens of that chunk: the first
+		// output_text.delta of the chunk carries them.
+		state.PendingLogProbs = convertGeminiLogprobsResultToResponses(candidate.LogprobsResult)
 		if candidate.Content != nil && len(candidate.Content.Parts) > 0 {
 			for _, part := range candidate.Content.Parts {
 				partResponses := processGeminiPart(part, state, sequenceNumber+len(responses))
 				responses = append(responses, partResponses...)
 			}
 		}
+		// No delta in this chunk took them (a chunk with logprobs but no text): they
+		// still belong to the open text item's output.
+		if state.PendingLogProbs != nil && state.HasStartedText && !state.TextItemClosed {
+			state.TextLogProbs = append(state.TextLogProbs, state.PendingLogProbs...)
+		}
+		state.PendingLogProbs = nil
 
 		if candidate.FinishReason != "" {
 			state.PendingFinishReason = candidate.FinishReason
@@ -1600,6 +1626,7 @@ func processGeminiTextPart(part *Part, state *GeminiResponsesStreamState, sequen
 	if !state.HasStartedText || state.TextItemClosed {
 		state.TextItemClosed = false
 		state.TextBuffer.Reset()
+		state.TextLogProbs = nil
 		outputIndex = state.nextOutputIndex()
 		state.TextOutputIndex = outputIndex // Cache the text item's output index
 		itemID := state.generateItemID("item", outputIndex)
@@ -1663,6 +1690,11 @@ func processGeminiTextPart(part *Part, state *GeminiResponsesStreamState, sequen
 			ItemID:         &itemID,
 			Delta:          &text,
 			LogProbs:       []schemas.ResponsesOutputMessageContentTextLogProb{},
+		}
+		if state.PendingLogProbs != nil {
+			streamResponse.LogProbs = state.PendingLogProbs
+			state.TextLogProbs = append(state.TextLogProbs, state.PendingLogProbs...)
+			state.PendingLogProbs = nil
 		}
 		if len(part.ThoughtSignature) > 0 {
 			thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
@@ -2357,6 +2389,8 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 
 	// Emit output_text.done
 	fullText := state.TextBuffer.String()
+	logProbs := state.textItemLogProbs()
+	state.TextLogProbs = nil
 	responses = append(responses, &schemas.BifrostResponsesStreamResponse{
 		Type:           schemas.ResponsesStreamResponseTypeOutputTextDone,
 		SequenceNumber: sequenceNumber + len(responses),
@@ -2364,7 +2398,7 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 		ContentIndex:   &contentIndex,
 		ItemID:         &itemID,
 		Text:           &fullText,
-		LogProbs:       []schemas.ResponsesOutputMessageContentTextLogProb{},
+		LogProbs:       logProbs,
 	})
 
 	// Emit content_part.done with accumulated text
@@ -2373,7 +2407,7 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 		Type: schemas.ResponsesOutputMessageContentTypeText,
 		Text: &partText,
 		ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
-			LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+			LogProbs:    logProbs,
 			Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
 		},
 	}
@@ -2399,7 +2433,7 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 					Text: &itemText,
 					ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
 						Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
-						LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+						LogProbs:    logProbs,
 					},
 				},
 			},
@@ -3980,6 +4014,14 @@ func convertGeminiCandidatesToResponsesOutput(candidates []*Candidate) []schemas
 			}
 		}
 
+		// logprobsResult covers the candidate's whole output, so it goes on the
+		// candidate's text block, where the streaming path puts it too.
+		if logProbs := convertGeminiLogprobsResultToResponses(candidate.LogprobsResult); logProbs != nil {
+			if block := textBlockOf(messages, textMessageIdx); block != nil {
+				block.LogProbs = logProbs
+			}
+		}
+
 		// check if gemini used google search tool
 		if candidate.GroundingMetadata != nil {
 			webSearchmessage := schemas.ResponsesMessage{
@@ -4283,6 +4325,24 @@ func (r *GeminiGenerationRequest) convertParamsToGenerationConfigResponses(param
 	if params.Text != nil {
 		if err := convertTextConfigToGenerationConfig(params.Text, &config); err != nil {
 			return config, err
+		}
+	}
+
+	// include "message.output_text.logprobs" asks for the chosen tokens' logprobs
+	// (responseLogprobs); a non-zero top_logprobs also asks for that many alternatives
+	// per token (logprobs). The count is sent as given, as on the chat path: Gemini
+	// answers an out-of-range count with its own error. A value outside int32 is a 400.
+	if slices.Contains(params.Include, schemas.ResponsesIncludeOutputTextLogprobs) {
+		config.ResponseLogprobs = true
+	}
+	if params.TopLogProbs != nil {
+		topLogProbs := *params.TopLogProbs
+		if topLogProbs < math.MinInt32 || topLogProbs > math.MaxInt32 {
+			return config, providerUtils.InvalidRequestErrorf("top_logprobs must be between %d and %d for Gemini generationConfig.logprobs, got %d", math.MinInt32, math.MaxInt32, topLogProbs)
+		}
+		if topLogProbs != 0 {
+			config.ResponseLogprobs = true
+			config.Logprobs = schemas.Ptr(int32(topLogProbs))
 		}
 	}
 

@@ -2917,3 +2917,47 @@ func (cr *BifrostChatResponse) ToBifrostTextCompletionResponse() *BifrostTextCom
 		},
 	}
 }
+
+// ResponsesLogProbsFromChat converts Chat token logprobs (choices[].logprobs.content)
+// to the logprobs of a Responses output_text part. nil in, nil out.
+func ResponsesLogProbsFromChat(content []ContentLogProb) []ResponsesOutputMessageContentTextLogProb {
+	if content == nil {
+		return nil
+	}
+	out := make([]ResponsesOutputMessageContentTextLogProb, len(content))
+	for i, lp := range content {
+		topLogProbs := lp.TopLogProbs
+		if topLogProbs == nil {
+			topLogProbs = []LogProb{}
+		}
+		out[i] = ResponsesOutputMessageContentTextLogProb{
+			Bytes:       lp.Bytes,
+			LogProb:     lp.LogProb,
+			Token:       lp.Token,
+			TopLogProbs: topLogProbs,
+		}
+	}
+	return out
+}
+
+// ChatLogProbsFromResponses converts the logprobs of a Responses output_text part
+// to Chat token logprobs (choices[].logprobs.content). nil in, nil out.
+func ChatLogProbsFromResponses(logProbs []ResponsesOutputMessageContentTextLogProb) []ContentLogProb {
+	if logProbs == nil {
+		return nil
+	}
+	out := make([]ContentLogProb, len(logProbs))
+	for i, lp := range logProbs {
+		topLogProbs := lp.TopLogProbs
+		if topLogProbs == nil {
+			topLogProbs = []LogProb{}
+		}
+		out[i] = ContentLogProb{
+			Bytes:       lp.Bytes,
+			LogProb:     lp.LogProb,
+			Token:       lp.Token,
+			TopLogProbs: topLogProbs,
+		}
+	}
+	return out
+}
