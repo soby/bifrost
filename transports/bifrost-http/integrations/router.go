@@ -2906,6 +2906,7 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 	// Use SSEStreamReader to bypass fasthttp's internal pipe (fasthttputil.PipeConns)
 	// which batches multiple SSE events into single TCP segments.
 	reader := lib.NewSSEStreamReader()
+	reader.SetFrameTap(lib.StreamFrameTap(bifrostCtx))
 	ctx.Response.SetBodyStream(reader, -1)
 
 	// Producer goroutine: processes the stream channel, formats events, sends to reader
@@ -3784,6 +3785,7 @@ func (g *GenericRouter) handlePassthroughStream(
 
 	// Use SSEStreamReader to bypass fasthttp's internal pipe batching
 	reader := lib.NewSSEStreamReader()
+	reader.SetFrameTap(lib.StreamFrameTap(bifrostCtx))
 	ctx.Response.SetBodyStream(reader, -1)
 
 	// This path proxies raw upstream bytes 1:1, and content-type isn't always SSE (see the

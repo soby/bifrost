@@ -4,6 +4,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/maximhq/bifrost/core/schemas"
 )
 
 // SSEStreamReader is an io.ReadCloser that delivers one event per Read call,
@@ -33,6 +35,9 @@ type SSEStreamReader struct {
 	// whether the next byte written starts a fresh SSE line. True initially: the start of a
 	// stream is a line boundary.
 	atLineBoundary bool
+	// tap, when set, receives every byte this reader releases, one Write per release, under
+	// mu. Nil costs nothing.
+	tap io.Writer
 }
 
 // NewSSEStreamReader creates a new SSEStreamReader with a buffered event channel.
@@ -44,6 +49,27 @@ func NewSSEStreamReader() *SSEStreamReader {
 		closeCh:        make(chan struct{}),
 		atLineBoundary: true,
 	}
+}
+
+// SetFrameTap installs w to receive a copy of every byte the reader releases (events,
+// heartbeat comments and the done marker), in release order and one Write per release, so a
+// caller can observe exactly what the stream sent. Call it before the producer starts. w runs
+// under the reader's send lock: it must not block or retain the slice. A nil w disables the
+// tap. Write errors are ignored and never affect delivery.
+func (r *SSEStreamReader) SetFrameTap(w io.Writer) {
+	r.mu.Lock()
+	r.tap = w
+	r.mu.Unlock()
+}
+
+// StreamFrameTap returns the request's frame tap (schemas.BifrostContextKeyStreamFrameTap),
+// or nil when none is set.
+func StreamFrameTap(ctx *schemas.BifrostContext) io.Writer {
+	if ctx == nil {
+		return nil
+	}
+	tap, _ := ctx.Value(schemas.BifrostContextKeyStreamFrameTap).(io.Writer)
+	return tap
 }
 
 // Read implements io.Reader. It blocks until an event is available, then returns
@@ -104,6 +130,9 @@ func (r *SSEStreamReader) sendLocked(event []byte) bool {
 		// A zero-length send writes nothing, so it cannot move the write position.
 		if len(event) > 0 {
 			r.atLineBoundary = event[len(event)-1] == '\n'
+			if r.tap != nil {
+				_, _ = r.tap.Write(event)
+			}
 		}
 		return true
 	case <-r.closeCh:
