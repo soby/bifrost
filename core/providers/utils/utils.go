@@ -484,10 +484,7 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 // Fork-only: upstream has no per-request timeout for an attempt; a request-scoped attempt runs
 // with the default network settings' 300 s timeout.
 func withAttemptRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx == nil {
-		return ctx, func() {}
-	}
-	timeout, _ := ctx.Value(schemas.BifrostContextKeyAttemptRequestTimeout).(time.Duration)
+	timeout := attemptRequestTimeout(ctx)
 	if timeout <= 0 {
 		return ctx, func() {}
 	}
@@ -597,6 +594,131 @@ func DoHTTPRequest(client *http.Client, req *http.Request) (*http.Response, erro
 		resp.Body = &upstreamTimingBody{inner: resp.Body, ctx: req.Context()}
 	}
 	return resp, err
+}
+
+// errAttemptRequestTimeout is the error a net/http call bounded by the attempt's request
+// timeout fails with when that timeout, and not the request context, ended it. It is a
+// timeout (net.Error) and matches context.DeadlineExceeded, so callers classify it as a
+// retryable timeout and fallbacks run, as on the fasthttp path.
+var errAttemptRequestTimeout error = attemptRequestTimeoutError{}
+
+type attemptRequestTimeoutError struct{}
+
+func (attemptRequestTimeoutError) Error() string   { return "attempt request timeout exceeded" }
+func (attemptRequestTimeoutError) Timeout() bool   { return true }
+func (attemptRequestTimeoutError) Temporary() bool { return true }
+func (attemptRequestTimeoutError) Is(target error) bool {
+	return target == context.DeadlineExceeded
+}
+
+// attemptRequestTimeout returns the attempt's request timeout
+// (BifrostContextKeyAttemptRequestTimeout) carried by ctx, or 0 when there is none.
+func attemptRequestTimeout(ctx context.Context) time.Duration {
+	if ctx == nil {
+		return 0
+	}
+	timeout, _ := ctx.Value(schemas.BifrostContextKeyAttemptRequestTimeout).(time.Duration)
+	return max(timeout, 0)
+}
+
+// DoAttemptHTTPRequest is DoHTTPRequest for a unary provider call: the attempt's request
+// timeout (BifrostContextKeyAttemptRequestTimeout) bounds the whole call, body included, as
+// MakeRequestWithContext does on fasthttp. The call runs on a child of the request context, so
+// expiry ends the attempt without cancelling the request; it fails with a timeout that matches
+// context.DeadlineExceeded. The child is released when the body is closed. Without a positive
+// timeout it is DoHTTPRequest.
+//
+// Fork-only: upstream's net/http calls are bounded only by the client's timeout.
+func DoAttemptHTTPRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	timeout := attemptRequestTimeout(req.Context())
+	if timeout <= 0 {
+		return DoHTTPRequest(client, req)
+	}
+	attemptCtx, cancel := context.WithTimeoutCause(req.Context(), timeout, errAttemptRequestTimeout)
+	resp, err := DoHTTPRequest(client, req.WithContext(attemptCtx))
+	if err != nil {
+		cancel()
+		return nil, attemptError(attemptCtx, err)
+	}
+	bindAttemptBody(resp, attemptCtx, cancel)
+	return resp, nil
+}
+
+// DoAttemptStreamingHTTPRequest is DoHTTPRequest for a streaming provider call: the attempt's
+// request timeout (BifrostContextKeyAttemptRequestTimeout) bounds the wait for response
+// headers only, as DoStreamingRequest does on fasthttp; the body is left to the stream idle
+// timeout. Expiry ends the attempt without cancelling the request and fails with a timeout
+// that matches context.DeadlineExceeded. Without a positive timeout it is DoHTTPRequest.
+//
+// Fork-only: upstream's net/http calls are bounded only by the client's timeout.
+func DoAttemptStreamingHTTPRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	timeout := attemptRequestTimeout(req.Context())
+	if timeout <= 0 {
+		return DoHTTPRequest(client, req)
+	}
+	// A deadline cannot be lifted once headers arrive, so the header wait is bounded by a
+	// timer that cancels the attempt's context and is stopped when headers are in.
+	attemptCtx, cancel := context.WithCancelCause(req.Context())
+	timer := time.AfterFunc(timeout, func() { cancel(errAttemptRequestTimeout) })
+	resp, err := DoHTTPRequest(client, req.WithContext(attemptCtx))
+	if !timer.Stop() {
+		// The timer fired: the attempt timed out, even if headers arrived in the same instant.
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		cancel(nil)
+		return nil, errAttemptRequestTimeout
+	}
+	if err != nil {
+		cancel(nil)
+		return nil, attemptError(attemptCtx, err)
+	}
+	bindAttemptBody(resp, attemptCtx, func() { cancel(nil) })
+	return resp, nil
+}
+
+// attemptError returns errAttemptRequestTimeout when the attempt's timeout ended the call,
+// and err otherwise (a request-context cancellation or deadline stays what it was).
+func attemptError(attemptCtx context.Context, err error) error {
+	if context.Cause(attemptCtx) == errAttemptRequestTimeout {
+		return errAttemptRequestTimeout
+	}
+	return err
+}
+
+// bindAttemptBody makes closing resp's body release the attempt's context, and reports a
+// body read cut short by the attempt's timeout as errAttemptRequestTimeout. It wraps inside
+// DoHTTPRequest's timing wrapper, which NewIdleTimeoutReader looks for.
+func bindAttemptBody(resp *http.Response, attemptCtx context.Context, release func()) {
+	if resp.Body == nil {
+		release()
+		return
+	}
+	if tb, ok := resp.Body.(*upstreamTimingBody); ok {
+		tb.inner = &attemptBody{inner: tb.inner, ctx: attemptCtx, release: release}
+		return
+	}
+	resp.Body = &attemptBody{inner: resp.Body, ctx: attemptCtx, release: release}
+}
+
+type attemptBody struct {
+	inner   io.ReadCloser
+	ctx     context.Context
+	release func()
+}
+
+func (b *attemptBody) Read(p []byte) (int, error) {
+	n, err := b.inner.Read(p)
+	if err != nil && err != io.EOF {
+		err = attemptError(b.ctx, err)
+	}
+	return n, err
+}
+
+func (b *attemptBody) Close() error {
+	err := b.inner.Close()
+	b.release()
+	return err
 }
 
 // Deprecated: ConfigureRetry is now handled internally by ConfigureDialer.
