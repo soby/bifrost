@@ -1331,6 +1331,14 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 		penalty := float64(*params.FrequencyPenalty)
 		config.FrequencyPenalty = &penalty
 	}
+	// generationConfig.seed is an int32. A seed outside that range is refused rather
+	// than truncated: a truncated seed would silently sample with a different seed.
+	if params.Seed != nil {
+		if *params.Seed < math.MinInt32 || *params.Seed > math.MaxInt32 {
+			return config, providerUtils.InvalidRequestErrorf("seed must be between %d and %d for Gemini generationConfig.seed, got %d", math.MinInt32, math.MaxInt32, *params.Seed)
+		}
+		config.Seed = schemas.Ptr(int32(*params.Seed))
+	}
 	// Only set ThinkingConfig if the model actually supports thinking
 	caps := schemas.ResolveModelCaps(provider, model)
 	if params.Reasoning != nil && caps.SupportsReasoning(defaultSupportsReasoning(model)) {
@@ -1423,13 +1431,14 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 	if params.LogProbs != nil {
 		config.ResponseLogprobs = *params.LogProbs
 	}
-	// Mapping top_logprobs to generation config
+	// Mapping top_logprobs to generation config. The value is sent as given: Gemini
+	// answers an out-of-range count with its own error instead of Bifrost lowering it.
 	if params.TopLogProbs != nil {
 		topLogProbs := *params.TopLogProbs
-		if topLogProbs > 20 {
-			topLogProbs = 20
+		if topLogProbs < math.MinInt32 || topLogProbs > math.MaxInt32 {
+			return config, providerUtils.InvalidRequestErrorf("top_logprobs must be between %d and %d for Gemini generationConfig.logprobs, got %d", math.MinInt32, math.MaxInt32, topLogProbs)
 		}
-		if topLogProbs > 0 {
+		if topLogProbs != 0 {
 			config.ResponseLogprobs = true
 			config.Logprobs = schemas.Ptr(int32(topLogProbs))
 		}
