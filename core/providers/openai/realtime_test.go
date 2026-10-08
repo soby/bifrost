@@ -849,8 +849,13 @@ func TestRealtimeWebRTCUpstreamErrorCarriesRetryHint(t *testing.T) {
 
 	provider := &OpenAIProvider{}
 	bifrostErr := provider.realtimeWebRTCUpstreamError(schemas.NewBifrostContext(nil, schemas.NoDeadline), &resp)
-	if bifrostErr.StatusCode == nil || *bifrostErr.StatusCode != fasthttp.StatusBadGateway {
-		t.Fatalf("StatusCode = %v, want 502", bifrostErr.StatusCode)
+	// The upstream status is kept, as on every provider error path: a 429 stays a 429, so
+	// clients and fallbacks see a rate limit rather than a gateway failure.
+	if bifrostErr.StatusCode == nil || *bifrostErr.StatusCode != fasthttp.StatusTooManyRequests {
+		t.Fatalf("StatusCode = %v, want 429", bifrostErr.StatusCode)
+	}
+	if bifrostErr.Error == nil || bifrostErr.Error.Message != "slow down" {
+		t.Fatalf("error = %#v, want the upstream message", bifrostErr.Error)
 	}
 	if bifrostErr.ExtraFields.RetryAfter != 7000 {
 		t.Fatalf("RetryAfter = %d, want 7000", bifrostErr.ExtraFields.RetryAfter)
