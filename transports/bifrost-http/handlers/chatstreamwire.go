@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 var usageNullJSONSuffix = []byte(`,"usage":null}`)
@@ -27,6 +29,9 @@ func marshalChatCompletionStreamEvents(response *schemas.BifrostChatResponse, in
 		if err != nil {
 			return nil, nil, err
 		}
+		if primaryJSON, err = omitAccountingChoiceNulls(response, primaryJSON); err != nil {
+			return nil, nil, err
+		}
 		if includeUsage {
 			primaryJSON = appendUsageNull(primaryJSON)
 		}
@@ -38,6 +43,9 @@ func marshalChatCompletionStreamEvents(response *schemas.BifrostChatResponse, in
 		primary.Usage = nil
 		primaryJSON, err = schemas.MarshalSorted(&primary)
 		if err != nil {
+			return nil, nil, err
+		}
+		if primaryJSON, err = omitAccountingChoiceNulls(&primary, primaryJSON); err != nil {
 			return nil, nil, err
 		}
 		if includeUsage {
@@ -67,4 +75,45 @@ func appendUsageNull(encoded []byte) []byte {
 	}
 	encoded = encoded[:len(encoded)-1]
 	return append(encoded, usageNullJSONSuffix...)
+}
+
+// omitAccountingChoiceNulls keeps the post-finish accounting chunk on the wire
+// shape released Pretxt NeMo Relay workers accept (PLATFORM-4090). After
+// forwarding a content-bearing finish, the OpenAI stream producer sends one
+// synthetic chunk whose only choice is content-free: index 0, an empty delta,
+// and no finish reason or logprobs (providers/utils
+// CreateBifrostChatCompletionChunkResponse with a nil finish reason). Upstream
+// #6723 marshals finish_reason and logprobs as required nullable fields, which
+// gave that chunk `"finish_reason":null,"logprobs":null`; earlier releases
+// omitted both, and Relay's corrective collector accepts only the bare
+// `{"delta":{},"index":0}` after a finish. This removes exactly those two nulls
+// from exactly that choice. Every other chunk keeps upstream's encoding, and
+// the struct pre-check keeps them on the single-marshal path.
+func omitAccountingChoiceNulls(response *schemas.BifrostChatResponse, encoded []byte) ([]byte, error) {
+	if len(response.Choices) != 1 {
+		return encoded, nil
+	}
+	choice := response.Choices[0]
+	if choice.Index != 0 || choice.FinishReason != nil || choice.LogProbs != nil ||
+		choice.TextCompletionResponseChoice != nil || choice.ChatNonStreamResponseChoice != nil ||
+		choice.ChatStreamResponseChoice == nil || !emptyStreamDelta(choice.ChatStreamResponseChoice.Delta) ||
+		len(choice.ContentFilterResults) != 0 || len(choice.Error) != 0 {
+		return encoded, nil
+	}
+	wire := gjson.GetBytes(encoded, "choices.0")
+	if !wire.IsObject() || len(wire.Map()) != 4 || wire.Get("delta").Raw != "{}" ||
+		wire.Get("finish_reason").Type != gjson.Null || wire.Get("logprobs").Type != gjson.Null {
+		return encoded, nil
+	}
+	encoded, err := sjson.DeleteBytes(encoded, "choices.0.finish_reason")
+	if err != nil {
+		return nil, err
+	}
+	return sjson.DeleteBytes(encoded, "choices.0.logprobs")
+}
+
+func emptyStreamDelta(delta *schemas.ChatStreamResponseChoiceDelta) bool {
+	return delta != nil && delta.Role == nil && delta.Content == nil && delta.Refusal == nil &&
+		delta.Audio == nil && delta.Reasoning == nil && len(delta.ReasoningDetails) == 0 &&
+		len(delta.Annotations) == 0 && len(delta.ToolCalls) == 0 && len(delta.ExtraContent) == 0
 }
