@@ -8847,7 +8847,7 @@ func (bifrost *Bifrost) handleProviderRequest(provider schemas.Provider, config 
 			return nil, bifrostError
 		}
 		if changeType, ok := req.Context.Value(schemas.BifrostContextKeyChangeRequestType).(schemas.RequestType); ok && changeType == schemas.ResponsesRequest {
-			if bifrostError := refuseChatParamsLostToResponses(req.Context, req.BifrostRequest.ChatRequest); bifrostError != nil {
+			if bifrostError := refuseChatParamsLostToResponses(req.Context, req.ChatRequest); bifrostError != nil {
 				return nil, bifrostError
 			}
 			responsesRequest := req.BifrostRequest.ChatRequest.ToResponsesRequest()
@@ -9287,7 +9287,7 @@ func (bifrost *Bifrost) handleProviderStreamRequest(provider schemas.Provider, c
 			return nil, bifrostError
 		}
 		if changeType, ok := req.Context.Value(schemas.BifrostContextKeyChangeRequestType).(schemas.RequestType); ok && changeType == schemas.ResponsesRequest {
-			if bifrostError := refuseChatParamsLostToResponses(req.Context, req.BifrostRequest.ChatRequest); bifrostError != nil {
+			if bifrostError := refuseChatParamsLostToResponses(req.Context, req.ChatRequest); bifrostError != nil {
 				return nil, bifrostError
 			}
 			responsesRequest := req.BifrostRequest.ChatRequest.ToResponsesRequest()

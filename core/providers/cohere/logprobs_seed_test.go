@@ -208,7 +208,7 @@ func TestCohereResponses_LogprobsReachOutputText(t *testing.T) {
 	assertCohereHelloWorld(t, schemas.ChatLogProbsFromResponses(textDone[0].LogProbs))
 	partDone := filterStreamEvents(events, schemas.ResponsesStreamResponseTypeContentPartDone)
 	require.Len(t, partDone, 1)
-	assertCohereHelloWorld(t, schemas.ChatLogProbsFromResponses(partDone[0].Part.ResponsesOutputMessageContentText.LogProbs))
+	assertCohereHelloWorld(t, schemas.ChatLogProbsFromResponses(partDone[0].Part.LogProbs))
 
 	completed := completedResponse(t, events)
 	require.NotEmpty(t, completed.Output)

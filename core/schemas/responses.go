@@ -536,7 +536,7 @@ type PromptCacheBreakpoint struct {
 const ResponsesIncludeOutputTextLogprobs = "message.output_text.logprobs"
 
 type ResponsesParameters struct {
-	Background          *bool                          `json:"background,omitempty"`
+	Background           *bool                          `json:"background,omitempty"`
 	Conversation         *ResponsesResponseConversation `json:"conversation,omitempty"`
 	Include              []string                       `json:"include,omitempty"` // Supported values: "web_search_call.action.sources", "code_interpreter_call.outputs", "computer_call_output.output.image_url", "file_search_call.results", "message.input_image.image_url", "message.output_text.logprobs", "reasoning.encrypted_content"
 	Instructions         *string                        `json:"instructions,omitempty"`
