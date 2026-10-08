@@ -383,7 +383,14 @@ func stampA2AErrorFields(bErr *schemas.BifrostError, reqType schemas.A2ARequestT
 // that follows it, and BifrostContext.Value only walks parent-ward, so the gate
 // always runs on a fresh child rather than on the inbound context itself. This
 // mirrors mcp.runListToolsWithHooks.
-func gateContext(ctx context.Context) *schemas.BifrostContext {
+//
+// The child watches its parent from a goroutine until either is cancelled, and
+// long-lived parents (the manager's lifetime context behind the push relay's
+// passes, or request contexts that are never cancelled) would keep that
+// goroutine and the context's values alive indefinitely. Callers must therefore
+// call the returned release once the operation, including its post-hooks and
+// trace completion, has finished.
+func gateContext(ctx context.Context) (*schemas.BifrostContext, func()) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -392,7 +399,7 @@ func gateContext(ctx context.Context) *schemas.BifrostContext {
 	// sites can attribute upstream socket time and derive Bifrost overhead,
 	// exactly as the LLM request path does at request entry.
 	gateCtx.ResetUpstreamLatency()
-	return gateCtx
+	return gateCtx, gateCtx.Cancel
 }
 
 // phaseSpan is the token returned by startPhaseSpan and consumed by endPhaseSpan.

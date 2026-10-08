@@ -64,6 +64,8 @@ New on this branch:
 | c64050487 | **Fork-only, upstream candidate.** Fallbacks follow the request the primary attempt's `PreLLMHook` returned (fallback list, fallback decision and base request), as on the previous runtime branch |
 | 4d0091cca | **Fork-only, upstream candidate.** The transport interceptor middleware, the request handler, the LLM hooks and the HTTP transport post-hook share one `BifrostContext` per request (`lib.EnsureSharedBifrostContext`), as `cbcdf67b8` did on the previous runtime branch |
 | 4daa16e37 | Request-scoped instances have context-bound reads (`NetworkConfig.ContextBoundReads`): the default request timeout no longer caps a unary response or a stream's header wait; the request context and the attempt's request timeout do (PLATFORM-4058) |
+| c1b997e08 | **Fork-only, upstream candidate.** Agent-gateway gate contexts are released when their operation ends (`gateContext` returns a release func). Upstream leaks one cancellation-watcher goroutine per push-relay poll (every 3 s whenever a config store exists), prune and delivery (PLATFORM-4061) |
+| 27ff63169 | `invalidRegistrationError` wraps its cause with `%w`, as upstream dev already does, so `TestRegistrationDiscoveryUsesBuildTimeout` passes; drop at the next refresh |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's

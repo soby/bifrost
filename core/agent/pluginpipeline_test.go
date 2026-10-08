@@ -139,7 +139,8 @@ func gateCtxForTest() *schemas.BifrostContext {
 // accumulator so the call sites can attribute upstream socket time and populate
 // upstream/overhead on the response, mirroring the LLM request path.
 func TestGateContextInstallsUpstreamLatencyAccumulator(t *testing.T) {
-	gateCtx := gateContext(context.Background())
+	gateCtx, releaseGate := gateContext(context.Background())
+	defer releaseGate()
 	_, ok := schemas.GetUpstreamLatency(gateCtx)
 	require.True(t, ok, "gateContext must install an upstream-latency accumulator")
 
