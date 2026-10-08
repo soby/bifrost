@@ -73,6 +73,7 @@ New on this branch:
 | ac586030d | Chat/Responses conversions carry logprobs (`logprobs: true` is `include: message.output_text.logprobs`; `choices[].logprobs` are the `output_text` logprobs, unary and streaming) and the chat fallback takes a Responses `extra_params.seed` as `seed`. A chat request a plugin converts to Responses is a 400 when it sets chat parameters Responses cannot carry (PLATFORM-4071) |
 | d83eb4ef8 | GenAI ingress: `generationConfig.responseLogprobs` becomes the Responses `include` instead of an extra param; `generationConfig.seed` rides `extra_params.seed` (Responses has no seed field), which the Gemini Responses conversion maps back to `generationConfig.seed` (PLATFORM-4071) |
 | 555aaa420 | gofmt and lint cleanup of the files the PLATFORM-4071 commits touch |
+| 72337b79d | Per-request stream frame tap: an `io.Writer` at `schemas.BifrostContextKeyStreamFrameTap` receives every byte the SSE stream writer releases (events, heartbeat comments, `[DONE]`), in order and one `Write` per release; absent or nil costs no allocation |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
@@ -154,6 +155,11 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
   are not access-logged (fork-only).
 - Access-log `trace_id` is the exported W3C trace ID (fork-only).
 - Chat streams follow `stream_options.include_usage` (fork-only).
+- `schemas.BifrostContextKeyStreamFrameTap` (`io.Writer`, fork-only): set it before the stream
+  starts (the inference and integration stream handlers read it when they create the stream
+  writer). It gets one `Write` per released frame, under the writer's send lock, so it must not
+  block or retain the slice. The transport post-hook runs before `data: [DONE]` is written, so a
+  post-hook sees every frame except `[DONE]` and any heartbeat written after it ran.
 
 ## Known non-preserved fields
 
