@@ -2,6 +2,8 @@ package schemas
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1260,6 +1262,11 @@ func (cr *BifrostChatRequest) ToResponsesRequest() *BifrostResponsesRequest {
 			Metadata:        cr.Params.Metadata,
 		}
 
+		// logprobs: true is the Responses include "message.output_text.logprobs".
+		if cr.Params.LogProbs != nil && *cr.Params.LogProbs {
+			brr.Params.Include = []string{ResponsesIncludeOutputTextLogprobs}
+		}
+
 		// Convert StreamOptions
 		if cr.Params.StreamOptions != nil {
 			brr.Params.StreamOptions = &ResponsesStreamOptions{
@@ -1361,6 +1368,20 @@ func (brr *BifrostResponsesRequest) ToChatRequest() *BifrostChatRequest {
 			// Map specific fields
 			MaxCompletionTokens: brr.Params.MaxOutputTokens, // max_output_tokens -> max_completion_tokens
 			Metadata:            brr.Params.Metadata,
+		}
+
+		// include "message.output_text.logprobs" is Chat's logprobs: true.
+		if slices.Contains(brr.Params.Include, ResponsesIncludeOutputTextLogprobs) {
+			bcr.Params.LogProbs = Ptr(true)
+		}
+		// The Responses API has no seed field, so a Responses request carries a seed in
+		// extra_params.seed (the GenAI ingress puts generationConfig.seed there). Chat has
+		// one: the seed moves to it, out of a copy of the extra params so the Responses
+		// request keeps its own for a retry or fallback attempt.
+		if seed, ok := SafeExtractIntPointer(brr.Params.ExtraParams["seed"]); ok {
+			bcr.Params.Seed = seed
+			bcr.Params.ExtraParams = maps.Clone(brr.Params.ExtraParams)
+			delete(bcr.Params.ExtraParams, "seed")
 		}
 
 		// Convert StreamOptions
@@ -1598,6 +1619,14 @@ func (cr *BifrostChatResponse) ToBifrostResponsesResponse() *BifrostResponsesRes
 		if choice.ChatNonStreamResponseChoice != nil && choice.ChatNonStreamResponseChoice.Message != nil {
 			// Convert ChatMessage to ResponsesMessages
 			responsesMessages := choice.ChatNonStreamResponseChoice.Message.ToResponsesMessages()
+			if choice.LogProbs != nil {
+				if block := firstOutputTextBlock(responsesMessages); block != nil {
+					block.LogProbs = ResponsesLogProbsFromChat(choice.LogProbs.Content)
+					if block.LogProbs == nil {
+						block.LogProbs = []ResponsesOutputMessageContentTextLogProb{}
+					}
+				}
+			}
 			outputMessages = append(outputMessages, responsesMessages...)
 		}
 	}
@@ -1685,6 +1714,21 @@ func (responsesResp *BifrostResponsesResponse) ToBifrostChatResponse() *BifrostC
 			choices = append(choices, choice)
 		}
 
+		// The output_text logprobs are the choice's token logprobs. Chat has one list
+		// per choice, so they go on the choice holding the assistant text.
+		if logProbs := outputTextLogProbs(responsesResp.Output); logProbs != nil {
+			target := 0
+			for i := range choices {
+				if choices[i].Message != nil && choices[i].Message.Content != nil {
+					target = i
+					break
+				}
+			}
+			if len(choices) > 0 {
+				choices[target].LogProbs = &BifrostLogProbs{Content: ChatLogProbsFromResponses(logProbs)}
+			}
+		}
+
 		chatResp.Choices = choices
 	}
 
@@ -1704,27 +1748,28 @@ func (responsesResp *BifrostResponsesResponse) ToBifrostChatResponse() *BifrostC
 
 // ChatToResponsesStreamState tracks state during Chat-to-Responses streaming conversion
 type ChatToResponsesStreamState struct {
-	ToolArgumentBuffers   map[string]string // Maps tool call ID to accumulated argument JSON
-	ItemIDs               map[string]string // Maps tool call ID to item ID
-	ToolCallNames         map[string]string // Maps tool call ID to tool name
-	ToolCallIndexToID     map[uint16]string // Maps tool call index to tool call ID (for lookups when ID is missing)
-	MessageID             *string           // Message ID from first chunk
-	Model                 *string           // Model name
-	CreatedAt             int               // Timestamp for created_at consistency
-	HasEmittedCreated     bool              // Whether we've emitted response.created
-	HasEmittedInProgress  bool              // Whether we've emitted response.in_progress
-	TextItemAdded         bool              // Whether text item has been added
-	TextItemClosed        bool              // Whether text item has been closed
-	TextItemHasContent    bool              // Whether text item has received any content deltas
-	TextBuffer            strings.Builder   // Accumulated text deltas for output_text.done/content_part.done
-	TextOutputIndex       int               // Output index assigned to the text/message item
-	ReasoningItemAdded    bool              // Whether the reasoning item has been opened
-	ReasoningItemClosed   bool              // Whether the reasoning item has been closed
-	ReasoningOutputIndex  int               // Output index assigned to the reasoning item
-	ReasoningBuffer       strings.Builder   // Accumulated reasoning deltas for reasoning output_item.done
-	CurrentOutputIndex    int               // Current output index counter
-	ToolCallOutputIndices map[string]int    // Maps tool call ID to output index
-	SequenceNumber        int               // Monotonic sequence number across all chunks
+	ToolArgumentBuffers   map[string]string                          // Maps tool call ID to accumulated argument JSON
+	ItemIDs               map[string]string                          // Maps tool call ID to item ID
+	ToolCallNames         map[string]string                          // Maps tool call ID to tool name
+	ToolCallIndexToID     map[uint16]string                          // Maps tool call index to tool call ID (for lookups when ID is missing)
+	MessageID             *string                                    // Message ID from first chunk
+	Model                 *string                                    // Model name
+	CreatedAt             int                                        // Timestamp for created_at consistency
+	HasEmittedCreated     bool                                       // Whether we've emitted response.created
+	HasEmittedInProgress  bool                                       // Whether we've emitted response.in_progress
+	TextItemAdded         bool                                       // Whether text item has been added
+	TextItemClosed        bool                                       // Whether text item has been closed
+	TextItemHasContent    bool                                       // Whether text item has received any content deltas
+	TextBuffer            strings.Builder                            // Accumulated text deltas for output_text.done/content_part.done
+	TextLogProbs          []ResponsesOutputMessageContentTextLogProb // Accumulated token logprobs of the text item for its done events
+	TextOutputIndex       int                                        // Output index assigned to the text/message item
+	ReasoningItemAdded    bool                                       // Whether the reasoning item has been opened
+	ReasoningItemClosed   bool                                       // Whether the reasoning item has been closed
+	ReasoningOutputIndex  int                                        // Output index assigned to the reasoning item
+	ReasoningBuffer       strings.Builder                            // Accumulated reasoning deltas for reasoning output_item.done
+	CurrentOutputIndex    int                                        // Current output index counter
+	ToolCallOutputIndices map[string]int                             // Maps tool call ID to output index
+	SequenceNumber        int                                        // Monotonic sequence number across all chunks
 }
 
 // chatToResponsesStreamStatePool provides a pool for ChatToResponsesStreamState objects.
@@ -1790,6 +1835,7 @@ func AcquireChatToResponsesStreamState() *ChatToResponsesStreamState {
 	state.TextItemClosed = false
 	state.TextItemHasContent = false
 	state.TextBuffer = strings.Builder{}
+	state.TextLogProbs = nil
 	state.TextOutputIndex = 0
 	state.ReasoningItemAdded = false
 	state.ReasoningItemClosed = false
@@ -1829,6 +1875,7 @@ func ReleaseChatToResponsesStreamState(state *ChatToResponsesStreamState) {
 		state.TextItemClosed = false
 		state.TextItemHasContent = false
 		state.TextBuffer = strings.Builder{}
+		state.TextLogProbs = nil
 		state.TextOutputIndex = 0
 		state.ReasoningItemAdded = false
 		state.ReasoningItemClosed = false
@@ -2079,6 +2126,12 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 			LogProbs:       []ResponsesOutputMessageContentTextLogProb{},
 			ExtraFields:    cr.ExtraFields,
 		}
+		if choice.LogProbs != nil {
+			if logProbs := ResponsesLogProbsFromChat(choice.LogProbs.Content); len(logProbs) > 0 {
+				response.LogProbs = logProbs
+				state.TextLogProbs = append(state.TextLogProbs, logProbs...)
+			}
+		}
 		if itemID != "" {
 			response.ItemID = &itemID
 		}
@@ -2125,7 +2178,7 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 						ContentIndex:   Ptr(0),
 						ItemID:         &itemID,
 						Text:           &finalText,
-						LogProbs:       []ResponsesOutputMessageContentTextLogProb{},
+						LogProbs:       state.textItemLogProbs(),
 						ExtraFields:    cr.ExtraFields,
 					})
 					state.SequenceNumber++
@@ -2135,7 +2188,7 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 						Type: ResponsesOutputMessageContentTypeText,
 						Text: &finalText,
 						ResponsesOutputMessageContentText: &ResponsesOutputMessageContentText{
-							LogProbs:    []ResponsesOutputMessageContentTextLogProb{},
+							LogProbs:    state.textItemLogProbs(),
 							Annotations: []ResponsesOutputMessageContentTextAnnotation{},
 						},
 					}
@@ -2165,7 +2218,7 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 									Type: textType,
 									Text: &finalText,
 									ResponsesOutputMessageContentText: &ResponsesOutputMessageContentText{
-										LogProbs:    []ResponsesOutputMessageContentTextLogProb{},
+										LogProbs:    state.textItemLogProbs(),
 										Annotations: []ResponsesOutputMessageContentTextAnnotation{},
 									},
 								},
@@ -2287,7 +2340,7 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 				ContentIndex:   Ptr(0),
 				ItemID:         &itemID,
 				Text:           &finalText,
-				LogProbs:       []ResponsesOutputMessageContentTextLogProb{},
+				LogProbs:       state.textItemLogProbs(),
 				ExtraFields:    cr.ExtraFields,
 			})
 			state.SequenceNumber++
@@ -2297,7 +2350,7 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 				Type: ResponsesOutputMessageContentTypeText,
 				Text: &finalText,
 				ResponsesOutputMessageContentText: &ResponsesOutputMessageContentText{
-					LogProbs:    []ResponsesOutputMessageContentTextLogProb{},
+					LogProbs:    state.textItemLogProbs(),
 					Annotations: []ResponsesOutputMessageContentTextAnnotation{},
 				},
 			}
@@ -2327,7 +2380,7 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 							Type: textType,
 							Text: &finalText,
 							ResponsesOutputMessageContentText: &ResponsesOutputMessageContentText{
-								LogProbs:    []ResponsesOutputMessageContentTextLogProb{},
+								LogProbs:    state.textItemLogProbs(),
 								Annotations: []ResponsesOutputMessageContentTextAnnotation{},
 							},
 						},
@@ -2465,7 +2518,7 @@ func (cr *BifrostChatResponse) ToBifrostResponsesStreamResponse(state *ChatToRes
 							Type: textType,
 							Text: &finalText,
 							ResponsesOutputMessageContentText: &ResponsesOutputMessageContentText{
-								LogProbs:    []ResponsesOutputMessageContentTextLogProb{},
+								LogProbs:    state.textItemLogProbs(),
 								Annotations: []ResponsesOutputMessageContentTextAnnotation{},
 							},
 						},
@@ -2580,6 +2633,9 @@ func (rsr *BifrostResponsesStreamResponse) ToBifrostChatResponse() *BifrostChatR
 					},
 				},
 			},
+		}
+		if len(rsr.LogProbs) > 0 {
+			resp.Choices[0].LogProbs = &BifrostLogProbs{Content: ChatLogProbsFromResponses(rsr.LogProbs)}
 		}
 		return resp
 
@@ -2960,4 +3016,46 @@ func ChatLogProbsFromResponses(logProbs []ResponsesOutputMessageContentTextLogPr
 		}
 	}
 	return out
+}
+
+// firstOutputTextBlock returns the first output_text part among messages, or nil.
+func firstOutputTextBlock(messages []ResponsesMessage) *ResponsesOutputMessageContentText {
+	for i := range messages {
+		if messages[i].Content == nil {
+			continue
+		}
+		for j := range messages[i].Content.ContentBlocks {
+			block := &messages[i].Content.ContentBlocks[j]
+			if block.Type == ResponsesOutputMessageContentTypeText && block.ResponsesOutputMessageContentText != nil {
+				return block.ResponsesOutputMessageContentText
+			}
+		}
+	}
+	return nil
+}
+
+// outputTextLogProbs returns the token logprobs of every output_text part in output,
+// in order, or nil when none carries any.
+func outputTextLogProbs(output []ResponsesMessage) []ResponsesOutputMessageContentTextLogProb {
+	var logProbs []ResponsesOutputMessageContentTextLogProb
+	for i := range output {
+		if output[i].Content == nil {
+			continue
+		}
+		for _, block := range output[i].Content.ContentBlocks {
+			if block.Type == ResponsesOutputMessageContentTypeText && block.ResponsesOutputMessageContentText != nil {
+				logProbs = append(logProbs, block.LogProbs...)
+			}
+		}
+	}
+	return logProbs
+}
+
+// textItemLogProbs returns the text item's accumulated token logprobs, or an empty
+// list (the output_text logprobs field is always present) when it has none.
+func (state *ChatToResponsesStreamState) textItemLogProbs() []ResponsesOutputMessageContentTextLogProb {
+	if state.TextLogProbs == nil {
+		return []ResponsesOutputMessageContentTextLogProb{}
+	}
+	return state.TextLogProbs
 }
