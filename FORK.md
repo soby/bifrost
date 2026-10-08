@@ -74,6 +74,7 @@ New on this branch:
 | d83eb4ef8 | GenAI ingress: `generationConfig.responseLogprobs` becomes the Responses `include` instead of an extra param; `generationConfig.seed` rides `extra_params.seed` (Responses has no seed field), which the Gemini Responses conversion maps back to `generationConfig.seed` (PLATFORM-4071) |
 | 555aaa420 | gofmt and lint cleanup of the files the PLATFORM-4071 commits touch |
 | db03fc273 | Bedrock's AWS-signed net/http calls honor the per-attempt deadline (`DoAttemptHTTPRequest` for unary calls, body included; `DoAttemptStreamingHTTPRequest` for a stream's header wait), and with context-bound reads that client has no total or response-header timeout (PLATFORM-4085) |
+| ed57e34cc | Test-only: the Mantle gpt-oss replay test expects the assistant item as an `EasyInputMessage` without `status` (the shape the converter has sent since upstream f0696d879); the stale assertion also fails on upstream dev. Drop at a refresh once upstream fixes the test |
 | 72337b79d | Per-request stream frame tap: an `io.Writer` at `schemas.BifrostContextKeyStreamFrameTap` receives every byte the SSE stream writer releases (events, heartbeat comments, `[DONE]`), in order and one `Write` per release; absent or nil costs no allocation |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
