@@ -66,6 +66,7 @@ New on this branch:
 | 4daa16e37 | Request-scoped instances have context-bound reads (`NetworkConfig.ContextBoundReads`): the default request timeout no longer caps a unary response or a stream's header wait; the request context and the attempt's request timeout do (PLATFORM-4058) |
 | c1b997e08 | **Fork-only, upstream candidate.** Agent-gateway gate contexts are released when their operation ends (`gateContext` returns a release func). Upstream leaks one cancellation-watcher goroutine per push-relay poll (every 3 s whenever a config store exists), prune and delivery (PLATFORM-4061) |
 | 27ff63169 | `invalidRegistrationError` wraps its cause with `%w`, as upstream dev already does, so `TestRegistrationDiscoveryUsesBuildTimeout` passes; drop at the next refresh |
+| 01a84d27d | Gemini and Vertex Gemini chat: `seed` maps to `generationConfig.seed` (a seed outside int32 is a 400, never truncated); `top_logprobs` is sent as given instead of being lowered to 20 (PLATFORM-4060) |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
