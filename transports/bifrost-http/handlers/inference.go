@@ -2231,9 +2231,16 @@ func (h *CompletionHandler) handleStreamingTranscriptionRequest(ctx *fasthttp.Re
 // in lib.ConvertToBifrostContext. Bifrost handles cleanup internally for normal completion and
 // errors, so we only cancel upstream streams when the client has disconnected.
 func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, requestType schemas.RequestType, includeChatUsage bool, getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError), cancel context.CancelFunc) {
-	// Get the streaming channel — called BEFORE setting SSE headers so that
-	// provider errors return proper HTTP status codes + JSON content type.
-	stream, bifrostErr := getStream()
+	// Get the streaming channel — awaited BEFORE setting SSE headers so that
+	// provider errors return proper HTTP status codes + JSON content type. The
+	// only exception is a plugin's deliberate pre-admission wait that outlasts its
+	// commit delay (lib.StreamSetup, fork-only): the stream is then committed
+	// before setup ends and a setup error becomes an in-stream error event.
+	setup := lib.StartStreamSetup(bifrostCtx, true, getStream)
+	stream, bifrostErr, committedEarly := setup.Await()
+	if !committedEarly {
+		setup = nil
+	}
 	if bifrostErr != nil {
 		cancel()
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
@@ -2241,19 +2248,23 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 		return
 	}
 
-	// SSE headers set only after successful stream setup
+	// SSE headers set only after successful stream setup, or at an early commit
 	ctx.SetContentType("text/event-stream")
 	ctx.Response.Header.Set("Cache-Control", "no-cache")
 	ctx.Response.Header.Set("Connection", "keep-alive")
 
-	// Forward provider response headers stored in context by streaming handlers
-	if headers, ok := bifrostCtx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string); ok {
-		forwardProviderHeaders(ctx, headers)
-	}
+	// Provider and routed-identity headers exist only once setup has finished, so
+	// an early-committed stream omits them.
+	if !committedEarly {
+		// Forward provider response headers stored in context by streaming handlers
+		if headers, ok := bifrostCtx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string); ok {
+			forwardProviderHeaders(ctx, headers)
+		}
 
-	// Routed-identity headers from the context snapshot — routing is final once
-	// the stream channel is returned, before any chunk arrives.
-	lib.ApplyBifrostStreamResponseHeaders(ctx, bifrostCtx, requestType)
+		// Routed-identity headers from the context snapshot — routing is final once
+		// the stream channel is returned, before any chunk arrives.
+		lib.ApplyBifrostStreamResponseHeaders(ctx, bifrostCtx, requestType)
+	}
 
 	// Signal to tracing middleware that trace completion should be deferred
 	// The streaming callback will complete the trace after the stream ends
@@ -2348,13 +2359,18 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 		// write-failure detector too few chances to fire before the stream finished).
 		// A periodic no-op heartbeat forces an extra write attempt during otherwise-idle
 		// gaps, closing that window without touching fasthttp's connection internals.
-		heartbeatDone, heartbeatExited := lib.StartSSEHeartbeat(lib.DefaultSSEHeartbeatInterval, reader.SendHeartbeat, cancel)
+		// It starts once the stream exists; while an early-committed stream still waits
+		// for setup, the waiting comments below probe the connection instead.
+		var heartbeatDone chan struct{}
+		var heartbeatExited <-chan struct{}
 
 		defer func() {
 			// Must run before reader.Done(): closing eventCh while the heartbeat goroutine
 			// could still be mid-send on it panics ("send on closed channel"). See
 			// lib.StopSSEHeartbeat's doc for the full ordering rationale.
-			lib.StopSSEHeartbeat(reader, heartbeatDone, heartbeatExited)
+			if heartbeatDone != nil {
+				lib.StopSSEHeartbeat(reader, heartbeatDone, heartbeatExited)
+			}
 			schemas.ReleaseHTTPRequest(httpReq)
 			// Stamp the outbound relay costs onto the root span before the trace completes
 			// below (traceCompleter), so they reach the overhead breakdown. Runs on every
@@ -2374,6 +2390,14 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 				traceCompleter(transportLogs)
 			}
 		}()
+
+		if setup != nil {
+			// Early commit: send waiting comments until setup ends. A setup error comes
+			// back as a one-chunk error stream, written below as this route's ordinary
+			// error event (and suppressing [DONE]).
+			stream = setup.AwaitCommitted(reader.SendWaitingComment, cancel, requestType)
+		}
+		heartbeatDone, heartbeatExited = lib.StartSSEHeartbeat(lib.DefaultSSEHeartbeatInterval, reader.SendHeartbeat, cancel)
 
 		var includeEventType bool
 		var skipDoneMarker bool
