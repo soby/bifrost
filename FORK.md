@@ -77,6 +77,7 @@ New on this branch:
 | ed57e34cc | Test-only: the Mantle gpt-oss replay test expects the assistant item as an `EasyInputMessage` without `status` (the shape the converter has sent since upstream f0696d879); the stale assertion also fails on upstream dev. Drop at a refresh once upstream fixes the test |
 | cda108bba | Test-only: the OpenAI realtime WebRTC upstream-error test expects the upstream 429 and its retry hint, which the code has returned since upstream 575964b5f; the stale 502 expectation also fails on upstream dev. Drop at a refresh once upstream fixes the test |
 | 72337b79d | Per-request stream frame tap: an `io.Writer` at `schemas.BifrostContextKeyStreamFrameTap` receives every byte the SSE stream writer releases (events, heartbeat comments, `[DONE]`), in order and one `Write` per release; absent or nil costs no allocation |
+| #19 | Early SSE commit while a plugin holds a streaming request before admission (`schemas.StreamAdmissionWait`, `lib.StreamSetup`): `: waiting` comments on the committed stream, setup errors as the route's stream error event; see "Transport" below |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
@@ -165,6 +166,23 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
   writer). It gets one `Write` per released frame, under the writer's send lock, so it must not
   block or retain the slice. The transport post-hook runs before `data: [DONE]` is written, so a
   post-hook sees every frame except `[DONE]` and any heartbeat written after it ran.
+- `schemas.BifrostContextKeyStreamAdmissionWait` (`*schemas.StreamAdmissionWait`, fork-only):
+  the inference and integration stream handlers offer it on routes whose clients accept SSE
+  comment lines (not Bedrock's EventStream, not a route declaring `lib.SSEHeartbeatNone` such
+  as GenAI); it is absent on other routes and on non-streaming requests. A plugin that holds a
+  streaming request before admission (in `PreLLMHook`) calls `Begin` with `CommitAfter` and
+  `CommentInterval`. Stream setup then runs beside the handler (`lib.StreamSetup`). Setup that
+  ends within `CommitAfter` of the signal is answered exactly as before, setup errors keeping
+  their HTTP status. Otherwise the handler commits a 200 `text/event-stream` (without provider
+  or routed-identity headers, which do not exist yet), returns, and the producer writes
+  `: waiting` comment lines every `CommentInterval` until setup ends; a setup error then
+  becomes the route's ordinary stream error event (sanitized as on the HTTP path, no
+  `[DONE]`). A client that leaves during the wait cancels the request context, which ends the
+  plugin's wait. The handler never touches the `RequestCtx` after returning, and tracing and
+  the transport post-hook complete once, from the producer, as for any stream. A setup panic
+  before commitment is re-raised on the handler goroutine for `RecoveryMiddleware`; after
+  commitment it is logged and ends the stream with an error event. A committed stream cannot
+  switch to large-response passthrough: it cancels the request, closes the passthrough reader that owns the upstream response exactly once, and ends with an error event instead.
 
 ## Known non-preserved fields
 
