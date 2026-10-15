@@ -62,8 +62,8 @@ import (
 // This interface enables proper dependency injection for streaming handlers.
 type StreamChunkInterceptor interface {
 	// InterceptChunk processes a chunk before it's written to the client.
-	// Returns the (potentially modified) chunk, or nil to skip the chunk entirely.
-	InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error)
+	// Returns the chunks to write in its place, in order; none skips it entirely.
+	InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error)
 }
 
 // HandlerStore provides access to runtime configuration values for handlers.
@@ -6675,30 +6675,63 @@ type pluginChunkInterceptor struct {
 	plugins []schemas.HTTPTransportPlugin
 }
 
-// InterceptChunk processes a chunk through all plugin HTTPTransportStreamChunkHook methods.
+// InterceptChunk processes a chunk through all plugin stream chunk hooks.
 // Plugins are called in reverse order (same as PostHook) so modifications chain correctly.
-func (i *pluginChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {
+// A plugin implementing schemas.HTTPTransportStreamChunksPlugin may return several
+// chunks; each continues through the remaining plugins in order.
+func (i *pluginChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
+	chunks := []*schemas.BifrostStreamChunk{stream}
 	for j := len(i.plugins) - 1; j >= 0; j-- {
 		plugin := i.plugins[j]
 		pluginName := plugin.GetName()
-		var (
-			modified *schemas.BifrostStreamChunk
-			err      error
-		)
-		func() {
-			pluginCtx := ctx.WithPluginScope(&pluginName)
-			defer pluginCtx.ReleasePluginScope()
-			modified, err = plugin.HTTPTransportStreamChunkHook(pluginCtx, req, stream)
-		}()
-		if err != nil {
-			return modified, fmt.Errorf("failed to intercept chunk with plugin %s: %w", pluginName, err)
+		next := make([]*schemas.BifrostStreamChunk, 0, len(chunks))
+		for index, chunk := range chunks {
+			var (
+				outputs []*schemas.BifrostStreamChunk
+				err     error
+			)
+			func() {
+				pluginCtx := ctx.WithPluginScope(&pluginName)
+				defer pluginCtx.ReleasePluginScope()
+				outputs, err = interceptPluginChunk(plugin, pluginCtx, req, chunk)
+			}()
+			if err != nil {
+				wrapped := fmt.Errorf("failed to intercept chunk with plugin %s: %w", pluginName, err)
+				if len(outputs) == 0 {
+					return nil, wrapped // Stop the stream
+				}
+				// A warning keeps the chunks, as the single-chunk contract keeps the
+				// modified chunk, and skips the remaining plugins.
+				next = append(next, outputs...)
+				return append(next, chunks[index+1:]...), wrapped
+			}
+			next = append(next, outputs...)
 		}
-		if modified == nil {
-			return nil, nil // Plugin wants to skip this chunk
+		if len(next) == 0 {
+			return nil, nil // Plugins want to skip this chunk
 		}
-		stream = modified
+		chunks = next
 	}
-	return stream, nil
+	return chunks, nil
+}
+
+// interceptPluginChunk runs one plugin's stream chunk hook and drops nil outputs.
+func interceptPluginChunk(plugin schemas.HTTPTransportPlugin, ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
+	if expanding, ok := plugin.(schemas.HTTPTransportStreamChunksPlugin); ok {
+		outputs, err := expanding.HTTPTransportStreamChunksHook(ctx, req, chunk)
+		kept := outputs[:0:0]
+		for _, output := range outputs {
+			if output != nil {
+				kept = append(kept, output)
+			}
+		}
+		return kept, err
+	}
+	modified, err := plugin.HTTPTransportStreamChunkHook(ctx, req, chunk)
+	if modified == nil {
+		return nil, err
+	}
+	return []*schemas.BifrostStreamChunk{modified}, err
 }
 
 // GetStreamChunkInterceptor returns the chunk interceptor for streaming responses.

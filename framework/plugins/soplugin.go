@@ -30,6 +30,7 @@ type DynamicPlugin struct {
 	httpTransportPreHook             func(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error)
 	httpTransportPostHook            func(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponse) error
 	httpTransportStreamChunkHook     func(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error)
+	httpTransportStreamChunksHook    func(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error)
 	httpTransportResponseHeadersHook func(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error
 
 	// LLMPlugin (optional)
@@ -110,6 +111,19 @@ func (dp *DynamicPlugin) HTTPTransportStreamChunkHook(ctx *schemas.BifrostContex
 		return stream, nil // No-op if not implemented
 	}
 	return dp.httpTransportStreamChunkHook(ctx, req, stream)
+}
+
+// HTTPTransportStreamChunksHook expands one streaming chunk into zero or more chunks.
+// A plugin without the symbol keeps its single-chunk hook's behavior.
+func (dp *DynamicPlugin) HTTPTransportStreamChunksHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
+	if dp.httpTransportStreamChunksHook != nil {
+		return dp.httpTransportStreamChunksHook(ctx, req, stream)
+	}
+	modified, err := dp.HTTPTransportStreamChunkHook(ctx, req, stream)
+	if modified == nil {
+		return nil, err
+	}
+	return []*schemas.BifrostStreamChunk{modified}, err
 }
 
 // HTTPTransportResponseHeadersHook intercepts response headers immediately before

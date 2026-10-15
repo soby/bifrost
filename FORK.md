@@ -78,6 +78,7 @@ New on this branch:
 | cda108bba | Test-only: the OpenAI realtime WebRTC upstream-error test expects the upstream 429 and its retry hint, which the code has returned since upstream 575964b5f; the stale 502 expectation also fails on upstream dev. Drop at a refresh once upstream fixes the test |
 | 72337b79d | Per-request stream frame tap: an `io.Writer` at `schemas.BifrostContextKeyStreamFrameTap` receives every byte the SSE stream writer releases (events, heartbeat comments, `[DONE]`), in order and one `Write` per release; absent or nil costs no allocation |
 | #19 | Early SSE commit while a plugin holds a streaming request before admission (`schemas.StreamAdmissionWait`, `lib.StreamSetup`): `: waiting` comments on the committed stream, setup errors as the route's stream error event; see "Transport" below |
+| #20 | Optional `schemas.HTTPTransportStreamChunksPlugin`: an HTTP transport plugin can turn one streamed chunk into zero or more chunks, each continuing through the remaining plugins and written in order; see "Transport" below |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
@@ -161,6 +162,13 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
   are not access-logged (fork-only).
 - Access-log `trace_id` is the exported W3C trace ID (fork-only).
 - Chat streams follow `stream_options.include_usage` (fork-only).
+- `schemas.HTTPTransportStreamChunksPlugin` (fork-only): a plugin that implements
+  `HTTPTransportStreamChunksHook` is called instead of `HTTPTransportStreamChunkHook` and
+  returns the chunks to write in place of the input, in order; an empty result skips it. A
+  plugin can hold chunks back and release them later, or follow a replacement with further
+  chunks. Each output passes through the remaining plugins; error semantics match the
+  single-chunk hook. Shared-object plugins export `HTTPTransportStreamChunksHook` as an
+  optional symbol.
 - `schemas.BifrostContextKeyStreamFrameTap` (`io.Writer`, fork-only): set it before the stream
   starts (the inference and integration stream handlers read it when they create the stream
   writer). It gets one `Write` per released frame, under the writer's send lock, so it must not

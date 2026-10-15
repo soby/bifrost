@@ -390,6 +390,22 @@ type HTTPTransportPlugin interface {
 	HTTPTransportStreamChunkHook(ctx *BifrostContext, req *HTTPRequest, chunk *BifrostStreamChunk) (*BifrostStreamChunk, error)
 }
 
+// HTTPTransportStreamChunksPlugin is an optional extension of HTTPTransportPlugin for
+// plugins that turn one streamed chunk into zero or more chunks, for example to hold
+// chunks back and later release them, or to follow a replacement chunk with the events
+// that restate it. When a plugin implements it, the transport calls it instead of
+// HTTPTransportStreamChunkHook.
+//
+// Return values:
+// - (chunks, nil): Continue with chunks, in order; an empty result skips the input chunk
+// - (chunks, error): Log warning and continue with chunks
+// - (empty, error): Send back error to the client and stop the streaming
+//
+// Each returned chunk passes through the remaining plugins as the input chunk would have.
+type HTTPTransportStreamChunksPlugin interface {
+	HTTPTransportStreamChunksHook(ctx *BifrostContext, req *HTTPRequest, chunk *BifrostStreamChunk) ([]*BifrostStreamChunk, error)
+}
+
 // StreamInterceptionError carries a structured client error when an HTTP stream plugin terminates a stream.
 type StreamInterceptionError struct {
 	BifrostError *BifrostError
