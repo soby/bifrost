@@ -57,6 +57,7 @@ import (
 	"mime/multipart"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
@@ -2927,10 +2928,20 @@ func (g *GenericRouter) handleCommittedStreaming(ctx *fasthttp.RequestCtx, bifro
 	// The streaming callback will complete the trace after the stream ends
 	ctx.SetUserValue(schemas.BifrostContextKeyDeferTraceCompletion, true)
 
+	// Pre-allocate atomic.Value slot for the transport post-hook completer when
+	// TransportInterceptorMiddleware marked that post-hooks will run.
+	// TransportInterceptorMiddleware stores the completer into this slot after next(ctx)
+	// returns. The goroutine reads from the closure-captured pointer, avoiding any ctx
+	// access after the handler returns (fasthttp recycles RequestCtx).
+	var completerSlot *atomic.Value
+	if transportPostHookCompleterExpected(ctx) {
+		completerSlot = &atomic.Value{}
+		ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, completerSlot)
+	}
+
 	// Get the trace completer function for use in the streaming callback.
 	// Signature is func([]schemas.PluginLogEntry) so the callback never reads from
 	// ctx.UserValue (ctx may be recycled by fasthttp by the time this fires).
-	// Router path has no transport post-hook phase, so we always pass nil.
 	traceCompleter, _ := ctx.UserValue(schemas.BifrostContextKeyTraceCompleter).(func([]schemas.PluginLogEntry))
 
 	// Get stream chunk interceptor for plugin hooks
@@ -3008,6 +3019,7 @@ func (g *GenericRouter) handleCommittedStreaming(ctx *fasthttp.RequestCtx, bifro
 			}
 			schemas.ReleaseHTTPRequest(httpReq)
 			reader.Done()
+			transportLogs := g.runTransportPostHookCompleter(completerSlot)
 			// Split the provider-side backpressure into (A) client-write vs (B) transport
 			// CPU using what the send loop just measured. Before traceCompleter so the
 			// attributes are on the root span when the trace exports.
@@ -3015,7 +3027,7 @@ func (g *GenericRouter) handleCommittedStreaming(ctx *fasthttp.RequestCtx, bifro
 			// Complete the trace after streaming finishes
 			// This ensures all spans (including llm.call) are properly ended before the trace is sent to OTEL
 			if traceCompleter != nil {
-				traceCompleter(nil)
+				traceCompleter(transportLogs)
 			}
 		}()
 
@@ -3449,6 +3461,37 @@ func sendBedrockEventStreamException(reader *lib.SSEStreamReader, encoder *event
 	return true
 }
 
+func transportPostHookCompleterExpected(ctx *fasthttp.RequestCtx) bool {
+	expected, _ := ctx.UserValue(schemas.BifrostContextKeyTransportPostHookCompleter).(bool)
+	return expected
+}
+
+func (g *GenericRouter) runTransportPostHookCompleter(slot *atomic.Value) []schemas.PluginLogEntry {
+	if slot == nil {
+		return nil
+	}
+	var loaded any
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		if loaded = slot.Load(); loaded != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+	postHookCompleter, ok := loaded.(func() ([]schemas.PluginLogEntry, error))
+	if !ok {
+		return nil
+	}
+	logs, err := postHookCompleter()
+	if err != nil {
+		g.logger.Warn("transport post-hook failed after stream terminated: %v", err)
+	}
+	return logs
+}
+
 // extractPassthroughModel extracts the model from the passthrough request path and/or body.
 // Path patterns: models/{model}, models/{model}:suffix (GenAI), .../models/{model} (Vertex), tunedModels/{model}.
 // Body is pre-parsed by parsePassthroughBody to avoid redundant unmarshaling.
@@ -3812,6 +3855,13 @@ func (g *GenericRouter) handlePassthroughStream(
 
 	// Skip post-hook body materialization — ctx.Response.Body() would buffer the entire stream.
 	ctx.SetUserValue(schemas.BifrostContextKeyDeferTraceCompletion, true)
+	// Pre-allocate atomic.Value slot for the transport post-hook completer when
+	// TransportInterceptorMiddleware marked that post-hooks will run.
+	var completerSlot *atomic.Value
+	if transportPostHookCompleterExpected(ctx) {
+		completerSlot = &atomic.Value{}
+		ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, completerSlot)
+	}
 
 	ctx.SetStatusCode(passthroughResp.StatusCode)
 	// Preserve the upstream Content-Type. Passthrough streams aren't always SSE — e.g.
@@ -3874,10 +3924,11 @@ func (g *GenericRouter) handlePassthroughStream(
 				// goroutine could still be mid-send on it panics ("send on closed channel").
 				lib.StopSSEHeartbeat(reader, heartbeatDone, heartbeatExited)
 			}
-			if traceCompleter != nil {
-				traceCompleter(nil)
-			}
 			reader.Done()
+			transportLogs := g.runTransportPostHookCompleter(completerSlot)
+			if traceCompleter != nil {
+				traceCompleter(transportLogs)
+			}
 			cancel()
 		}()
 

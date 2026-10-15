@@ -20,6 +20,7 @@ Current runtime branch: `runtime/request-scoped`.
 | #7227 | Accept a scalar `stop` on chat completions | Open (third party) | Carried |
 | #5277 | Preserve `reasoning_details` on OpenAI-compatible chat requests | Open (third party) | Carried, adapted: forwarded only to destinations without a curated OpenAI dialect (OpenRouter, custom providers); curated dialects keep it off the wire; Anthropic conversion drops unsigned text-only details |
 | #6452 | Request-scoped routing and provider deadlines | Open (ours) | Its deadline and OpenRouter routing parts are carried as the fork commits below |
+| #4275 | Run transport post-hooks after integration-route streams (`/anthropic`, `/genai`, `/openai`, …), as the root inference handler does | Open (third party) | Carried, its four commits applied to this branch's handlers |
 
 ## Fork-only commits
 

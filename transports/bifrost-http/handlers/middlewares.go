@@ -641,6 +641,9 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 				next(ctx)
 				return
 			}
+			// Mark that streaming handlers should allocate a post-hook completer slot.
+			// The handler replaces this marker with *atomic.Value before returning.
+			ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, true)
 			// Fork-only: the pre-hook, the request handler (lib.ConvertToBifrostContext
 			// reuses the stored context), the LLM hooks and the post-hook share one
 			// context, so a value written during the request reaches the post-hook.

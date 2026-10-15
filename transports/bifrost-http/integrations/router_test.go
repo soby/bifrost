@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -171,6 +172,56 @@ func TestAnthropicExtraParamsReachBedrock(t *testing.T) {
 				assert.NotContains(t, wire, "extra_params")
 			})
 		}
+	}
+}
+
+func TestHandleStreamingRetainsTransportPluginLogs(t *testing.T) {
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.SetRequestURI("/anthropic/v1/messages")
+	ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+
+	wantLogs := []schemas.PluginLogEntry{{
+		PluginName: "test-transport",
+		Level:      schemas.LogLevelInfo,
+		Message:    `{"action":"rewrite"}`,
+		Timestamp:  1781147283369,
+	}}
+	done := make(chan []schemas.PluginLogEntry, 1)
+	ctx.SetUserValue(schemas.BifrostContextKeyTraceCompleter, func(logs []schemas.PluginLogEntry) {
+		done <- logs
+	})
+	ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, true)
+
+	stream := make(chan *schemas.BifrostStreamChunk)
+
+	router := NewGenericRouter(nil, &mockHandlerStore{}, nil, nil, nil, &testLogger{})
+	router.handleStreaming(
+		ctx,
+		schemas.NewBifrostContext(context.Background(), schemas.NoDeadline),
+		RouteConfig{
+			Type:         RouteConfigTypeAnthropic,
+			Path:         "/anthropic/v1/messages",
+			StreamConfig: &StreamConfig{},
+		},
+		stream,
+		func() {},
+	)
+
+	slot, ok := ctx.UserValue(schemas.BifrostContextKeyTransportPostHookCompleter).(interface {
+		Store(any)
+	})
+	require.True(t, ok)
+	slot.Store(func() ([]schemas.PluginLogEntry, error) {
+		return wantLogs, nil
+	})
+	close(stream)
+
+	select {
+	case gotLogs := <-done:
+		require.Len(t, gotLogs, 1)
+		assert.Equal(t, wantLogs[0], gotLogs[0])
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for trace completer")
 	}
 }
 
@@ -1494,5 +1545,104 @@ func TestPassthroughManagementRoutesNeverForward(t *testing.T) {
 			r.Handler(&ctx)
 			require.Equal(t, fasthttp.StatusForbidden, ctx.Response.StatusCode(), "%s %s: %s", prefix, method, ctx.Response.Body())
 		}
+	}
+}
+
+// streamPostHookTestEvents is a minimal native Responses stream: two text
+// deltas and the completed event.
+func streamPostHookTestEvents() []*schemas.BifrostStreamChunk {
+	completed := schemas.ResponsesStreamResponseTypeCompleted
+	delta := schemas.ResponsesStreamResponseTypeOutputTextDelta
+	return []*schemas.BifrostStreamChunk{
+		{BifrostResponsesStreamResponse: &schemas.BifrostResponsesStreamResponse{Type: delta, SequenceNumber: 0, Delta: schemas.Ptr("first ")}},
+		{BifrostResponsesStreamResponse: &schemas.BifrostResponsesStreamResponse{Type: delta, SequenceNumber: 1, Delta: schemas.Ptr("second")}},
+		{BifrostResponsesStreamResponse: &schemas.BifrostResponsesStreamResponse{Type: completed, SequenceNumber: 2, Response: &schemas.BifrostResponsesResponse{
+			ID: schemas.Ptr("resp_1"), Model: "m", Status: schemas.Ptr("completed"),
+		}}},
+	}
+}
+
+func streamPostHookRoute(t *testing.T, routes []RouteConfig, pathFragment string) RouteConfig {
+	t.Helper()
+	for _, route := range routes {
+		if route.StreamConfig != nil && route.StreamConfig.ResponsesStreamResponseConverter != nil && strings.Contains(route.Path, pathFragment) {
+			return route
+		}
+	}
+	t.Fatalf("no responses streaming route containing %q", pathFragment)
+	return RouteConfig{}
+}
+
+// An integration-route stream runs the transport post-hooks exactly once,
+// after its last event has been converted and written, the same contract the
+// root inference handler keeps. TransportInterceptorMiddleware's part is
+// reproduced exactly: mark that post-hooks will run, call the handler, then
+// store the completer in the slot the handler allocated.
+func TestHandleStreamingRunsTransportPostHookOnceAfterTheLastEvent(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		routes []RouteConfig
+		path   string
+	}{
+		{name: "anthropic", routes: CreateAnthropicRouteConfigs("/anthropic", bifrost.NewNoOpLogger()), path: "/messages"},
+		{name: "genai", routes: CreateGenAIRouteConfigs("/genai"), path: "models"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			route := streamPostHookRoute(t, test.routes, test.path)
+			events := streamPostHookTestEvents()
+			var converted atomic.Int32
+			convert := route.StreamConfig.ResponsesStreamResponseConverter
+			streamConfig := *route.StreamConfig
+			streamConfig.ResponsesStreamResponseConverter = func(ctx *schemas.BifrostContext, resp *schemas.BifrostResponsesStreamResponse) (string, interface{}, error) {
+				converted.Add(1)
+				return convert(ctx, resp)
+			}
+			route.StreamConfig = &streamConfig
+
+			stream := make(chan *schemas.BifrostStreamChunk, len(events))
+			for _, event := range events {
+				stream <- event
+			}
+			close(stream)
+
+			ctx := &fasthttp.RequestCtx{}
+			ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+			ctx.Request.SetRequestURI(route.Path)
+			ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, true)
+
+			router := NewGenericRouter(nil, &mockHandlerStore{}, nil, nil, nil, bifrost.NewNoOpLogger())
+			router.handleStreaming(ctx, schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), route, stream, func() {})
+
+			slot, ok := ctx.UserValue(schemas.BifrostContextKeyTransportPostHookCompleter).(*atomic.Value)
+			require.True(t, ok, "a stream marked for post-hooks must allocate the completer slot")
+			var calls atomic.Int32
+			convertedAtPostHook := make(chan int32, 1)
+			slot.Store(func() ([]schemas.PluginLogEntry, error) {
+				if calls.Add(1) == 1 {
+					convertedAtPostHook <- converted.Load()
+				}
+				return nil, nil
+			})
+
+			body := make(chan string, 1)
+			go func() {
+				b, _ := io.ReadAll(ctx.Response.BodyStream())
+				body <- string(b)
+			}()
+			select {
+			case got := <-body:
+				assert.Contains(t, got, "second", "the client receives the last event")
+			case <-time.After(10 * time.Second):
+				t.Fatal("stream did not finish")
+			}
+			select {
+			case n := <-convertedAtPostHook:
+				assert.Equal(t, int32(len(events)), n, "post-hooks run only after every event was written")
+			case <-time.After(5 * time.Second):
+				t.Fatal("the transport post-hook never ran for the integration stream")
+			}
+			time.Sleep(150 * time.Millisecond)
+			assert.Equal(t, int32(1), calls.Load(), "the transport post-hook runs exactly once")
+		})
 	}
 }
