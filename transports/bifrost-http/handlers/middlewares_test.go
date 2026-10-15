@@ -4618,3 +4618,36 @@ func TestParseAccessLogPaths(t *testing.T) {
 		t.Errorf("parseAccessLogPaths = %v, want %v", got, want)
 	}
 }
+
+// A unary request keeps its synchronous transport post-hook: exactly one call
+// before the middleware returns. The marker that tells streaming handlers to
+// allocate a completer slot never reaches a plugin as a path parameter.
+func TestTransportInterceptorMiddleware_UnaryPostHookRunsOnceSynchronously(t *testing.T) {
+	calls := 0
+	var sawMarker bool
+	plugin := &fakeResponseHeadersPlugin{
+		name: "unary-post-hook",
+		hook: func(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponseMetadata) error {
+			return nil
+		},
+		postHook: func(_ *schemas.BifrostContext, req *schemas.HTTPRequest, _ *schemas.HTTPResponse) error {
+			calls++
+			_, sawMarker = req.PathParams[string(schemas.BifrostContextKeyTransportPostHookCompleter)]
+			return nil
+		},
+	}
+	handler := TransportInterceptorMiddleware(responseHeadersTestConfig(t, plugin))(func(ctx *fasthttp.RequestCtx) {
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.SetBodyString(`{"ok":true}`)
+	})
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(fasthttp.MethodPost)
+	ctx.Request.SetRequestURI("/anthropic/v1/messages")
+	handler(ctx)
+	if calls != 1 {
+		t.Fatalf("unary post-hook calls = %d, want exactly 1 before the middleware returns", calls)
+	}
+	if sawMarker {
+		t.Fatal("the completer-slot marker leaked into the request's path parameters")
+	}
+}
