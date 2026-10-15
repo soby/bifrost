@@ -136,6 +136,13 @@ func (l *SharedObjectPluginLoader) LoadPlugin(path string, config any) (schemas.
 		}
 	}
 
+	// Optional: HTTPTransportStreamChunksHook
+	if sym, err := pluginObj.Lookup("HTTPTransportStreamChunksHook"); err == nil {
+		if dp.httpTransportStreamChunksHook, ok = sym.(func(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error)); !ok {
+			return nil, fmt.Errorf("failed to cast HTTPTransportStreamChunksHook to expected signature")
+		}
+	}
+
 	// Optional: HTTPTransportResponseHeadersHook
 	if sym, err := pluginObj.Lookup("HTTPTransportResponseHeadersHook"); err == nil {
 		if dp.httpTransportResponseHeadersHook, ok = sym.(func(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error); !ok {

@@ -2408,29 +2408,31 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 		var sawErrorChunk bool
 
 		// Process streaming responses
-		for chunk := range stream {
-			if chunk == nil {
+		for input := range stream {
+			if input == nil {
 				continue
 			}
 
+			// Framing follows the provider's chunk, whatever a plugin emits for it.
 			includeEventType = false
-			if chunk.BifrostResponsesStreamResponse != nil ||
-				chunk.BifrostImageGenerationStreamResponse != nil ||
-				(chunk.BifrostError != nil && (chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesRetrieveStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageGenerationStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageEditStreamRequest)) {
+			if input.BifrostResponsesStreamResponse != nil ||
+				input.BifrostImageGenerationStreamResponse != nil ||
+				(input.BifrostError != nil && (input.BifrostError.ExtraFields.RequestType == schemas.ResponsesStreamRequest || input.BifrostError.ExtraFields.RequestType == schemas.ResponsesRetrieveStreamRequest || input.BifrostError.ExtraFields.RequestType == schemas.ImageGenerationStreamRequest || input.BifrostError.ExtraFields.RequestType == schemas.ImageEditStreamRequest)) {
 				includeEventType = true
 			}
 
 			// Image generation streams don't use [DONE] marker
-			if chunk.BifrostImageGenerationStreamResponse != nil {
+			if input.BifrostImageGenerationStreamResponse != nil {
 				skipDoneMarker = true
 			}
 
-			// Allow plugins to modify/filter the chunk via StreamChunkInterceptor
+			// Allow plugins to modify, filter or expand the chunk via StreamChunkInterceptor
+			outputs := []*schemas.BifrostStreamChunk{input}
 			if interceptor != nil {
 				var err error
-				chunk, err = interceptor.InterceptChunk(bifrostCtx, httpReq, chunk)
+				outputs, err = interceptor.InterceptChunk(bifrostCtx, httpReq, input)
 				if err != nil {
-					if chunk == nil {
+					if len(outputs) == 0 {
 						var errorPayload interface{} = map[string]string{"error": err.Error()}
 						var structuredErr *schemas.StreamInterceptionError
 						if errors.As(err, &structuredErr) && structuredErr != nil {
@@ -2455,63 +2457,64 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 					// Else add warn log and continue
 					logger.Warn("%v", err)
 				}
+			}
+
+			for _, chunk := range outputs {
 				if chunk == nil {
-					// Skip chunk if plugin wants to skip it
 					continue
 				}
-			}
-
-			// Convert response to JSON (transport-goroutine CPU).
-			// A chat chunk is normalized into the OpenAI wire contract: usage is
-			// omitted unless requested, and requested usage is its own final event.
-			cpuStart := time.Now()
-			var chunkJSON, usageJSON []byte
-			var err error
-			if requestType == schemas.ChatCompletionStreamRequest && chunk.BifrostChatResponse != nil {
-				chunkJSON, usageJSON, err = marshalChatCompletionStreamEvents(chunk.BifrostChatResponse, includeChatUsage)
-			} else {
-				chunkJSON, err = sonic.Marshal(chunk)
-			}
-			streamTransportCPUNs += time.Since(cpuStart).Nanoseconds()
-			if err != nil {
-				logger.Warn("Failed to marshal streaming response: %v", err)
-				continue
-			}
-
-			// Checked after marshalling so a chunk that never reaches the wire does
-			// not suppress the marker.
-			if chunk.BifrostError != nil {
-				sawErrorChunk = true
-			}
-
-			// Format and send as SSE data
-			var eventType string
-			if includeEventType {
-				// For responses and image gen API, use OpenAI-compatible format with event line
-				if chunk.BifrostResponsesStreamResponse != nil {
-					eventType = string(chunk.BifrostResponsesStreamResponse.Type)
-				} else if chunk.BifrostImageGenerationStreamResponse != nil {
-					eventType = string(chunk.BifrostImageGenerationStreamResponse.Type)
-				} else if chunk.BifrostError != nil {
-					eventType = string(schemas.ResponsesStreamResponseTypeError)
+				// Convert response to JSON (transport-goroutine CPU).
+				// A chat chunk is normalized into the OpenAI wire contract: usage is
+				// omitted unless requested, and requested usage is its own final event.
+				cpuStart := time.Now()
+				var chunkJSON, usageJSON []byte
+				var err error
+				if requestType == schemas.ChatCompletionStreamRequest && chunk.BifrostChatResponse != nil {
+					chunkJSON, usageJSON, err = marshalChatCompletionStreamEvents(chunk.BifrostChatResponse, includeChatUsage)
+				} else {
+					chunkJSON, err = sonic.Marshal(chunk)
 				}
-			}
-
-			writeStart := time.Now()
-			sent := len(chunkJSON) == 0 || reader.SendEvent(eventType, chunkJSON)
-			if sent && len(usageJSON) > 0 {
-				sent = reader.SendEvent("", usageJSON)
-			}
-			streamClientWriteNs += time.Since(writeStart).Nanoseconds()
-			if !sent {
-				cancel() // Client disconnected, cancel upstream stream
-				// Drain remaining chunks so the provider goroutine's defer
-				// (HandleStreamCancellation -> PostLLMHook -> storeOrEnqueueEntry) finishes
-				// before our own defer fires traceCompleter. Without this, Inject runs
-				// against an empty pendingLogsToInject and the cancellation log is orphaned.
-				for range stream {
+				streamTransportCPUNs += time.Since(cpuStart).Nanoseconds()
+				if err != nil {
+					logger.Warn("Failed to marshal streaming response: %v", err)
+					continue
 				}
-				return
+
+				// Checked after marshalling so a chunk that never reaches the wire does
+				// not suppress the marker.
+				if chunk.BifrostError != nil {
+					sawErrorChunk = true
+				}
+
+				// Format and send as SSE data
+				var eventType string
+				if includeEventType {
+					// For responses and image gen API, use OpenAI-compatible format with event line
+					if chunk.BifrostResponsesStreamResponse != nil {
+						eventType = string(chunk.BifrostResponsesStreamResponse.Type)
+					} else if chunk.BifrostImageGenerationStreamResponse != nil {
+						eventType = string(chunk.BifrostImageGenerationStreamResponse.Type)
+					} else if chunk.BifrostError != nil {
+						eventType = string(schemas.ResponsesStreamResponseTypeError)
+					}
+				}
+
+				writeStart := time.Now()
+				sent := len(chunkJSON) == 0 || reader.SendEvent(eventType, chunkJSON)
+				if sent && len(usageJSON) > 0 {
+					sent = reader.SendEvent("", usageJSON)
+				}
+				streamClientWriteNs += time.Since(writeStart).Nanoseconds()
+				if !sent {
+					cancel() // Client disconnected, cancel upstream stream
+					// Drain remaining chunks so the provider goroutine's defer
+					// (HandleStreamCancellation -> PostLLMHook -> storeOrEnqueueEntry) finishes
+					// before our own defer fires traceCompleter. Without this, Inject runs
+					// against an empty pendingLogsToInject and the cancellation log is orphaned.
+					for range stream {
+					}
+					return
+				}
 			}
 		}
 

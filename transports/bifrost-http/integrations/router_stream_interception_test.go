@@ -24,8 +24,52 @@ type stubChunkInterceptor struct {
 	err error
 }
 
-func (s *stubChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {
+func (s *stubChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
 	return nil, s.err
+}
+
+// expandingChunkInterceptor returns a fixed list of chunks for every input.
+type expandingChunkInterceptor struct {
+	outputs []*schemas.BifrostStreamChunk
+}
+
+func (s *expandingChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
+	return s.outputs, nil
+}
+
+// Every chunk an interceptor returns for one input is converted and written,
+// in order.
+func Test_handleStreamingWritesEveryInterceptedChunkInOrder(t *testing.T) {
+	text := func(delta string) *schemas.BifrostStreamChunk {
+		return &schemas.BifrostStreamChunk{BifrostResponsesStreamResponse: &schemas.BifrostResponsesStreamResponse{
+			Type: schemas.ResponsesStreamResponseTypeOutputTextDelta, Delta: &delta,
+		}}
+	}
+	config := RouteConfig{
+		Path: "/v1/responses",
+		StreamConfig: &StreamConfig{
+			ResponsesStreamResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostResponsesStreamResponse) (string, interface{}, error) {
+				return string(resp.Type), resp, nil
+			},
+		},
+	}
+	stream := make(chan *schemas.BifrostStreamChunk, 1)
+	stream <- text("input")
+	close(stream)
+	handlerStore := &interceptorHandlerStore{
+		mockHandlerStore: &mockHandlerStore{},
+		interceptor:      &expandingChunkInterceptor{outputs: []*schemas.BifrostStreamChunk{text("first"), nil, text("second")}},
+	}
+	router := NewGenericRouter(nil, handlerStore, nil, nil, nil, bifrost.NewNoOpLogger())
+	ctx := &fasthttp.RequestCtx{}
+	rec := newCancelRecorder()
+	router.handleStreaming(ctx, nil, config, stream, rec.cancel)
+
+	body, err := io.ReadAll(ctx.Response.BodyStream())
+	require.NoError(t, err)
+	first, second := strings.Index(string(body), `"delta":"first"`), strings.Index(string(body), `"delta":"second"`)
+	assert.True(t, first >= 0 && second > first, "both chunks written in order, got: %q", body)
+	assert.NotContains(t, string(body), `"delta":"input"`, "the replaced input chunk must not be written")
 }
 
 // interceptorHandlerStore overrides mockHandlerStore to supply a stream chunk

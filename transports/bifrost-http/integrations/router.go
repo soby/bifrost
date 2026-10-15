@@ -3138,12 +3138,13 @@ func (g *GenericRouter) handleCommittedStreaming(ctx *fasthttp.RequestCtx, bifro
 
 				return // End stream on error, Bifrost handles cleanup internally
 			} else {
-				// Allow plugins to modify/filter the chunk via StreamChunkInterceptor
+				// Allow plugins to modify, filter or expand the chunk via StreamChunkInterceptor
+				outputs := []*schemas.BifrostStreamChunk{chunk}
 				if interceptor != nil {
 					var err error
-					chunk, err = interceptor.InterceptChunk(bifrostCtx, httpReq, chunk)
+					outputs, err = interceptor.InterceptChunk(bifrostCtx, httpReq, chunk)
 					if err != nil {
-						if chunk == nil {
+						if len(outputs) == 0 {
 							// A StreamInterceptionError carries a structured client error —
 							// emit it through the integration's error converter, the same
 							// as upstream provider errors.
@@ -3173,144 +3174,145 @@ func (g *GenericRouter) handleCommittedStreaming(ctx *fasthttp.RequestCtx, bifro
 						// Else add warn log and continue
 						g.logger.Warn("%v", err)
 					}
+				}
+				for _, chunk := range outputs {
 					if chunk == nil {
-						// Skip chunk if plugin wants to skip it
 						continue
 					}
-				}
-				// Handle successful responses
-				// Convert response to integration-specific streaming format
-				var eventType string
-				var convertedResponse interface{}
-				var err error
-				converterMissing := false
+					// Handle successful responses
+					// Convert response to integration-specific streaming format
+					var eventType string
+					var convertedResponse interface{}
+					var err error
+					converterMissing := false
 
-				cpuStart := time.Now()
-				switch {
-				case chunk.BifrostTextCompletionResponse != nil:
-					if config.StreamConfig.TextStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("text stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.TextStreamResponseConverter(bifrostCtx, chunk.BifrostTextCompletionResponse)
+					cpuStart := time.Now()
+					switch {
+					case chunk.BifrostTextCompletionResponse != nil:
+						if config.StreamConfig.TextStreamResponseConverter == nil {
+							converterMissing = true
+							err = fmt.Errorf("text stream response converter is not configured")
+						} else {
+							eventType, convertedResponse, err = config.StreamConfig.TextStreamResponseConverter(bifrostCtx, chunk.BifrostTextCompletionResponse)
+						}
+					case chunk.BifrostChatResponse != nil:
+						if config.StreamConfig.ChatStreamResponseConverter == nil {
+							converterMissing = true
+							err = fmt.Errorf("chat stream response converter is not configured")
+						} else {
+							eventType, convertedResponse, err = config.StreamConfig.ChatStreamResponseConverter(bifrostCtx, chunk.BifrostChatResponse)
+						}
+					case chunk.BifrostResponsesStreamResponse != nil:
+						if config.StreamConfig.ResponsesStreamResponseConverter == nil {
+							converterMissing = true
+							err = fmt.Errorf("responses stream response converter is not configured")
+						} else {
+							eventType, convertedResponse, err = config.StreamConfig.ResponsesStreamResponseConverter(bifrostCtx, chunk.BifrostResponsesStreamResponse)
+						}
+					case chunk.BifrostSpeechStreamResponse != nil:
+						if config.StreamConfig.SpeechStreamResponseConverter == nil {
+							converterMissing = true
+							err = fmt.Errorf("speech stream response converter is not configured")
+						} else {
+							eventType, convertedResponse, err = config.StreamConfig.SpeechStreamResponseConverter(bifrostCtx, chunk.BifrostSpeechStreamResponse)
+						}
+					case chunk.BifrostTranscriptionStreamResponse != nil:
+						if config.StreamConfig.TranscriptionStreamResponseConverter == nil {
+							converterMissing = true
+							err = fmt.Errorf("transcription stream response converter is not configured")
+						} else {
+							eventType, convertedResponse, err = config.StreamConfig.TranscriptionStreamResponseConverter(bifrostCtx, chunk.BifrostTranscriptionStreamResponse)
+						}
+					case chunk.BifrostImageGenerationStreamResponse != nil:
+						if config.StreamConfig.ImageGenerationStreamResponseConverter == nil {
+							converterMissing = true
+							err = fmt.Errorf("image generation stream response converter is not configured")
+						} else {
+							eventType, convertedResponse, err = config.StreamConfig.ImageGenerationStreamResponseConverter(bifrostCtx, chunk.BifrostImageGenerationStreamResponse)
+						}
+					default:
+						requestType := safeGetRequestType(chunk)
+						convertedResponse, err = nil, fmt.Errorf("no response converter found for request type: %s", requestType)
 					}
-				case chunk.BifrostChatResponse != nil:
-					if config.StreamConfig.ChatStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("chat stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.ChatStreamResponseConverter(bifrostCtx, chunk.BifrostChatResponse)
-					}
-				case chunk.BifrostResponsesStreamResponse != nil:
-					if config.StreamConfig.ResponsesStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("responses stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.ResponsesStreamResponseConverter(bifrostCtx, chunk.BifrostResponsesStreamResponse)
-					}
-				case chunk.BifrostSpeechStreamResponse != nil:
-					if config.StreamConfig.SpeechStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("speech stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.SpeechStreamResponseConverter(bifrostCtx, chunk.BifrostSpeechStreamResponse)
-					}
-				case chunk.BifrostTranscriptionStreamResponse != nil:
-					if config.StreamConfig.TranscriptionStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("transcription stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.TranscriptionStreamResponseConverter(bifrostCtx, chunk.BifrostTranscriptionStreamResponse)
-					}
-				case chunk.BifrostImageGenerationStreamResponse != nil:
-					if config.StreamConfig.ImageGenerationStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("image generation stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.ImageGenerationStreamResponseConverter(bifrostCtx, chunk.BifrostImageGenerationStreamResponse)
-					}
-				default:
-					requestType := safeGetRequestType(chunk)
-					convertedResponse, err = nil, fmt.Errorf("no response converter found for request type: %s", requestType)
-				}
-				transportCPUNs += time.Since(cpuStart).Nanoseconds()
+					transportCPUNs += time.Since(cpuStart).Nanoseconds()
 
-				if convertedResponse == nil && err == nil {
-					// Skip streaming chunk if no response is available and no error is returned
-					continue
-				}
+					if convertedResponse == nil && err == nil {
+						// Skip streaming chunk if no response is available and no error is returned
+						continue
+					}
 
-				if err != nil {
-					g.logger.Warn("Failed to convert streaming response: %v", err)
-					if converterMissing {
-						sendConvertedStreamError(newBifrostErrorWithCode(nil, lib.ClientSafeInternalErrorMessage, fasthttp.StatusInternalServerError))
-						cancel()
+					if err != nil {
+						g.logger.Warn("Failed to convert streaming response: %v", err)
+						if converterMissing {
+							sendConvertedStreamError(newBifrostErrorWithCode(nil, lib.ClientSafeInternalErrorMessage, fasthttp.StatusInternalServerError))
+							cancel()
+							for range streamChan {
+							}
+							return
+						}
+						// Log ordinary conversion errors and continue processing subsequent chunks.
+						continue
+					}
+
+					// Handle Bedrock Event Stream format
+					if config.Type == RouteConfigTypeBedrock && eventStreamEncoder != nil {
+						// We need to cast to BedrockStreamEvent to determine event type and structure
+						if bedrockEvent, ok := convertedResponse.(*bedrock.BedrockStreamEvent); ok {
+							if !sendBedrockEventStream(reader, eventStreamEncoder, bedrockEvent, g.logger) {
+								cancel()
+								return
+							}
+						}
+						// Continue to next chunk (we handled sending internally)
+						continue
+					}
+
+					// Build and send SSE event. Time the whole build+send: for the common
+					// pre-formatted-SSE path (Anthropic) the buf build is trivial and this is
+					// essentially the reader.Send socket-write wait; integrations that marshal
+					// here fold a small marshal CPU into this figure, which is acceptable for
+					// the A/B ratio the breakdown derives from it.
+					writeStart := time.Now()
+					var buf []byte
+					var sent bool
+					if sseString, ok := convertedResponse.(string); ok {
+						if strings.HasPrefix(sseString, "data: ") || strings.HasPrefix(sseString, "event: ") {
+							// Pre-formatted SSE string (e.g. Anthropic custom event types)
+							if eventType != "" {
+								// Prepend event type line to pre-formatted data
+								buf = make([]byte, 0, 7+len(eventType)+1+len(sseString))
+								buf = append(buf, "event: "...)
+								buf = append(buf, eventType...)
+								buf = append(buf, '\n')
+								buf = append(buf, sseString...)
+								sent = reader.Send(buf)
+							} else {
+								sent = reader.Send([]byte(sseString))
+							}
+						} else {
+							sent = reader.SendEvent(eventType, []byte(sseString))
+						}
+					} else {
+						responseJSON, err := sonic.Marshal(convertedResponse)
+						if err != nil {
+							g.logger.Warn("Failed to marshal streaming response: %v", err)
+							continue
+						}
+						sent = reader.SendEvent(eventType, responseJSON)
+					}
+
+					if !sent {
+						cancel() // Client disconnected, cancel upstream stream
+						// Drain remaining chunks so the provider goroutine's defer
+						// (HandleStreamCancellation -> PostLLMHook -> storeOrEnqueueEntry) finishes
+						// before our own defer fires traceCompleter. Without this, Inject runs
+						// against an empty pendingLogsToInject and the cancellation log is orphaned.
 						for range streamChan {
 						}
 						return
 					}
-					// Log ordinary conversion errors and continue processing subsequent chunks.
-					continue
+					clientWriteNs += time.Since(writeStart).Nanoseconds()
 				}
-
-				// Handle Bedrock Event Stream format
-				if config.Type == RouteConfigTypeBedrock && eventStreamEncoder != nil {
-					// We need to cast to BedrockStreamEvent to determine event type and structure
-					if bedrockEvent, ok := convertedResponse.(*bedrock.BedrockStreamEvent); ok {
-						if !sendBedrockEventStream(reader, eventStreamEncoder, bedrockEvent, g.logger) {
-							cancel()
-							return
-						}
-					}
-					// Continue to next chunk (we handled sending internally)
-					continue
-				}
-
-				// Build and send SSE event. Time the whole build+send: for the common
-				// pre-formatted-SSE path (Anthropic) the buf build is trivial and this is
-				// essentially the reader.Send socket-write wait; integrations that marshal
-				// here fold a small marshal CPU into this figure, which is acceptable for
-				// the A/B ratio the breakdown derives from it.
-				writeStart := time.Now()
-				var buf []byte
-				var sent bool
-				if sseString, ok := convertedResponse.(string); ok {
-					if strings.HasPrefix(sseString, "data: ") || strings.HasPrefix(sseString, "event: ") {
-						// Pre-formatted SSE string (e.g. Anthropic custom event types)
-						if eventType != "" {
-							// Prepend event type line to pre-formatted data
-							buf = make([]byte, 0, 7+len(eventType)+1+len(sseString))
-							buf = append(buf, "event: "...)
-							buf = append(buf, eventType...)
-							buf = append(buf, '\n')
-							buf = append(buf, sseString...)
-							sent = reader.Send(buf)
-						} else {
-							sent = reader.Send([]byte(sseString))
-						}
-					} else {
-						sent = reader.SendEvent(eventType, []byte(sseString))
-					}
-				} else {
-					responseJSON, err := sonic.Marshal(convertedResponse)
-					if err != nil {
-						g.logger.Warn("Failed to marshal streaming response: %v", err)
-						continue
-					}
-					sent = reader.SendEvent(eventType, responseJSON)
-				}
-
-				if !sent {
-					cancel() // Client disconnected, cancel upstream stream
-					// Drain remaining chunks so the provider goroutine's defer
-					// (HandleStreamCancellation -> PostLLMHook -> storeOrEnqueueEntry) finishes
-					// before our own defer fires traceCompleter. Without this, Inject runs
-					// against an empty pendingLogsToInject and the cancellation log is orphaned.
-					for range streamChan {
-					}
-					return
-				}
-				clientWriteNs += time.Since(writeStart).Nanoseconds()
 			}
 		}
 

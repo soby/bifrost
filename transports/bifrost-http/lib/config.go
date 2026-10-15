@@ -62,8 +62,8 @@ import (
 // This interface enables proper dependency injection for streaming handlers.
 type StreamChunkInterceptor interface {
 	// InterceptChunk processes a chunk before it's written to the client.
-	// Returns the (potentially modified) chunk, or nil to skip the chunk entirely.
-	InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error)
+	// Returns the chunks to write in its place, in order; none skips it entirely.
+	InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error)
 }
 
 // HandlerStore provides access to runtime configuration values for handlers.
@@ -6675,30 +6675,78 @@ type pluginChunkInterceptor struct {
 	plugins []schemas.HTTPTransportPlugin
 }
 
-// InterceptChunk processes a chunk through all plugin HTTPTransportStreamChunkHook methods.
+// InterceptChunk processes a chunk through all plugin stream chunk hooks.
 // Plugins are called in reverse order (same as PostHook) so modifications chain correctly.
-func (i *pluginChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {
-	for j := len(i.plugins) - 1; j >= 0; j-- {
+// A plugin implementing schemas.HTTPTransportStreamChunksPlugin may return several
+// chunks; each continues through the remaining plugins on its own, in order.
+func (i *pluginChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
+	return i.interceptFrom(ctx, req, stream, len(i.plugins)-1)
+}
+
+// interceptFrom runs chunk through plugins[from] down to plugins[0]. A warning
+// ends the chain for that chunk only, as the single-chunk contract does; an
+// error without output stops the stream.
+func (i *pluginChunkInterceptor) interceptFrom(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk, from int) ([]*schemas.BifrostStreamChunk, error) {
+	for j := from; j >= 0; j-- {
 		plugin := i.plugins[j]
 		pluginName := plugin.GetName()
 		var (
-			modified *schemas.BifrostStreamChunk
-			err      error
+			outputs []*schemas.BifrostStreamChunk
+			err     error
 		)
 		func() {
 			pluginCtx := ctx.WithPluginScope(&pluginName)
 			defer pluginCtx.ReleasePluginScope()
-			modified, err = plugin.HTTPTransportStreamChunkHook(pluginCtx, req, stream)
+			outputs, err = interceptPluginChunk(plugin, pluginCtx, req, chunk)
 		}()
 		if err != nil {
-			return modified, fmt.Errorf("failed to intercept chunk with plugin %s: %w", pluginName, err)
+			wrapped := fmt.Errorf("failed to intercept chunk with plugin %s: %w", pluginName, err)
+			if len(outputs) == 0 {
+				return nil, wrapped // Stop the stream
+			}
+			return outputs, wrapped // Keep the chunks; skip the remaining plugins
 		}
-		if modified == nil {
+		switch len(outputs) {
+		case 0:
 			return nil, nil // Plugin wants to skip this chunk
+		case 1:
+			chunk = outputs[0]
+			continue
 		}
-		stream = modified
+		var (
+			expanded []*schemas.BifrostStreamChunk
+			warnings error
+		)
+		for _, child := range outputs {
+			childOutputs, childErr := i.interceptFrom(ctx, req, child, j-1)
+			if childErr != nil && len(childOutputs) == 0 {
+				return nil, childErr
+			}
+			warnings = errors.Join(warnings, childErr)
+			expanded = append(expanded, childOutputs...)
+		}
+		return expanded, warnings
 	}
-	return stream, nil
+	return []*schemas.BifrostStreamChunk{chunk}, nil
+}
+
+// interceptPluginChunk runs one plugin's stream chunk hook and drops nil outputs.
+func interceptPluginChunk(plugin schemas.HTTPTransportPlugin, ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
+	if expanding, ok := plugin.(schemas.HTTPTransportStreamChunksPlugin); ok {
+		outputs, err := expanding.HTTPTransportStreamChunksHook(ctx, req, chunk)
+		kept := outputs[:0:0]
+		for _, output := range outputs {
+			if output != nil {
+				kept = append(kept, output)
+			}
+		}
+		return kept, err
+	}
+	modified, err := plugin.HTTPTransportStreamChunkHook(ctx, req, chunk)
+	if modified == nil {
+		return nil, err
+	}
+	return []*schemas.BifrostStreamChunk{modified}, err
 }
 
 // GetStreamChunkInterceptor returns the chunk interceptor for streaming responses.
