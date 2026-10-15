@@ -2413,6 +2413,19 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 				continue
 			}
 
+			// Framing follows the provider's chunk, whatever a plugin emits for it.
+			includeEventType = false
+			if input.BifrostResponsesStreamResponse != nil ||
+				input.BifrostImageGenerationStreamResponse != nil ||
+				(input.BifrostError != nil && (input.BifrostError.ExtraFields.RequestType == schemas.ResponsesStreamRequest || input.BifrostError.ExtraFields.RequestType == schemas.ResponsesRetrieveStreamRequest || input.BifrostError.ExtraFields.RequestType == schemas.ImageGenerationStreamRequest || input.BifrostError.ExtraFields.RequestType == schemas.ImageEditStreamRequest)) {
+				includeEventType = true
+			}
+
+			// Image generation streams don't use [DONE] marker
+			if input.BifrostImageGenerationStreamResponse != nil {
+				skipDoneMarker = true
+			}
+
 			// Allow plugins to modify, filter or expand the chunk via StreamChunkInterceptor
 			outputs := []*schemas.BifrostStreamChunk{input}
 			if interceptor != nil {
@@ -2450,18 +2463,6 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 				if chunk == nil {
 					continue
 				}
-				includeEventType = false
-				if chunk.BifrostResponsesStreamResponse != nil ||
-					chunk.BifrostImageGenerationStreamResponse != nil ||
-					(chunk.BifrostError != nil && (chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesRetrieveStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageGenerationStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageEditStreamRequest)) {
-					includeEventType = true
-				}
-
-				// Image generation streams don't use [DONE] marker
-				if chunk.BifrostImageGenerationStreamResponse != nil {
-					skipDoneMarker = true
-				}
-
 				// Convert response to JSON (transport-goroutine CPU).
 				// A chat chunk is normalized into the OpenAI wire contract: usage is
 				// omitted unless requested, and requested usage is its own final event.

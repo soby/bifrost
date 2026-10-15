@@ -137,3 +137,27 @@ func TestInterceptChunk_ExpandingPluginCanHoldAndRelease(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b", "end"}, chunkTexts(chunks))
 }
+
+// A warning on one expanded chunk ends that chunk's chain only; its siblings
+// still pass through every remaining plugin.
+func TestInterceptChunk_WarningOnOneExpandedChunkLeavesSiblingsProcessed(t *testing.T) {
+	split := &testExpandingPlugin{
+		testStreamPlugin: testStreamPlugin{name: "split"},
+		expand: func(chunk *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
+			return []*schemas.BifrostStreamChunk{textChunk("a"), textChunk("b")}, nil
+		},
+	}
+	middle := &testStreamPlugin{name: "middle", hook: func(chunk *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {
+		if *chunk.BifrostResponsesStreamResponse.Delta == "a" {
+			return textChunk("a-warned"), errors.New("degraded")
+		}
+		return textChunk("b-middle"), nil
+	}}
+	last := &testStreamPlugin{name: "last", hook: suffix("!")}
+	// Reverse order: split, then middle, then last.
+	interceptor := &pluginChunkInterceptor{plugins: []schemas.HTTPTransportPlugin{last, middle, split}}
+
+	chunks, err := interceptor.InterceptChunk(testContext(), nil, textChunk("x"))
+	assert.Error(t, err, "the warning is reported")
+	assert.Equal(t, []string{"a-warned", "b-middle!"}, chunkTexts(chunks))
+}

@@ -6678,41 +6678,56 @@ type pluginChunkInterceptor struct {
 // InterceptChunk processes a chunk through all plugin stream chunk hooks.
 // Plugins are called in reverse order (same as PostHook) so modifications chain correctly.
 // A plugin implementing schemas.HTTPTransportStreamChunksPlugin may return several
-// chunks; each continues through the remaining plugins in order.
+// chunks; each continues through the remaining plugins on its own, in order.
 func (i *pluginChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) ([]*schemas.BifrostStreamChunk, error) {
-	chunks := []*schemas.BifrostStreamChunk{stream}
-	for j := len(i.plugins) - 1; j >= 0; j-- {
+	return i.interceptFrom(ctx, req, stream, len(i.plugins)-1)
+}
+
+// interceptFrom runs chunk through plugins[from] down to plugins[0]. A warning
+// ends the chain for that chunk only, as the single-chunk contract does; an
+// error without output stops the stream.
+func (i *pluginChunkInterceptor) interceptFrom(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk, from int) ([]*schemas.BifrostStreamChunk, error) {
+	for j := from; j >= 0; j-- {
 		plugin := i.plugins[j]
 		pluginName := plugin.GetName()
-		next := make([]*schemas.BifrostStreamChunk, 0, len(chunks))
-		for index, chunk := range chunks {
-			var (
-				outputs []*schemas.BifrostStreamChunk
-				err     error
-			)
-			func() {
-				pluginCtx := ctx.WithPluginScope(&pluginName)
-				defer pluginCtx.ReleasePluginScope()
-				outputs, err = interceptPluginChunk(plugin, pluginCtx, req, chunk)
-			}()
-			if err != nil {
-				wrapped := fmt.Errorf("failed to intercept chunk with plugin %s: %w", pluginName, err)
-				if len(outputs) == 0 {
-					return nil, wrapped // Stop the stream
-				}
-				// A warning keeps the chunks, as the single-chunk contract keeps the
-				// modified chunk, and skips the remaining plugins.
-				next = append(next, outputs...)
-				return append(next, chunks[index+1:]...), wrapped
+		var (
+			outputs []*schemas.BifrostStreamChunk
+			err     error
+		)
+		func() {
+			pluginCtx := ctx.WithPluginScope(&pluginName)
+			defer pluginCtx.ReleasePluginScope()
+			outputs, err = interceptPluginChunk(plugin, pluginCtx, req, chunk)
+		}()
+		if err != nil {
+			wrapped := fmt.Errorf("failed to intercept chunk with plugin %s: %w", pluginName, err)
+			if len(outputs) == 0 {
+				return nil, wrapped // Stop the stream
 			}
-			next = append(next, outputs...)
+			return outputs, wrapped // Keep the chunks; skip the remaining plugins
 		}
-		if len(next) == 0 {
-			return nil, nil // Plugins want to skip this chunk
+		switch len(outputs) {
+		case 0:
+			return nil, nil // Plugin wants to skip this chunk
+		case 1:
+			chunk = outputs[0]
+			continue
 		}
-		chunks = next
+		var (
+			expanded []*schemas.BifrostStreamChunk
+			warnings error
+		)
+		for _, child := range outputs {
+			childOutputs, childErr := i.interceptFrom(ctx, req, child, j-1)
+			if childErr != nil && len(childOutputs) == 0 {
+				return nil, childErr
+			}
+			warnings = errors.Join(warnings, childErr)
+			expanded = append(expanded, childOutputs...)
+		}
+		return expanded, warnings
 	}
-	return chunks, nil
+	return []*schemas.BifrostStreamChunk{chunk}, nil
 }
 
 // interceptPluginChunk runs one plugin's stream chunk hook and drops nil outputs.
