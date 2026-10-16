@@ -397,6 +397,58 @@ func TestConfigureDialerFor_LoopbackIsPrivate(t *testing.T) {
 	}
 }
 
+// TestNetHTTPDialContextFor applies ConfigureDialerFor's address policy to net/http dials:
+// loopback with LoopbackIsPrivate needs AllowPrivateNetwork, unspecified and link-local
+// addresses are always refused.
+func TestNetHTTPDialContextFor(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	tests := []struct {
+		name    string
+		config  schemas.NetworkConfig
+		addr    string
+		wantErr string
+	}{
+		{"loopback", schemas.NetworkConfig{}, ln.Addr().String(), ""},
+		{"loopback private", schemas.NetworkConfig{LoopbackIsPrivate: true}, ln.Addr().String(), "private IP"},
+		{"loopback private, private network allowed", schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true}, ln.Addr().String(), ""},
+		{"RFC 1918", schemas.NetworkConfig{}, "10.0.0.1:80", "private IP"},
+		{"link-local", schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true}, "169.254.169.254:80", "link-local IP"},
+		{"unspecified", schemas.NetworkConfig{AllowPrivateNetwork: true}, "0.0.0.0:80", "unspecified IP"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dial := NetHTTPDialContextFor(tt.config, time.Second)
+			conn, err := dial(t.Context(), "tcp", tt.addr)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the dial to succeed, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected an error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
 // TestConfigureDialer_SSRFProxyBypass verifies that when an existingDial is set
 // (proxy path), SSRF checks are intentionally skipped — the proxy owns routing.
 func TestConfigureDialer_SSRFProxyBypass(t *testing.T) {

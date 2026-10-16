@@ -46,6 +46,7 @@ type BedrockProvider struct {
 	customProviderConfig  *schemas.CustomProviderConfig // Custom provider config
 	sendBackRawRequest    bool                          // Whether to include raw request in BifrostResponse
 	sendBackRawResponse   bool                          // Whether to include raw response in BifrostResponse
+	runtimeBaseURL        string                        // Request-scoped origin for bedrock-runtime model invocation (see ForRequest); empty uses the regional host
 }
 
 // assumeRoleCredsCache caches *aws.CredentialsCache instances keyed by the
@@ -99,7 +100,14 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 	if err != nil {
 		return nil, err
 	}
-	if proxy == nil {
+	switch {
+	case proxy != nil:
+	case config.NetworkConfig.LoopbackIsPrivate:
+		// An instance serving request-scoped configuration can be pointed at a caller-chosen
+		// origin (ForRequest), so it dials directly, like its fasthttp clients, through the
+		// same private-network checks they apply.
+		dialContext = providerUtils.NetHTTPDialContextFor(config.NetworkConfig, requestTimeout)
+	default:
 		proxy = providerUtils.EnvProxyFunc()
 	}
 
@@ -223,9 +231,17 @@ func (provider *BedrockProvider) GetProviderKey() schemas.ModelProvider {
 // the AWS default credential chain or assumes a role, whose credentials are cached per role.
 // File and batch operations always sign with SigV4, so they need the static keys. Regions are
 // checked and endpoint overrides rejected, because they choose the host Bifrost connects to.
+//
+// A base URL (for example a VPC endpoint or a signing proxy) replaces the bedrock-runtime host
+// for model invocation only, Converse and InvokeModel, unary and streaming; its scheme is used
+// as given. Requests are signed exactly as without it, for the URL actually sent. Every other
+// Bedrock service (control plane, S3, batch, files, agent runtime, Mantle, the runtime's
+// OpenAI-compatible surface) keeps its AWS host, so an attempt that would reach one with a
+// base URL is refused: here by request type, and when the model routes away from Converse and
+// InvokeModel, by the operation.
 func (provider *BedrockProvider) ForRequest(requestType schemas.RequestType, key schemas.Key, baseURL string) (schemas.Provider, error) {
-	if baseURL != "" {
-		return nil, errors.New("bedrock takes its endpoint from the key's region, not a base URL")
+	if baseURL != "" && !bedrockRuntimeInvocation(requestType) {
+		return nil, errors.New("bedrock takes a base URL only for model invocation (Converse and InvokeModel)")
 	}
 	cfg := key.BedrockKeyConfig
 	if cfg == nil || !awsRegionRegex.MatchString(cfg.Region.GetValue()) {
@@ -249,7 +265,48 @@ func (provider *BedrockProvider) ForRequest(requestType schemas.RequestType, key
 			return nil, errors.New("bedrock file and batch operations require an access key and secret key")
 		}
 	}
+	if baseURL != "" {
+		scoped := *provider
+		scoped.runtimeBaseURL = baseURL
+		return &scoped, nil
+	}
 	return provider, nil
+}
+
+// bedrockRuntimeInvocation reports whether Bedrock serves requestType by invoking a model on
+// bedrock-runtime (Converse or InvokeModel), the only calls a request-scoped base URL reaches.
+func bedrockRuntimeInvocation(requestType schemas.RequestType) bool {
+	switch requestType {
+	case schemas.TextCompletionRequest, schemas.TextCompletionStreamRequest,
+		schemas.ChatCompletionRequest, schemas.ChatCompletionStreamRequest,
+		schemas.ResponsesRequest, schemas.ResponsesStreamRequest,
+		schemas.EmbeddingRequest, schemas.ImageGenerationRequest, schemas.ImageEditRequest, schemas.ImageVariationRequest:
+		return true
+	}
+	return false
+}
+
+// runtimeModelURL returns the URL of the bedrock-runtime model operation at path
+// ("<model>/<action>"): on the request-scoped base URL when the attempt has one, otherwise on
+// the key's runtime endpoint override or the regional host.
+func (provider *BedrockProvider) runtimeModelURL(key schemas.Key, region, path string) string {
+	if provider.runtimeBaseURL != "" {
+		return provider.runtimeBaseURL + "/model/" + path
+	}
+	return fmt.Sprintf("https://%s/model/%s", resolveBedrockHost(bedrockEndpoints(key.BedrockKeyConfig), bedrockServiceRuntime, region), path)
+}
+
+// checkBaseURLSurface refuses an attempt with a request-scoped base URL whose model routes to
+// Mantle or to bedrock-runtime's OpenAI-compatible surface: the base URL stands in only for
+// Converse and InvokeModel, and the attempt must not go to an AWS host instead.
+func (provider *BedrockProvider) checkBaseURLSurface(ctx *schemas.BifrostContext, key schemas.Key, surface bedrockSurface, model string, api schemas.BedrockAPI) *schemas.BifrostError {
+	if provider.runtimeBaseURL == "" {
+		return nil
+	}
+	if surface.isMantle() || runtimeServesOpenAIAPI(ctx, key, surface, model, api) {
+		return providerUtils.NewBifrostBadRequestError(fmt.Sprintf("bedrock model %q is not served by Converse or InvokeModel, which a base URL is limited to", model))
+	}
+	return nil
 }
 
 // isStreamTransportError reports whether err is a transport-level connection
@@ -384,7 +441,7 @@ func (provider *BedrockProvider) completeRequest(ctx *schemas.BifrostContext, js
 	region := resolveBedrockRegion(ctx, key, model)
 
 	// Create the request with the JSON body
-	requestURL := fmt.Sprintf("https://%s/model/%s", resolveBedrockHost(bedrockEndpoints(config), bedrockServiceRuntime, region), path)
+	requestURL := provider.runtimeModelURL(key, region, path)
 	req, err := http.NewRequestWithContext(ctx, "POST", requestURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, 0, nil, &schemas.BifrostError{
@@ -608,7 +665,7 @@ func (provider *BedrockProvider) makeStreamingRequest(ctx *schemas.BifrostContex
 	path, region := provider.getModelPathAndRegion(ctx, action, model, key)
 
 	// Create HTTP request for streaming
-	requestURL := fmt.Sprintf("https://%s/model/%s", resolveBedrockHost(bedrockEndpoints(key.BedrockKeyConfig), bedrockServiceRuntime, region), path)
+	requestURL := provider.runtimeModelURL(key, region, path)
 	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(jsonData))
 	if reqErr != nil {
 		return nil, providerUtils.NewBifrostOperationError("error creating request", reqErr)
@@ -1392,6 +1449,9 @@ func (provider *BedrockProvider) ChatCompletion(ctx *schemas.BifrostContext, key
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIChatCompletions); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleChatCompletions(ctx, key, request)
 	}
@@ -1591,6 +1651,9 @@ func (provider *BedrockProvider) ChatCompletionStream(ctx *schemas.BifrostContex
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIChatCompletions); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleChatCompletionsStream(ctx, postHookRunner, postHookSpanFinalizer, key, request)
 	}
@@ -1931,6 +1994,9 @@ func (provider *BedrockProvider) Responses(ctx *schemas.BifrostContext, key sche
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIResponses); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleResponses(ctx, key, request)
 	}
@@ -2024,6 +2090,9 @@ func (provider *BedrockProvider) ResponsesStream(ctx *schemas.BifrostContext, po
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIResponses); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleResponsesStream(ctx, postHookRunner, postHookSpanFinalizer, key, request)
 	}
@@ -4657,8 +4726,7 @@ func invokeIngressThinkingNeedsInvokePath(ctx *schemas.BifrostContext, reasoning
 // the same region and model-path resolution as the Converse path.
 func (provider *BedrockProvider) invokeURL(ctx *schemas.BifrostContext, key schemas.Key, model, action string) (requestURL, region string) {
 	path, region := provider.getModelPathAndRegion(ctx, action, model, key)
-	host := resolveBedrockHost(bedrockEndpoints(key.BedrockKeyConfig), bedrockServiceRuntime, region)
-	return fmt.Sprintf("https://%s/model/%s", host, path), region
+	return provider.runtimeModelURL(key, region, path), region
 }
 
 // invokeSigner returns a SigV4 body signer for bedrock-runtime, or nil when the
