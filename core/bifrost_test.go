@@ -5134,7 +5134,12 @@ func TestRequestScopedProviderRules(t *testing.T) {
 		{name: "bedrock endpoints", provider: schemas.Bedrock, requestType: schemas.ChatCompletionRequest, key: bedrockBearer(func(c *schemas.BedrockKeyConfig) {
 			c.Endpoints = &schemas.BedrockEndpoints{Runtime: schemas.NewSecretVar("vpce.example.com")}
 		}), wantErr: "endpoint overrides"},
-		{name: "bedrock base URL", provider: schemas.Bedrock, requestType: schemas.ChatCompletionRequest, key: bedrockBearer(nil), baseURL: "https://x.example.com", wantErr: "not a base URL"},
+		{name: "bedrock base URL chat", provider: schemas.Bedrock, requestType: schemas.ChatCompletionRequest, key: bedrockBearer(nil), baseURL: "https://x.example.com"},
+		{name: "bedrock base URL list models", provider: schemas.Bedrock, requestType: schemas.ListModelsRequest, key: bedrockBearer(nil), baseURL: "https://x.example.com", wantErr: "only for model invocation"},
+		{name: "bedrock base URL batch", provider: schemas.Bedrock, requestType: schemas.BatchCreateRequest, key: bedrockStatic, baseURL: "https://x.example.com", wantErr: "only for model invocation"},
+		{name: "bedrock base URL endpoints", provider: schemas.Bedrock, requestType: schemas.ChatCompletionRequest, key: bedrockBearer(func(c *schemas.BedrockKeyConfig) {
+			c.Endpoints = &schemas.BedrockEndpoints{Runtime: schemas.NewSecretVar("vpce.example.com")}
+		}), baseURL: "https://x.example.com", wantErr: "endpoint overrides"},
 		// Fork-only: Vertex with a caller-supplied access token.
 		{name: "vertex access token chat", provider: schemas.Vertex, requestType: schemas.ChatCompletionRequest, key: vertexToken(nil)},
 		{name: "vertex access token batch", provider: schemas.Vertex, requestType: schemas.BatchCreateRequest, key: vertexToken(nil)},

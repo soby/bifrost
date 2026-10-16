@@ -827,17 +827,8 @@ func configureDialer(client *fasthttp.Client, allowPrivateNetwork, loopbackIsPri
 			}
 			var lastErr error
 			for _, ip := range ips {
-				// Unspecified (0.0.0.0, ::) and link-local (169.254.x.x, fe80::) are always blocked
-				if ip.IsUnspecified() {
-					return nil, fmt.Errorf("connection to unspecified IP %s is not allowed", ip)
-				}
-				if network.IsLinkLocal(ip) {
-					return nil, fmt.Errorf("connection to link-local IP %s is not allowed", ip)
-				}
-				// RFC 1918 blocked unless operator explicitly opted in; loopback allowed
-				// unless the client was built with loopbackIsPrivate
-				if (loopbackIsPrivate || !ip.IsLoopback()) && !allowPrivateNetwork && network.IsPrivateIP(ip) {
-					return nil, fmt.Errorf("connection to private IP %s is not allowed", ip)
+				if err := checkDialIP(ip, allowPrivateNetwork, loopbackIsPrivate); err != nil {
+					return nil, err
 				}
 				conn, err = dialer.Dial("tcp", net.JoinHostPort(ip.String(), port))
 				if err == nil {
@@ -864,6 +855,64 @@ func configureDialer(client *fasthttp.Client, allowPrivateNetwork, loopbackIsPri
 	}
 
 	return client
+}
+
+// checkDialIP reports whether ip may be dialed. Unspecified (0.0.0.0, ::) and link-local
+// (169.254.x.x, fe80::) addresses are always refused. RFC 1918 addresses are refused unless
+// allowPrivateNetwork is set; loopback ones too when loopbackIsPrivate is set.
+func checkDialIP(ip net.IP, allowPrivateNetwork, loopbackIsPrivate bool) error {
+	if ip.IsUnspecified() {
+		return fmt.Errorf("connection to unspecified IP %s is not allowed", ip)
+	}
+	if network.IsLinkLocal(ip) {
+		return fmt.Errorf("connection to link-local IP %s is not allowed", ip)
+	}
+	if (loopbackIsPrivate || !ip.IsLoopback()) && !allowPrivateNetwork && network.IsPrivateIP(ip) {
+		return fmt.Errorf("connection to private IP %s is not allowed", ip)
+	}
+	return nil
+}
+
+// NetHTTPDialContextFor returns a net/http DialContext that applies the address policy
+// ConfigureDialerFor applies to fasthttp clients: it resolves the host, refuses an address
+// checkDialIP refuses for networkConfig, and dials the checked IP literal, so a second
+// resolution cannot swap in another address. timeout bounds the resolution and each dial.
+// It is for direct connections: a transport that dials a proxy with it checks the proxy's
+// address, not the target's.
+func NetHTTPDialContextFor(networkConfig schemas.NetworkConfig, timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	allowPrivateNetwork, loopbackIsPrivate := networkConfig.AllowPrivateNetwork, networkConfig.LoopbackIsPrivate
+	dialer := &net.Dialer{Timeout: timeout}
+	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		resolveCtx := ctx
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			resolveCtx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		var lastErr error
+		for _, ip := range ips {
+			if err := checkDialIP(ip, allowPrivateNetwork, loopbackIsPrivate); err != nil {
+				return nil, err
+			}
+			conn, err := dialer.DialContext(ctx, netw, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("no usable address resolved for %s", host)
+	}
 }
 
 // ConfigureProxy sets up a proxy for the fasthttp client based on the provided configuration.

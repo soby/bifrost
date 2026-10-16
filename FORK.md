@@ -80,6 +80,7 @@ New on this branch:
 | 72337b79d | Per-request stream frame tap: an `io.Writer` at `schemas.BifrostContextKeyStreamFrameTap` receives every byte the SSE stream writer releases (events, heartbeat comments, `[DONE]`), in order and one `Write` per release; absent or nil costs no allocation |
 | #19 | Early SSE commit while a plugin holds a streaming request before admission (`schemas.StreamAdmissionWait`, `lib.StreamSetup`): `: waiting` comments on the committed stream, setup errors as the route's stream error event; see "Transport" below |
 | #20 | Optional `schemas.HTTPTransportStreamChunksPlugin`: an HTTP transport plugin can turn one streamed chunk into zero or more chunks, each continuing through the remaining plugins and written in order; see "Transport" below |
+| #22 | Request-scoped Bedrock takes a base URL for model invocation only (Converse and InvokeModel, unary and streaming); every other Bedrock service refuses one. The instance's net/http client dials directly through the private-network checks; see "Bedrock base URL" below |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
@@ -119,8 +120,26 @@ afd5a305e (superseded by the adapted #5277 tests), and the x/crypto upgrade and 
 - WebSocket and realtime routes do not honor request-scoped configuration.
 - Supported: OpenAI, Anthropic, Gemini, Cohere, Cerebras, Groq, Mistral, Nebius, OpenRouter,
   Parasail, Perplexity, xAI, Replicate, Hugging Face, Ollama, SGL, vLLM (URL on the key),
-  Azure (API key and endpoint on the key), Bedrock (API key or static keys, region on the key)
-  and, fork-only, Vertex. Others fail closed.
+  Azure (API key and endpoint on the key), Bedrock (API key or static keys, region on the key;
+  fork-only, a base URL for model invocation, below) and, fork-only, Vertex. Others fail closed.
+
+### Bedrock base URL (fork-only)
+
+- `UpdateProviderBaseURL(schemas.Bedrock, url)` replaces the bedrock-runtime host for model
+  invocation only: Converse and InvokeModel, unary and streaming
+  (`<url>/model/<model>/<action>`, the model identifier percent-encoded as on the AWS host).
+  The scheme is used as given, so a loopback `http://` origin works with
+  `UpdateProviderAllowPrivateNetwork`.
+- `ForRequest` refuses a base URL for every request type that is not served by model
+  invocation (list models, count tokens, rerank, files, batches, passthrough), and an attempt
+  whose model routes to Mantle or to the runtime's OpenAI-compatible surface fails with a 400
+  without sending anything. Endpoint overrides on the key stay refused.
+- Credentials are unchanged: the API key or static keys come with the request, never the
+  default chain or a role. SigV4 signs the URL actually sent, so a signing proxy re-signs for
+  AWS.
+- On request-scoped instances the net/http client (Converse, and every SigV4 net/http call)
+  dials directly through the same private-network checks as the fasthttp clients
+  (`providerUtils.NetHTTPDialContextFor`) instead of using an environment proxy.
 
 ### Vertex with a caller-supplied token (fork-only)
 

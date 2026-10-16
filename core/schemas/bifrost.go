@@ -1135,8 +1135,9 @@ func (br *BifrostRequest) UpdateProviderKey(provider ModelProvider, key Key) err
 
 // UpdateProviderBaseURL sends this request's attempts against provider to baseURL, which
 // takes the form network_config.base_url takes for that provider. Providers that keep their
-// endpoint on the key (Azure, Bedrock, vLLM) take it from the key instead and fail an
-// attempt that carries a base URL.
+// endpoint on the key (Azure, vLLM) take it from the key instead and fail an attempt that
+// carries a base URL. Bedrock takes one only for model invocation (Converse and InvokeModel),
+// in place of the bedrock-runtime host, and fails any other attempt that carries one.
 //
 // The URL must be http or https with a host and no user info, query or fragment; trailing
 // slashes are removed. Its destination is checked when Bifrost connects: link-local
