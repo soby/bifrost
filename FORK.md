@@ -15,7 +15,7 @@ Current runtime branch: `runtime/request-scoped`.
 
 | Upstream PR | What | Status | In this branch |
 |---|---|---|---|
-| #2030 | Request-scoped provider configuration: `BifrostRequest.UpdateProviderKey`, `UpdateProviderBaseURL`, `UpdateProviderAllowPrivateNetwork`, `ProviderOverrideFor`; `schemas.RequestScopedProvider`; inline execution bounded by a per-instance semaphore | Open (ours) | Base of the branch |
+| #2030 | Request-scoped provider configuration: `BifrostRequest.UpdateProviderKey`, `UpdateProviderBaseURL`, `UpdateProviderAllowPrivateNetwork`, `ProviderOverrideFor`; `schemas.RequestScopedProvider`; inline execution bounded by a per-instance semaphore | Open (ours) | Base of the branch; the semaphore is removed by #23 |
 | #6630 | Honor `UseRawRequestBody` on native inference routes | Open (third party) | Carried |
 | #7227 | Accept a scalar `stop` on chat completions | Open (third party) | Carried |
 | #5277 | Preserve `reasoning_details` on OpenAI-compatible chat requests | Open (third party) | Carried, adapted: forwarded only to destinations without a curated OpenAI dialect (OpenRouter, custom providers); curated dialects keep it off the wire; Anthropic conversion drops unsigned text-only details |
@@ -81,6 +81,7 @@ New on this branch:
 | #19 | Early SSE commit while a plugin holds a streaming request before admission (`schemas.StreamAdmissionWait`, `lib.StreamSetup`): `: waiting` comments on the committed stream, setup errors as the route's stream error event; see "Transport" below |
 | #20 | Optional `schemas.HTTPTransportStreamChunksPlugin`: an HTTP transport plugin can turn one streamed chunk into zero or more chunks, each continuing through the remaining plugins and written in order; see "Transport" below |
 | #22 | Request-scoped Bedrock takes a base URL for model invocation only (Converse and InvokeModel, unary and streaming); every other Bedrock service refuses one. The instance's net/http client dials directly through the private-network checks; see "Bedrock base URL" below |
+| #23 | **Upstream candidate for #2030.** Request-scoped attempts have no per-instance concurrency cap: the 1000-slot semaphore (`schemas.DefaultConcurrency`) is gone, so an attempt is bounded only by admission, its request context and its attempt timeout |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
