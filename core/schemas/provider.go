@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 	"time"
 )
 
@@ -91,6 +92,13 @@ type NetworkConfig struct {
 	// sets it on the provider instances that serve request-scoped configuration, whose
 	// callers bound each attempt themselves, and it is never serialized.
 	ContextBoundReads bool `json:"-"`
+
+	// UnboundedConnsPerHost removes the per-host connection cap: MaxConnsPerHost becomes
+	// math.MaxInt, so a client opens a new connection whenever no idle one is free and a
+	// request never waits for one. Runtime-only and fork-only: Bifrost sets it on the provider
+	// instances that serve request-scoped configuration, whose callers bound each attempt with
+	// its context and attempt timeout, and it is never serialized.
+	UnboundedConnsPerHost bool `json:"-"`
 }
 
 // UnmarshalJSON customizes JSON unmarshaling for NetworkConfig.
@@ -692,7 +700,9 @@ func (config *ProviderConfig) CheckAndSetDefaults() {
 		config.NetworkConfig.KeepAliveTimeoutInSeconds = DefaultKeepAliveTimeoutInSeconds
 	}
 
-	if config.NetworkConfig.MaxConnsPerHost <= 0 {
+	if config.NetworkConfig.UnboundedConnsPerHost {
+		config.NetworkConfig.MaxConnsPerHost = math.MaxInt
+	} else if config.NetworkConfig.MaxConnsPerHost <= 0 {
 		config.NetworkConfig.MaxConnsPerHost = DefaultMaxConnsPerHost
 	} else if config.NetworkConfig.MaxConnsPerHost > MaxConnsPerHostUpperBound {
 		config.NetworkConfig.MaxConnsPerHost = MaxConnsPerHostUpperBound

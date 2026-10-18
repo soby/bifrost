@@ -15,7 +15,7 @@ Current runtime branch: `runtime/request-scoped`.
 
 | Upstream PR | What | Status | In this branch |
 |---|---|---|---|
-| #2030 | Request-scoped provider configuration: `BifrostRequest.UpdateProviderKey`, `UpdateProviderBaseURL`, `UpdateProviderAllowPrivateNetwork`, `ProviderOverrideFor`; `schemas.RequestScopedProvider`; inline execution bounded by a per-instance semaphore | Open (ours) | Base of the branch; the semaphore is removed by #23 |
+| #2030 | Request-scoped provider configuration: `BifrostRequest.UpdateProviderKey`, `UpdateProviderBaseURL`, `UpdateProviderAllowPrivateNetwork`, `ProviderOverrideFor`; `schemas.RequestScopedProvider`; inline execution bounded by a per-instance semaphore | Open (ours) | Base of the branch; the semaphore is removed by #23 and the per-host connection cap by #24 |
 | #6630 | Honor `UseRawRequestBody` on native inference routes | Open (third party) | Carried |
 | #7227 | Accept a scalar `stop` on chat completions | Open (third party) | Carried |
 | #5277 | Preserve `reasoning_details` on OpenAI-compatible chat requests | Open (third party) | Carried, adapted: forwarded only to destinations without a curated OpenAI dialect (OpenRouter, custom providers); curated dialects keep it off the wire; Anthropic conversion drops unsigned text-only details |
@@ -82,6 +82,7 @@ New on this branch:
 | #20 | Optional `schemas.HTTPTransportStreamChunksPlugin`: an HTTP transport plugin can turn one streamed chunk into zero or more chunks, each continuing through the remaining plugins and written in order; see "Transport" below |
 | #22 | Request-scoped Bedrock takes a base URL for model invocation only (Converse and InvokeModel, unary and streaming); every other Bedrock service refuses one. The instance's net/http client dials directly through the private-network checks; see "Bedrock base URL" below |
 | #23 | **Upstream candidate for #2030.** Request-scoped attempts have no per-instance concurrency cap: the 1000-slot semaphore (`schemas.DefaultConcurrency`) is gone, so an attempt is bounded only by admission, its request context and its attempt timeout |
+| #24 | **Upstream candidate for #2030.** Request-scoped instances have no per-host connection cap: runtime-only `NetworkConfig.UnboundedConnsPerHost` makes `MaxConnsPerHost` `math.MaxInt` through `CheckAndSetDefaults`, so a request never waits for a free connection; its context and attempt timeout bound it |
 | #25 | **Upstream candidate.** `schemas.SetConnectionObserver`: a process-wide `ConnectionObserver` hears provider connections opened and closed (fasthttp and net/http dialers) and each request's acquisition (address, reused, wait including dial and TLS), from `contextTransport` and an `httptrace` in `DoHTTPRequest`; nothing is wrapped or timed without an observer |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
