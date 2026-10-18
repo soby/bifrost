@@ -113,7 +113,7 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 
 	transport := &http.Transport{
 		Proxy:                 proxy,
-		DialContext:           dialContext,
+		DialContext:           providerUtils.ObservedDialContext(dialContext),
 		TLSClientConfig:       proxyTLS,
 		MaxConnsPerHost:       config.NetworkConfig.MaxConnsPerHost,
 		MaxIdleConns:          schemas.DefaultMaxIdleConnsPerHost,

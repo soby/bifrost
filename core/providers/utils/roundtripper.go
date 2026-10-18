@@ -146,6 +146,7 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 
 	customSkipBody := resp.SkipBody
 
+	acquireStart := connectionAcquireStart()
 	cc, err := hc.AcquireConn(0, req.ConnectionClose())
 	if err != nil {
 		return false, err
@@ -155,6 +156,7 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 	// fasthttp stamps lastUseTime only when a connection is returned to the
 	// pool, so a zero value means this socket was dialed for this request.
 	reused := !cc.LastUseTime().IsZero()
+	observeConnectionAcquired(hc.Addr, reused, acquireStart)
 	retryOn := func(err error) bool {
 		return reused && !errors.Is(err, fasthttp.ErrBodyTooLarge)
 	}
