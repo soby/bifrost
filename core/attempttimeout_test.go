@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -236,5 +237,22 @@ func TestRequestScopedProviderConfig_ContextBoundReads(t *testing.T) {
 	}
 	if schemas.DefaultNetworkConfig.ContextBoundReads {
 		t.Error("DefaultNetworkConfig.ContextBoundReads = true; configured providers must keep their read timeout")
+	}
+}
+
+// Request-scoped instances have no per-host connection cap (fasthttp and net/http both treat
+// math.MaxInt as unbounded, where fasthttp would read 0 as its 512 default), so an attempt
+// never waits for a free connection; configured providers keep the default cap.
+func TestRequestScopedProviderConfig_UnboundedConnsPerHost(t *testing.T) {
+	for _, allowPrivateNetwork := range []bool{true, false} {
+		config := requestScopedProviderConfig(allowPrivateNetwork)
+		// Provider constructors run CheckAndSetDefaults, which must keep the value unclamped.
+		config.CheckAndSetDefaults()
+		if got := config.NetworkConfig.MaxConnsPerHost; got != math.MaxInt {
+			t.Errorf("requestScopedProviderConfig(%v): MaxConnsPerHost = %d after CheckAndSetDefaults, want math.MaxInt", allowPrivateNetwork, got)
+		}
+	}
+	if schemas.DefaultNetworkConfig.MaxConnsPerHost != schemas.DefaultMaxConnsPerHost {
+		t.Errorf("DefaultNetworkConfig.MaxConnsPerHost = %d, want %d", schemas.DefaultNetworkConfig.MaxConnsPerHost, schemas.DefaultMaxConnsPerHost)
 	}
 }
