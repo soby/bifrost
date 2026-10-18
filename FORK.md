@@ -82,6 +82,7 @@ New on this branch:
 | #20 | Optional `schemas.HTTPTransportStreamChunksPlugin`: an HTTP transport plugin can turn one streamed chunk into zero or more chunks, each continuing through the remaining plugins and written in order; see "Transport" below |
 | #22 | Request-scoped Bedrock takes a base URL for model invocation only (Converse and InvokeModel, unary and streaming); every other Bedrock service refuses one. The instance's net/http client dials directly through the private-network checks; see "Bedrock base URL" below |
 | #23 | **Upstream candidate for #2030.** Request-scoped attempts have no per-instance concurrency cap: the 1000-slot semaphore (`schemas.DefaultConcurrency`) is gone, so an attempt is bounded only by admission, its request context and its attempt timeout |
+| #25 | **Upstream candidate.** `schemas.SetConnectionObserver`: a process-wide `ConnectionObserver` hears provider connections opened and closed (fasthttp and net/http dialers) and each request's acquisition (address, reused, wait including dial and TLS), from `contextTransport` and an `httptrace` in `DoHTTPRequest`; nothing is wrapped or timed without an observer |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
