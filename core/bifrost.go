@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -5112,17 +5111,17 @@ type requestScopedProvider struct {
 // request timeout does not cap a response; the request's context and the attempt's request
 // timeout bound it.
 //
-// Fork-only: there is no per-host connection cap (NetworkConfig.UnboundedConnsPerHost). A
-// client opens a new connection whenever no idle one is free, so an attempt never waits for a
-// connection and the client's connection-wait timeout is never reached; the request's context
-// and the attempt's request timeout bound the dial like the rest of the attempt.
+// Fork-only: there is no per-host connection cap (NetworkConfig.UnboundedConnsPerHost, applied
+// by CheckAndSetDefaults in every provider constructor). A client opens a new connection
+// whenever no idle one is free, so an attempt never waits for a free connection and the
+// client's connection-wait timeout is never reached. The dial itself keeps its existing
+// bounds (the client's dial timeout).
 func requestScopedProviderConfig(allowPrivateNetwork bool) *schemas.ProviderConfig {
 	networkConfig := schemas.DefaultNetworkConfig
 	networkConfig.AllowPrivateNetwork = allowPrivateNetwork
 	networkConfig.LoopbackIsPrivate = true
 	networkConfig.ContextBoundReads = true
 	networkConfig.UnboundedConnsPerHost = true
-	networkConfig.MaxConnsPerHost = math.MaxInt
 	return &schemas.ProviderConfig{
 		NetworkConfig:            networkConfig,
 		ConcurrencyAndBufferSize: schemas.ConcurrencyAndBufferSize{Concurrency: 1, BufferSize: 1},
