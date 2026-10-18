@@ -588,7 +588,7 @@ func DoHTTPRequest(client *http.Client, req *http.Request) (*http.Response, erro
 		req = req.WithContext(attemptCtx)
 	}
 	startTime := time.Now()
-	resp, err := client.Do(req)
+	resp, err := client.Do(withConnectionTrace(req))
 	schemas.ObserveUpstreamWait(req.Context(), startTime)
 	if err == nil && resp != nil && resp.Body != nil {
 		resp.Body = &upstreamTimingBody{inner: resp.Body, ctx: req.Context()}
@@ -851,7 +851,7 @@ func configureDialer(client *fasthttp.Client, allowPrivateNetwork, loopbackIsPri
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetKeepAliveConfig(keepAliveCfg)
 		}
-		return conn, nil
+		return observeDialedConn(conn, addr), nil
 	}
 
 	return client
@@ -904,7 +904,7 @@ func NetHTTPDialContextFor(networkConfig schemas.NetworkConfig, timeout time.Dur
 			}
 			conn, err := dialer.DialContext(ctx, netw, net.JoinHostPort(ip.String(), port))
 			if err == nil {
-				return conn, nil
+				return observeDialedConn(conn, addr), nil
 			}
 			lastErr = err
 		}
