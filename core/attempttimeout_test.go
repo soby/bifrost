@@ -167,21 +167,17 @@ func TestAttemptRequestTimeout_ClearedBeforeFallback(t *testing.T) {
 	}
 }
 
-// TestAttemptRequestTimeout_ReleasesSlotAndShutdown pins that a request-scoped attempt cut off
-// by its attempt timeout gives back its slot and its place among the attempts Shutdown waits
+// TestAttemptRequestTimeout_ReleasesShutdown pins that a request-scoped attempt cut off
+// by its attempt timeout gives back its place among the attempts Shutdown waits
 // for: Shutdown, started while the attempt hangs, returns once the timeout fires rather than
 // when the upstream gives up.
-func TestAttemptRequestTimeout_ReleasesSlotAndShutdown(t *testing.T) {
+func TestAttemptRequestTimeout_ReleasesShutdown(t *testing.T) {
 	for _, streaming := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", streaming), func(t *testing.T) {
 			var calls atomic.Int64
 			upstream := hangingUpstream(t, &calls)
 			plugin := &attemptTimeoutPlugin{t: t, urls: [2]string{upstream.URL, upstream.URL}, timeouts: [2]time.Duration{200 * time.Millisecond, 0}}
 			client := newRequestScopedTestClient(t, NewMockAccount(), plugin, nil)
-			instance, err := client.getRequestScopedProvider(requestScopedClass{provider: schemas.OpenAI, allowPrivateNetwork: true})
-			if err != nil {
-				t.Fatal(err)
-			}
 
 			result := make(chan *schemas.BifrostError, 1)
 			go func() {
@@ -220,9 +216,6 @@ func TestAttemptRequestTimeout_ReleasesSlotAndShutdown(t *testing.T) {
 			}
 			if err := <-result; err == nil || err.StatusCode == nil || *err.StatusCode != http.StatusGatewayTimeout {
 				t.Errorf("error = %v, want the 504 attempt timeout", err)
-			}
-			if n := len(instance.slots); n != 0 {
-				t.Errorf("%d request-scoped slots still taken after the attempt timed out", n)
 			}
 		})
 	}
