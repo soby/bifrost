@@ -904,7 +904,7 @@ func NetHTTPDialContextFor(networkConfig schemas.NetworkConfig, timeout time.Dur
 			}
 			conn, err := dialer.DialContext(ctx, netw, net.JoinHostPort(ip.String(), port))
 			if err == nil {
-				return observeDialedConn(conn, addr), nil
+				return conn, nil
 			}
 			lastErr = err
 		}

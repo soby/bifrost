@@ -2,6 +2,8 @@ package utils
 
 import (
 	"context"
+	"crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -103,7 +105,7 @@ func TestConnectionObserver_FastHTTP(t *testing.T) {
 	assertConnectionLifecycle(t, observer.snapshot())
 }
 
-// The same lifecycle on a net/http client dialing through NetHTTPDialContextFor.
+// The same lifecycle on a net/http client dialing through ObservedDialContext.
 func TestConnectionObserver_NetHTTP(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -111,7 +113,7 @@ func TestConnectionObserver_NetHTTP(t *testing.T) {
 	defer server.Close()
 	observer := installRecordingConnectionObserver(t, server.URL)
 
-	transport := &http.Transport{DialContext: NetHTTPDialContextFor(schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true}, 5*time.Second)}
+	transport := &http.Transport{DialContext: ObservedDialContext(NetHTTPDialContextFor(schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true}, 5*time.Second))}
 	client := &http.Client{Transport: transport}
 	for range 2 {
 		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
@@ -142,5 +144,51 @@ func TestConnectionObserver_UnsetWrapsNothing(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 	if _, wrapped := conn.(*observedConn); wrapped {
 		t.Fatal("connection wrapped with no observer installed")
+	}
+}
+
+// A custom dialer that returns an established TLS connection keeps working with an observer
+// installed: the wrapper keeps Handshake, so fasthttp does not add a second TLS layer.
+func TestConnectionObserver_PreEstablishedTLS(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+	addr := strings.TrimPrefix(server.URL, "https://")
+	tlsConfig := server.Client().Transport.(*http.Transport).TLSClientConfig
+	for _, observed := range []bool{false, true} {
+		if observed {
+			installRecordingConnectionObserver(t, "http://"+addr)
+		}
+		client := ConfigureDialer(&fasthttp.Client{
+			ReadTimeout: 5 * time.Second,
+			Dial: func(target string) (net.Conn, error) {
+				raw, err := net.Dial("tcp", target)
+				if err != nil {
+					return nil, err
+				}
+				config := tlsConfig.Clone()
+				config.ServerName = "example.com" // httptest's certificate names example.com
+				conn := tls.Client(raw, config)
+				if err := conn.Handshake(); err != nil {
+					_ = raw.Close()
+					return nil, err
+				}
+				return conn, nil
+			},
+		}, true)
+		req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
+		req.SetRequestURI(server.URL)
+		_, bifrostErr, wait := MakeRequestWithContext(context.Background(), client, req, resp)
+		wait()
+		if bifrostErr != nil {
+			t.Fatalf("observer installed=%v: %v", observed, bifrostErr.Error)
+		}
+		if string(resp.Body()) != "ok" {
+			t.Fatalf("observer installed=%v: body %q", observed, resp.Body())
+		}
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+		client.CloseIdleConnections()
 	}
 }

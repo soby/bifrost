@@ -7,15 +7,20 @@ import (
 
 // ConnectionObserver receives events about the outbound HTTP connections that provider
 // clients open to upstream hosts, so an embedding application can export connection metrics.
-// addr is the upstream "host:port" the client dialed. Implementations must be safe for
+// addr is the "host:port" the client connected to. Implementations must be safe for
 // concurrent use and must return quickly: every method runs on the request path.
 type ConnectionObserver interface {
-	// ConnectionAcquired runs once for every request a client sends, after it has a
-	// connection. reused reports a connection taken from the pool; wait is the time spent
-	// obtaining the connection, which for a new one includes the dial and TLS handshake.
+	// ConnectionAcquired runs once per successful connection acquisition, including a
+	// transport retry after a stale pooled connection; a failed acquisition reports nothing.
+	// reused reports a connection taken from the pool; wait is the time spent obtaining it,
+	// which for a new one includes the dial and TLS handshake. Every client that sends
+	// through Bifrost's transports reports acquisitions, auxiliary ones (auth, media fetches)
+	// included.
 	ConnectionAcquired(addr string, reused bool, wait time.Duration)
-	// ConnectionOpened runs when a client has dialed a new connection, and ConnectionClosed
-	// exactly once when that connection is closed.
+	// ConnectionOpened runs when a provider inference client has dialed a new connection, and
+	// ConnectionClosed exactly once when that connection is closed. Through a proxy, addr is
+	// the proxy's for a net/http client and the target's for a fasthttp one. Auxiliary clients'
+	// connections are not reported.
 	ConnectionOpened(addr string)
 	ConnectionClosed(addr string)
 }

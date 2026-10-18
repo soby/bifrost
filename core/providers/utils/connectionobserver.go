@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -11,9 +12,10 @@ import (
 )
 
 // This file reports provider connections to the schemas.ConnectionObserver, when one is
-// installed: a dialed connection is wrapped so its Close is reported, contextTransport reports
-// each fasthttp connection acquisition, and DoHTTPRequest traces net/http ones. With no
-// observer installed nothing is wrapped, traced or timed.
+// installed: a connection dialed by a provider client (ConfigureDialer/ConfigureDialerFor for
+// fasthttp, ObservedDialContext for net/http) is wrapped so its Close is reported,
+// contextTransport reports each fasthttp connection acquisition, and DoHTTPRequest traces
+// net/http ones. With no observer installed nothing is wrapped, traced or timed.
 
 // observedConn reports its first Close to the observer that saw it open.
 type observedConn struct {
@@ -30,6 +32,15 @@ func (c *observedConn) Close() error {
 	return c.Conn.Close()
 }
 
+// observedHandshakeConn keeps the Handshake method of a dialed connection that already speaks
+// TLS, which clients check for before adding their own TLS layer.
+type observedHandshakeConn struct {
+	*observedConn
+	handshaker interface{ Handshake() error }
+}
+
+func (c *observedHandshakeConn) Handshake() error { return c.handshaker.Handshake() }
+
 // observeDialedConn reports a connection just dialed to addr and returns it wrapped so its
 // close is reported too. Without an observer it returns conn unchanged.
 func observeDialedConn(conn net.Conn, addr string) net.Conn {
@@ -38,7 +49,27 @@ func observeDialedConn(conn net.Conn, addr string) net.Conn {
 		return conn
 	}
 	observer.ConnectionOpened(addr)
-	return &observedConn{Conn: conn, observer: observer, addr: addr}
+	observed := &observedConn{Conn: conn, observer: observer, addr: addr}
+	if handshaker, ok := conn.(interface{ Handshake() error }); ok {
+		return &observedHandshakeConn{observedConn: observed, handshaker: handshaker}
+	}
+	return observed
+}
+
+// ObservedDialContext returns dial wrapped so the connections it opens are reported to the
+// connection observer; a nil dial is net/http's default (a zero net.Dialer). Through a proxy
+// the reported address is the proxy's, since that is the connection dialed.
+func ObservedDialContext(dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return observeDialedConn(conn, addr), nil
+	}
 }
 
 // connectionAcquireStart returns the time an acquisition starts, or the zero time when no
