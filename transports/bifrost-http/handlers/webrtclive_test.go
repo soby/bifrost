@@ -172,6 +172,10 @@ func TestLiveWebRTCRelayEndToEnd(t *testing.T) {
 	require.Nil(t, meter.admit("gpt-live-1", "gpt-5.6-luna"))
 	messages := &liveWebRTCMessages{}
 	messages.liveSessionController = newTestLiveController(fakeLiveModels{allowed: false}, meter, messages)
+	// Data channel messages ride SCTP over loopback UDP, where one dropped datagram costs a
+	// retransmission of about a second. The relay must wait for session.closed past that, as it
+	// does in production, or a single retransmission abandons the upstream before the reply.
+	messages.liveSessionController.drainTimeout = liveCloseDrainTimeout
 	closed := make(chan struct{})
 	var closeOnce sync.Once
 
