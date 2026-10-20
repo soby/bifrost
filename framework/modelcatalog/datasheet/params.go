@@ -180,6 +180,10 @@ func (s *Store) loadModelParametersFromURL(ctx context.Context) (map[string]json
 func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int {
 	newResponseTypes := make(map[string][]string, len(paramsData))
 	newParamsIndex := make(map[string][]string, len(paramsData))
+	var newRows map[string]string
+	if s.configStore == nil {
+		newRows = make(map[string]string, len(paramsData))
+	}
 	applied := 0
 
 	for model, rawData := range paramsData {
@@ -198,6 +202,9 @@ func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int 
 		// feed of empty rows clear the capability cache with nothing to refill it.
 		if !IsEmptyModelCapabilities(&caps) {
 			applied++
+		}
+		if newRows != nil {
+			newRows[model] = string(rawData)
 		}
 
 		outputs := make([]string, 0, len(caps.SupportedEndpoints))
@@ -254,6 +261,9 @@ func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int 
 	s.mu.Lock()
 	s.supportedResponseTypes = newResponseTypes
 	s.supportedParams = newParamsIndex
+	if newRows != nil {
+		s.parameterRows = newRows
+	}
 	s.mu.Unlock()
 
 	// Anything cached against the previous sheet — records and "no such model"
@@ -273,7 +283,8 @@ func (s *Store) SetOnModelParametersApplied(fn func()) {
 }
 
 // LoadModelCapabilities resolves a runtime (provider, model) pair to its
-// capability record by reading datasheet rows out of the DB. It is the loader
+// capability record by reading datasheet rows out of the DB, or out of memory
+// when there is no config store. It is the loader
 // behind the provider-utils capability cache, and it owns the key translation
 // that cache deliberately knows nothing about: the datasheet keys rows by a raw,
 // often provider-prefixed name ("azure/gpt-5.1-chat") while callers ask by bare
@@ -287,12 +298,12 @@ func (s *Store) SetOnModelParametersApplied(fn func()) {
 // store failure returns an error instead, which keeps the caller from caching
 // "no capabilities" for a model whose row exists but was unreachable.
 func (s *Store) LoadModelCapabilities(ctx context.Context, provider schemas.ModelProvider, model string) (*schemas.ModelCapabilities, error) {
-	if s.configStore == nil || model == "" {
+	if model == "" {
 		return nil, nil
 	}
 	candidates := s.modelParameterCandidates(model)
 	for _, candidate := range candidates {
-		row, err := s.configStore.GetModelParametersByModel(ctx, candidate)
+		row, err := s.modelParametersRow(ctx, candidate)
 		if err != nil {
 			if errors.Is(err, configstore.ErrNotFound) {
 				continue
@@ -317,14 +328,28 @@ func (s *Store) LoadModelCapabilities(ctx context.Context, provider schemas.Mode
 	return nil, nil
 }
 
-// GetModelParametersByModel reads a single model-parameter row from the DB.
-// Used by the composer's cache-miss handler — installed via
-// providerUtils.SetCacheMissHandler in the composer's Init.
+// GetModelParametersByModel reads a single model-parameter row from the DB,
+// or from memory when there is no config store. Used by the composer's
+// cache-miss handler — installed via providerUtils.SetCacheMissHandler in the
+// composer's Init.
 func (s *Store) GetModelParametersByModel(ctx context.Context, model string) (*configstoreTables.TableModelParameters, error) {
-	if s.configStore == nil {
-		return nil, nil
+	return s.modelParametersRow(ctx, model)
+}
+
+// modelParametersRow reads one model-parameters row from the config store, or
+// from the rows the last model-parameters load kept in memory when there is
+// no store. A missing row is configstore.ErrNotFound either way.
+func (s *Store) modelParametersRow(ctx context.Context, model string) (*configstoreTables.TableModelParameters, error) {
+	if s.configStore != nil {
+		return s.configStore.GetModelParametersByModel(ctx, model)
 	}
-	return s.configStore.GetModelParametersByModel(ctx, model)
+	s.mu.RLock()
+	data, ok := s.parameterRows[model]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, configstore.ErrNotFound
+	}
+	return &configstoreTables.TableModelParameters{Model: model, Data: data}, nil
 }
 
 // ResolveModelParameters looks up a model-parameter row for model, falling
@@ -335,12 +360,9 @@ func (s *Store) GetModelParametersByModel(ctx context.Context, model string) (*c
 // resolution to land on the stored key. Mirrors GetCapabilityEntry's
 // exact → stripped → base-model fallback chain.
 func (s *Store) ResolveModelParameters(ctx context.Context, model string) (*configstoreTables.TableModelParameters, error) {
-	if s.configStore == nil {
-		return nil, nil
-	}
 	var firstErr error
 	for _, candidate := range s.modelParameterCandidates(model) {
-		params, err := s.configStore.GetModelParametersByModel(ctx, candidate)
+		params, err := s.modelParametersRow(ctx, candidate)
 		if err == nil {
 			return params, nil
 		}
