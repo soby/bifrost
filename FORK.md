@@ -84,6 +84,7 @@ New on this branch:
 | #23 | **Also on #2030 since d1eafc121.** Request-scoped attempts have no per-instance concurrency cap: the 1000-slot semaphore (`schemas.DefaultConcurrency`) is gone, so an attempt is bounded only by admission, its request context and its attempt timeout |
 | #24 | **Upstream candidate for #2030.** Request-scoped instances have no per-host connection cap: runtime-only `NetworkConfig.UnboundedConnsPerHost` makes `MaxConnsPerHost` `math.MaxInt` through `CheckAndSetDefaults`, so a request never waits for a free connection; its context and attempt timeout bound it |
 | #25 | **Upstream candidate.** `schemas.SetConnectionObserver`: a process-wide `ConnectionObserver` hears provider connections opened and closed (fasthttp and net/http dialers) and each request's acquisition (address, reused, wait including dial and TLS), from `contextTransport` and an `httptrace` in `DoHTTPRequest`; nothing is wrapped or timed without an observer |
+| #27 | **Integration-only.** Without a config store the model catalog serves capability records and model-parameter rows from the in-memory datasheet (`LoadModelCapabilities`, `GetModelParametersByModel`, `ResolveModelParameters`), so a datasheet `max_output_tokens` still sets the default output limit |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's
