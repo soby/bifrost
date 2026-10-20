@@ -89,6 +89,7 @@ New on this branch:
 | #29 | **Integration-only.** Without a config store `GET /api/models/parameters` serves rows from the in-memory model catalog instead of refusing with 503; it refuses only when it has neither a catalog nor a store |
 | #29 | Two-hunk backport of upstream a404aa7e0 (handler and test): agent gateway protocol requests build the card origin from the configured A2A external URL (`lib.BuildBaseURL(ctx, h.config.GetA2AExternalClientURL())`), not the request's Host, and the test configures that URL, so `TestAgentGatewayExtendedCardFollowsEnforcementSetting` passes. Drop at the next refresh |
 | #29 | Test-only: `TestLiveWebRTCRelayEndToEnd` waits for `session.closed` with the production drain timeout instead of the test controller's 1 s, which one SCTP retransmission over loopback exceeds; the flake also occurs on upstream dev. Drop at a refresh once upstream fixes the test |
+| #30 | **Upstream candidate.** The Azure deployment route decodes its `deploymentPath` once before parsing it, so an escaped slash (`provider%2Fmodel`) selects provider and model as the unescaped path does; a malformed escape is a 400 |
 
 Dropped from the previous runtime branch: the earlier `ProviderOverride` / provider auto-init
 implementation (503e90ef9, a42f4fb7a, 047ae6692, a9e7eb0c5, 16d994bca; replaced by #2030's

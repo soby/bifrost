@@ -178,6 +178,14 @@ func AzureEndpointPreHook(handlerStore lib.HandlerStore) func(ctx *fasthttp.Requ
 			return nil
 		}
 
+		// The router passes the raw path, so decode it once before parsing:
+		// a client that escapes the slashes in "provider/model" sends
+		// "provider%2Fmodel" as the deployment.
+		deploymentPath, err := url.PathUnescape(deploymentPath)
+		if err != nil {
+			return fmt.Errorf("invalid azure deployment path: %w", err)
+		}
+
 		// Example:
 		// gpt-4o/chat/completions
 		// openai/gpt-4o/chat/completions
