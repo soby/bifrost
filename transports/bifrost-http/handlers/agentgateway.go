@@ -861,7 +861,7 @@ func (h *AgentGatewayHandler) serveProtocol(ctx *fasthttp.RequestCtx, binding ag
 		}
 	}
 	downstreamTransport := binding.String()
-	requestOrigin := lib.BuildBaseURL(ctx, "")
+	requestOrigin := lib.BuildBaseURL(ctx, h.config.GetA2AExternalClientURL())
 	ctx.SetUserValue(schemas.BifrostContextKeyA2ADownstreamTransport, downstreamTransport)
 	ctx.SetUserValue(schemas.BifrostContextKeyA2ARequestOrigin, requestOrigin)
 	if bifrostCtx, ok := ctx.UserValue(agentGatewayBifrostContextKey).(*schemas.BifrostContext); ok {

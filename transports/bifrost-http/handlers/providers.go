@@ -1303,21 +1303,21 @@ func (h *ProviderHandler) getModelParameters(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if h.dbStore == nil {
-		SendError(ctx, fasthttp.StatusServiceUnavailable, "database store not available")
-		return
-	}
-
 	// Prefer catalog-aware resolution so provider-qualified IDs from
 	// /v1/models ("openai/gpt-5.5", "openrouter/openai/gpt-5.5") and bare
 	// aliases resolve to the datasheet's stored key instead of 404ing on an
-	// exact-match miss.
+	// exact-match miss. The catalog also serves the rows without a config
+	// store, from the datasheet it loaded into memory.
 	var params *tables.TableModelParameters
 	var err error
-	if h.inMemoryStore != nil && h.inMemoryStore.ModelCatalog != nil {
+	switch {
+	case h.inMemoryStore != nil && h.inMemoryStore.ModelCatalog != nil:
 		params, err = h.inMemoryStore.ModelCatalog.ResolveModelParameters(ctx, modelParam)
-	} else {
+	case h.dbStore != nil:
 		params, err = h.dbStore.GetModelParametersByModel(ctx, modelParam)
+	default:
+		SendError(ctx, fasthttp.StatusServiceUnavailable, "database store not available")
+		return
 	}
 	if err == nil && params == nil {
 		err = configstore.ErrNotFound
