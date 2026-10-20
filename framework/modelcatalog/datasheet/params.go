@@ -113,6 +113,9 @@ func (s *Store) LoadModelParamsFromURLIntoMemory(ctx context.Context) error {
 		return fmt.Errorf("failed to load model parameters from URL: %w", err)
 	}
 	s.applyModelParameters(paramsData)
+	if s.logger != nil {
+		s.logger.Info("successfully synced %d model parameters records", len(paramsData))
+	}
 	return nil
 }
 
