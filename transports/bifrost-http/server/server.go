@@ -3125,6 +3125,19 @@ func startSkillsOrphanCleanupWorker(ctx context.Context, config *lib.Config, sho
 	}()
 }
 
+// storelessAPIMiddlewares guards /api on a server without a config store. There is no admin
+// account to sign in with, so (OSS only, as with a store) the setup lock keeps /api closed to
+// any call without the setup token, exactly as before an admin account exists. Every request
+// it admits is then marked as bypassed; otherwise the handlers that require genuine auth for
+// dangerous changes see an unmarked request and let it through.
+func storelessAPIMiddlewares(ctx context.Context, setupToken string) []schemas.BifrostHTTPMiddleware {
+	var chain []schemas.BifrostHTTPMiddleware
+	if ctx.Value(schemas.BifrostContextKeyIsEnterprise) == nil {
+		chain = append(chain, handlers.NewStorelessSetupLock(setupToken).SetupLockMiddleware())
+	}
+	return append(chain, handlers.AuthBypassedMiddleware())
+}
+
 // Bootstrap initializes the Bifrost HTTP server with all necessary components.
 // It:
 // 1. Initializes Prometheus collectors for monitoring
@@ -3315,10 +3328,7 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	inferenceMiddlewares := commonMiddlewares
 	if s.Config.ConfigStore == nil {
 		logger.Error("auth middleware requires config store, skipping auth middleware initialization")
-		// No auth runs in this mode, so mark every API request as bypassed; otherwise the
-		// handlers that require genuine auth for dangerous changes see an unmarked request and
-		// let it through.
-		apiMiddlewares = append(apiMiddlewares, handlers.AuthBypassedMiddleware())
+		apiMiddlewares = append(apiMiddlewares, storelessAPIMiddlewares(ctx, s.Config.SetupToken)...)
 	} else {
 		// Use a signed (stateless) ticket store when an encryption key is configured
 		// so tickets are verifiable across nodes; otherwise fall back to in-memory.

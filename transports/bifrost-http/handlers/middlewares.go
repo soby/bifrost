@@ -1338,6 +1338,19 @@ func (m *AuthMiddleware) CheckConfiguredSetupToken(token string) bool {
 	return subtle.ConstantTimeCompare([]byte(*current), []byte(token)) == 1
 }
 
+// NewStorelessSetupLock returns an AuthMiddleware for a server without a config store. It
+// holds only the operator-configured setup token (pass "" when none is configured): with no
+// store there is no admin account, so dashboard auth is never active and its
+// SetupLockMiddleware keeps /api locked, letting through only public routes and calls that
+// carry the setup token. Nothing else on it is usable without a store.
+func NewStorelessSetupLock(configuredSetupToken string) *AuthMiddleware {
+	am := &AuthMiddleware{}
+	if configuredSetupToken != "" {
+		am.setupToken.Store(&configuredSetupToken)
+	}
+	return am
+}
+
 // UpdateWhitelistedRoutes updates the configured whitelisted routes that bypass auth middleware.
 func (m *AuthMiddleware) UpdateWhitelistedRoutes(routes []string) {
 	m.whitelistedRoutes.Store(&routes)
