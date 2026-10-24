@@ -1722,6 +1722,9 @@ func toBedrockInvokeAnthropicResponse(resp *schemas.BifrostResponsesResponse, mo
 	result := &BedrockInvokeMessagesResponse{
 		Type: "message",
 		Role: "assistant",
+		// Anthropic Messages always carries a content list; a reply with no
+		// renderable blocks is [] (as the native Anthropic renderer writes), never null.
+		Content: []BedrockInvokeMessagesContentBlock{},
 	}
 
 	if resp.ID != nil {
@@ -1741,6 +1744,14 @@ func toBedrockInvokeAnthropicResponse(resp *schemas.BifrostResponsesResponse, mo
 	for _, item := range resp.Output {
 		// Text content from message items
 		if item.Type != nil && *item.Type == schemas.ResponsesMessageTypeMessage && item.Content != nil {
+			// A message carries its text as blocks or as one string, as the
+			// native Anthropic renderer reads it.
+			if item.Content.ContentBlocks == nil && item.Content.ContentStr != nil {
+				result.Content = append(result.Content, BedrockInvokeMessagesContentBlock{
+					Type: "text",
+					Text: *item.Content.ContentStr,
+				})
+			}
 			for _, contentPart := range item.Content.ContentBlocks {
 				if contentPart.Text != nil {
 					result.Content = append(result.Content, BedrockInvokeMessagesContentBlock{

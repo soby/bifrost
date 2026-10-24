@@ -61,7 +61,8 @@
           "var __u = (pm.request && pm.request.url && pm.request.url.toString()) || '';",
           "// Management API (/api/...) and OAuth (/oauth2/...) responses carry no inference content, so the shape check does not apply to them; those rows assert their own bodies.",
           "var __skipShape = __u.indexOf('/api/') !== -1 || __u.indexOf('/oauth2/') !== -1 || (__u.indexOf('/files/') !== -1 && (__u.indexOf('/content?') !== -1 || __u.slice(-8) === '/content')) || __u.indexOf('storage.googleapis.com') !== -1 || __u.indexOf('batchPredictionJobs') !== -1 || (__u.indexOf('/genai/v1beta/batches/') !== -1 && __u.indexOf(':cancel') !== -1) || (__u.indexOf('cachedContents') !== -1 && (pm.request.method !== 'GET' || __u.indexOf('/cachedContents/') !== -1)) || __u.indexOf('/v1/containers') !== -1 || __u.indexOf('/upload/v1beta/files') !== -1 || (__u.indexOf('/genai/v1beta/files/') !== -1 && pm.request.method === 'DELETE') || (__u.indexOf('/model-invocation-job/') !== -1 && __u.slice(-5) === '/stop') || (__u.indexOf('/messages/batches/') !== -1 && __u.indexOf('/results') !== -1) || __u.indexOf('/tunedModels') !== -1 || __u.indexOf('/bedrock_passthrough/') !== -1;",
-          "if (pm.response.code < 400 && !__skipShape && (pm.response.headers.get('content-type') || '').indexOf('text/event-stream') === -1 && (pm.response.headers.get('content-type') || '').indexOf('vnd.amazon.eventstream') === -1 && (pm.response.headers.get('content-type') || '').indexOf('audio/') === -1) {",
+          "// Rows tagged [EMPTY-REPLY] assert a completed reply with no content blocks, so they check the empty content list themselves.",
+          "if (pm.response.code < 400 && !__skipShape && __rn.indexOf('[EMPTY-REPLY]') === -1 && (pm.response.headers.get('content-type') || '').indexOf('text/event-stream') === -1 && (pm.response.headers.get('content-type') || '').indexOf('vnd.amazon.eventstream') === -1 && (pm.response.headers.get('content-type') || '').indexOf('audio/') === -1) {",
           "  pm.test('Response has content (text or tool_use)', function () {",
           "    var j;",
           "    try { j = pm.response.json(); } catch (e) {",
@@ -206769,6 +206770,119 @@
               "path": [
                 "v1",
                 "decisions"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "183. Bedrock invoke renders an empty reply as content [] and keeps string message text (bedrock-invoke-content)",
+      "description": "Local fixture regression like folder 154: run with providerErrorFixture=1 against the isolated gateway. A Bedrock invoke Messages request for openai/gpt-5-pro goes to /v1/responses upstream and is rendered back as an Anthropic Messages body. The fixture answers two marker user texts with fixed completed envelopes: one with no output items, one whose message carries its text as a plain string. Before the fix the first rendered content:null and the second dropped the text. 183.1 is tagged [EMPTY-REPLY] so the collection-wide nonempty-content check does not apply; it asserts the empty list itself.",
+      "item": [
+        {
+          "name": "183.1 [EMPTY-REPLY] bedrock invoke openai/gpt-5-pro completed reply with no output renders content as an empty list",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.variables.get('providerErrorFixture') !== '1') {",
+                  "  pm.execution.skipRequest();",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var j = pm.response.json();",
+                  "pm.test('an Anthropic Messages body', function () { pm.expect(j.type, pm.response.text().slice(0, 400)).to.equal('message'); pm.expect(j.role).to.equal('assistant'); });",
+                  "pm.test('content is an empty list, not null', function () { pm.expect(Array.isArray(j.content), pm.response.text().slice(0, 400)).to.equal(true); pm.expect(j.content.length).to.equal(0); });",
+                  "pm.test('the turn ended normally', function () { pm.expect(j.stop_reason, pm.response.text().slice(0, 400)).to.equal('end_turn'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"anthropic_version\": \"bedrock-2023-05-31\",\n  \"max_tokens\": 16,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"bedrock fixture empty completed reply\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bedrock/model/openai%2Fgpt-5-pro/invoke",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "bedrock",
+                "model",
+                "openai%2Fgpt-5-pro",
+                "invoke"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "183.2 bedrock invoke openai/gpt-5-pro message with string content renders one text block",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.variables.get('providerErrorFixture') !== '1') {",
+                  "  pm.execution.skipRequest();",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var j = pm.response.json();",
+                  "pm.test('exactly one text block carrying the string', function () { pm.expect(j.content, pm.response.text().slice(0, 400)).to.deep.equal([{ type: 'text', text: 'fixture string reply' }]); });",
+                  "pm.test('the turn ended normally', function () { pm.expect(j.stop_reason, pm.response.text().slice(0, 400)).to.equal('end_turn'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"anthropic_version\": \"bedrock-2023-05-31\",\n  \"max_tokens\": 16,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"bedrock fixture string content reply\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bedrock/model/openai%2Fgpt-5-pro/invoke",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "bedrock",
+                "model",
+                "openai%2Fgpt-5-pro",
+                "invoke"
               ]
             }
           },
