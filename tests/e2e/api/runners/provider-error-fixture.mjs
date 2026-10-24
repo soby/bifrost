@@ -49,8 +49,44 @@ const azureFiltered = () => ({
 // how a gateway that mints a fresh id on replay shows up as a 400.
 const REASONING_ID = "rs_fixture_original";
 const REASONING_TOKEN = "enc-token-fixture";
+// Two user texts select fixed completed envelopes for the Bedrock invoke renderer cases (folder 183):
+// one with no output items, one whose message carries its text as a plain string instead of blocks.
+const EMPTY_REPLY_MARKER = "bedrock fixture empty completed reply";
+const STRING_REPLY_MARKER = "bedrock fixture string content reply";
+const userTexts = (input) =>
+	input
+		.filter((item) => item && item.role === "user")
+		.flatMap((item) =>
+			typeof item.content === "string"
+				? [item.content]
+				: Array.isArray(item.content)
+					? item.content.filter((part) => part && typeof part.text === "string").map((part) => part.text)
+					: [],
+		);
+const completed = (output) => ({
+	status: 200,
+	headers: {},
+	body: JSON.stringify({
+		id: "resp_fixture_1",
+		object: "response",
+		created_at: 1,
+		status: "completed",
+		model: "gpt-5-pro",
+		output,
+		usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+	}),
+});
 const responsesFor = (body, count) => {
 	const input = Array.isArray(body.input) ? body.input : [];
+	const texts = userTexts(input);
+	if (texts.includes(EMPTY_REPLY_MARKER)) {
+		count("empty-reply");
+		return completed([]);
+	}
+	if (texts.includes(STRING_REPLY_MARKER)) {
+		count("string-reply");
+		return completed([{ id: "msg_fixture_string", type: "message", role: "assistant", status: "completed", content: "fixture string reply" }]);
+	}
 	for (const item of input) {
 		if (item && item.type === "reasoning" && item.encrypted_content === REASONING_TOKEN) {
 			if (item.id !== REASONING_ID) {
