@@ -2952,3 +2952,40 @@ func TestInvokeIngressCarriesEagerInputStreaming(t *testing.T) {
 		})
 	}
 }
+
+// TestToBedrockInvokeAnthropicResponse_EmptyOutputIsAnEmptyList: a completed reply
+// with no renderable blocks must still marshal content as a list, as Anthropic
+// Messages always does; clients that require the list otherwise reject it.
+func TestToBedrockInvokeAnthropicResponse_EmptyOutputIsAnEmptyList(t *testing.T) {
+	model := "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+	result := toBedrockInvokeAnthropicResponse(&schemas.BifrostResponsesResponse{Model: model}, model)
+
+	body, err := json.Marshal(result)
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(body, &decoded))
+	content, ok := decoded["content"].([]any)
+	require.True(t, ok, "content must be a JSON list, got %s", body)
+	assert.Empty(t, content)
+}
+
+// TestToBedrockInvokeAnthropicResponse_StringContentBecomesText: a message whose
+// text is a single string, not blocks, renders as one text block instead of
+// being dropped.
+func TestToBedrockInvokeAnthropicResponse_StringContentBecomesText(t *testing.T) {
+	model := "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+	messageType := schemas.ResponsesMessageTypeMessage
+	text := "The deployment needs approval first."
+	resp := &schemas.BifrostResponsesResponse{
+		Model: model,
+		Output: []schemas.ResponsesMessage{{
+			Type:    &messageType,
+			Content: &schemas.ResponsesMessageContent{ContentStr: &text},
+		}},
+	}
+
+	result := toBedrockInvokeAnthropicResponse(resp, model)
+	require.Len(t, result.Content, 1)
+	assert.Equal(t, "text", result.Content[0].Type)
+	assert.Equal(t, text, result.Content[0].Text)
+}
