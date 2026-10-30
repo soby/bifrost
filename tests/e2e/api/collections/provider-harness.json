@@ -206889,6 +206889,226 @@
           "response": []
         }
       ]
+    },
+    {
+      "name": "184. Parallel tool turns stay whole on Responses input and Chat tool results (parallel-tool-turns)",
+      "description": "Two converters split a parallel tool turn in a way the provider rejects. (1) Gemini, Responses input (core/providers/gemini/responses.go convertResponsesMessagesToGeminiContents): consecutive function_call items each became their own model content, so a parallel batch went out as adjacent model turns answered by one user turn with two functionResponse parts; Gemini requires all calls of a turn in one content followed by as many responses. Calls now join the model turn the previous call opened, also across a signature-only reasoning item consumed by the previous call (that signed shape is pinned by Go tests only, because a valid thought signature cannot be fixed in a collection). Both the Anthropic Messages and the OpenAI Responses ingress reach this converter; the requests succeed either way on some models, so raw_request is the pin. (2) Bedrock Converse, Chat input (core/providers/bedrock/utils.go convertMessages): a user message after a run of tool messages became a second adjacent user turn, which Converse refuses with a ValidationException; it now joins the toolResult turn behind the results. Run with PROVIDER=gemini and PROVIDER=bedrock, FEATURE=\"parallel-tool-turns\".",
+      "item": [
+        {
+          "name": "gemini/gemini-3.7-flash /anthropic/v1/messages parallel tool_use batch stays one model turn - parallel-tool-turns",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Gemini requires every call of a parallel batch in ONE model content, followed by one user content",
+                  "// with as many functionResponse parts. Red pre-fix: each function_call became its own model content.",
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('gemini/gemini-3.7-flash anthropic parallel batch: HTTP 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 800)).to.equal(200);",
+                  "});",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('gemini/gemini-3.7-flash anthropic parallel batch: raw_request captured', function () {",
+                  "  pm.expect(rr, 'raw_request missing - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 800)).to.be.an('object');",
+                  "});",
+                  "rr = rr || {};",
+                  "var contents = rr.contents || [];",
+                  "var dump = JSON.stringify(contents).slice(0, 1500);",
+                  "var callTurns = [];",
+                  "contents.forEach(function (c, i) {",
+                  "  var calls = (c.parts || []).filter(function (p) { return !!p.functionCall; }).length;",
+                  "  if (calls > 0) { callTurns.push({ index: i, calls: calls }); }",
+                  "});",
+                  "pm.test('gemini/gemini-3.7-flash anthropic parallel batch: both parallel calls share one model turn', function () {",
+                  "  pm.expect(callTurns.length, 'model turns with functionCall parts: ' + dump).to.eql(1);",
+                  "  pm.expect(callTurns[0] && callTurns[0].calls, 'functionCall parts in that turn: ' + dump).to.eql(2);",
+                  "});",
+                  "pm.test('gemini/gemini-3.7-flash anthropic parallel batch: the next turn answers both calls', function () {",
+                  "  var next = callTurns.length ? contents[callTurns[0].index + 1] || {} : {};",
+                  "  var responses = (next.parts || []).filter(function (p) { return !!p.functionResponse; }).length;",
+                  "  pm.expect(next.role, 'turn after the calls: ' + dump).to.equal('user');",
+                  "  pm.expect(responses, 'functionResponse parts after the calls: ' + dump).to.eql(2);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gemini/gemini-3.7-flash\",\n  \"max_tokens\": 64,\n  \"tools\": [\n    {\n      \"name\": \"read_file\",\n      \"description\": \"Read a file\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"path\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"path\"\n        ]\n      }\n    }\n  ],\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Read a.txt and b.txt and tell me which file says what.\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": [\n        {\n          \"type\": \"tool_use\",\n          \"id\": \"toolu_a\",\n          \"name\": \"read_file\",\n          \"input\": {\n            \"path\": \"a.txt\"\n          }\n        },\n        {\n          \"type\": \"tool_use\",\n          \"id\": \"toolu_b\",\n          \"name\": \"read_file\",\n          \"input\": {\n            \"path\": \"b.txt\"\n          }\n        }\n      ]\n    },\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\n          \"type\": \"tool_result\",\n          \"tool_use_id\": \"toolu_a\",\n          \"content\": \"contents of A\"\n        },\n        {\n          \"type\": \"tool_result\",\n          \"tool_use_id\": \"toolu_b\",\n          \"content\": \"contents of B\"\n        },\n        {\n          \"type\": \"text\",\n          \"text\": \"Answer in one sentence.\"\n        }\n      ]\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/anthropic/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "anthropic",
+                "v1",
+                "messages"
+              ]
+            }
+          }
+        },
+        {
+          "name": "gemini/gemini-3.7-flash /v1/responses parallel function_call batch stays one model turn - parallel-tool-turns",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Gemini requires every call of a parallel batch in ONE model content, followed by one user content",
+                  "// with as many functionResponse parts. Red pre-fix: each function_call became its own model content.",
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('gemini/gemini-3.7-flash responses parallel batch: HTTP 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 800)).to.equal(200);",
+                  "});",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('gemini/gemini-3.7-flash responses parallel batch: raw_request captured', function () {",
+                  "  pm.expect(rr, 'raw_request missing - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 800)).to.be.an('object');",
+                  "});",
+                  "rr = rr || {};",
+                  "var contents = rr.contents || [];",
+                  "var dump = JSON.stringify(contents).slice(0, 1500);",
+                  "var callTurns = [];",
+                  "contents.forEach(function (c, i) {",
+                  "  var calls = (c.parts || []).filter(function (p) { return !!p.functionCall; }).length;",
+                  "  if (calls > 0) { callTurns.push({ index: i, calls: calls }); }",
+                  "});",
+                  "pm.test('gemini/gemini-3.7-flash responses parallel batch: both parallel calls share one model turn', function () {",
+                  "  pm.expect(callTurns.length, 'model turns with functionCall parts: ' + dump).to.eql(1);",
+                  "  pm.expect(callTurns[0] && callTurns[0].calls, 'functionCall parts in that turn: ' + dump).to.eql(2);",
+                  "});",
+                  "pm.test('gemini/gemini-3.7-flash responses parallel batch: the next turn answers both calls', function () {",
+                  "  var next = callTurns.length ? contents[callTurns[0].index + 1] || {} : {};",
+                  "  var responses = (next.parts || []).filter(function (p) { return !!p.functionResponse; }).length;",
+                  "  pm.expect(next.role, 'turn after the calls: ' + dump).to.equal('user');",
+                  "  pm.expect(responses, 'functionResponse parts after the calls: ' + dump).to.eql(2);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gemini/gemini-3.7-flash\",\n  \"max_output_tokens\": 64,\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"name\": \"read_file\",\n      \"description\": \"Read a file\",\n      \"parameters\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"path\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"path\"\n        ]\n      }\n    }\n  ],\n  \"input\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"user\",\n      \"content\": \"Read a.txt and b.txt and tell me which file says what.\"\n    },\n    {\n      \"type\": \"function_call\",\n      \"call_id\": \"call_a\",\n      \"name\": \"read_file\",\n      \"arguments\": \"{\\\"path\\\":\\\"a.txt\\\"}\"\n    },\n    {\n      \"type\": \"function_call\",\n      \"call_id\": \"call_b\",\n      \"name\": \"read_file\",\n      \"arguments\": \"{\\\"path\\\":\\\"b.txt\\\"}\"\n    },\n    {\n      \"type\": \"function_call_output\",\n      \"call_id\": \"call_a\",\n      \"output\": \"contents of A\"\n    },\n    {\n      \"type\": \"function_call_output\",\n      \"call_id\": \"call_b\",\n      \"output\": \"contents of B\"\n    },\n    {\n      \"type\": \"message\",\n      \"role\": \"user\",\n      \"content\": \"Answer in one sentence.\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+        {
+          "name": "bedrock/us.amazon.nova-lite-v1:0 /v1/chat/completions tool results and the next user message share one turn - parallel-tool-turns",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Converse requires alternating roles. Tool messages become one user turn of toolResult blocks; the",
+                  "// user message after them must join that turn, behind the results. Red pre-fix: a second adjacent",
+                  "// user turn, which Converse refuses with a ValidationException (HTTP 400).",
+                  "var txt = pm.response.text() || '';",
+                  "pm.test('bedrock/us.amazon.nova-lite-v1:0 tool results then user: HTTP 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 800)).to.equal(200);",
+                  "});",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('bedrock/us.amazon.nova-lite-v1:0 tool results then user: raw_request captured', function () {",
+                  "  pm.expect(rr, 'raw_request missing - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 800)).to.be.an('object');",
+                  "});",
+                  "rr = rr || {};",
+                  "var messages = rr.messages || [];",
+                  "var dump = JSON.stringify(messages).slice(0, 1500);",
+                  "pm.test('bedrock/us.amazon.nova-lite-v1:0 tool results then user: roles alternate', function () {",
+                  "  for (var i = 1; i < messages.length; i++) {",
+                  "    pm.expect(messages[i].role, 'turns ' + (i - 1) + ' and ' + i + ' share a role: ' + dump).to.not.equal(messages[i - 1].role);",
+                  "  }",
+                  "});",
+                  "pm.test('bedrock/us.amazon.nova-lite-v1:0 tool results then user: one user turn holds both results, then the text', function () {",
+                  "  var last = messages[messages.length - 1] || {};",
+                  "  var blocks = last.content || [];",
+                  "  pm.expect(last.role, 'last turn: ' + dump).to.equal('user');",
+                  "  pm.expect(blocks.length, 'blocks in the last turn: ' + dump).to.be.at.least(3);",
+                  "  pm.expect(!!(blocks[0] || {}).toolResult && !!(blocks[1] || {}).toolResult, 'toolResult blocks lead the turn: ' + dump).to.equal(true);",
+                  "  pm.expect((blocks[blocks.length - 1] || {}).text, 'the user text ends the turn: ' + dump).to.equal('Answer in one sentence.');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"bedrock/us.amazon.nova-lite-v1:0\",\n  \"max_tokens\": 64,\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"read_file\",\n        \"description\": \"Read a file\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"path\": {\n              \"type\": \"string\"\n            }\n          },\n          \"required\": [\n            \"path\"\n          ]\n        }\n      }\n    }\n  ],\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Read a.txt and b.txt and tell me which file says what.\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": null,\n      \"tool_calls\": [\n        {\n          \"id\": \"tooluse_a\",\n          \"type\": \"function\",\n          \"function\": {\n            \"name\": \"read_file\",\n            \"arguments\": \"{\\\"path\\\":\\\"a.txt\\\"}\"\n          }\n        },\n        {\n          \"id\": \"tooluse_b\",\n          \"type\": \"function\",\n          \"function\": {\n            \"name\": \"read_file\",\n            \"arguments\": \"{\\\"path\\\":\\\"b.txt\\\"}\"\n          }\n        }\n      ]\n    },\n    {\n      \"role\": \"tool\",\n      \"tool_call_id\": \"tooluse_a\",\n      \"content\": \"contents of A\"\n    },\n    {\n      \"role\": \"tool\",\n      \"tool_call_id\": \"tooluse_b\",\n      \"content\": \"contents of B\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Answer in one sentence.\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            }
+          }
+        }
+      ]
     }
   ]
 }
