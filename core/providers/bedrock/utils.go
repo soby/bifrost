@@ -1690,6 +1690,14 @@ func convertMessages(ctx context.Context, model string, bifrostMessages []schema
 				}
 				pendingReminderBlocks = nil
 			}
+			if n := len(messages); n > 0 && bedrockMsg.Role == BedrockMessageRoleUser &&
+				messages[n-1].Role == BedrockMessageRoleUser && bedrockContentHasToolResult(messages[n-1].Content) {
+				// tool, tool, user: the tool results already opened a user turn, and Converse
+				// rejects two adjacent user turns. The user content joins that turn behind the
+				// toolResult blocks, the same shape the Responses path produces.
+				messages[n-1].Content = append(messages[n-1].Content, bedrockMsg.Content...)
+				continue
+			}
 			messages = append(messages, bedrockMsg)
 
 		case schemas.ChatMessageRoleTool:
@@ -1730,6 +1738,16 @@ func convertMessages(ctx context.Context, model string, bifrostMessages []schema
 	}
 
 	return messages, systemMessages, nil
+}
+
+// bedrockContentHasToolResult reports whether a turn's content carries a toolResult block.
+func bedrockContentHasToolResult(content []BedrockContentBlock) bool {
+	for i := range content {
+		if content[i].ToolResult != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // reasoningSignatureForBedrock returns sig only when it is a non-empty string.

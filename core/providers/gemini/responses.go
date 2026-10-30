@@ -4838,6 +4838,14 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 		pendingFunctionCallIDs = nil
 	}
 
+	// Index in contents of the model turn opened by the most recent function_call, or -1.
+	// Gemini requires the parallel function calls of one model turn to share a single Content,
+	// answered by one user Content with as many functionResponse parts. A function_call that
+	// arrives while that turn is still the last content (nothing else appended since, e.g. only a
+	// signature-only reasoning item already consumed by the look-ahead sat between them) joins it
+	// instead of opening a new model turn.
+	functionCallTurn := -1
+
 	// Set once the leading system prompt ends (first non-system message). Only the leading run is
 	// hoisted into systemInstruction; a system turn that arrives after the conversation has
 	// started is inlined in place instead -- see inlineGeminiSystemReminder.
@@ -4953,6 +4961,8 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 
 		// Handle regular messages
 		content := Content{}
+		// Set when this item is a function call that produced a functionCall part.
+		isFunctionCall := false
 
 		if msg.Role != nil {
 			// Map Responses roles to Gemini roles (Gemini only supports "user" and "model")
@@ -5034,6 +5044,7 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 					}
 
 					content.Parts = append(content.Parts, part)
+					isFunctionCall = true
 				}
 
 			case schemas.ResponsesMessageTypeCodeInterpreterCall:
@@ -5170,7 +5181,14 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 		}
 
 		if len(content.Parts) > 0 {
+			if isFunctionCall && functionCallTurn >= 0 && functionCallTurn == len(contents)-1 {
+				contents[functionCallTurn].Parts = append(contents[functionCallTurn].Parts, content.Parts...)
+				continue
+			}
 			contents = append(contents, content)
+			if isFunctionCall {
+				functionCallTurn = len(contents) - 1
+			}
 		}
 	}
 

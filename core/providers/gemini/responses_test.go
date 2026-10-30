@@ -3,6 +3,7 @@ package gemini
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"github.com/maximhq/bifrost/core/internal/memtest"
 	"github.com/maximhq/bifrost/core/providers/anthropic"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"github.com/valyala/fasthttp"
 )
@@ -1125,4 +1127,187 @@ func TestGeminiResponsesStreamClosesDanglingCodeInterpreterCall(t *testing.T) {
 		}
 	}
 	t.Fatalf("dangling code_interpreter_call was never closed (%d events)", len(events))
+}
+
+// Gemini's parallel function calling contract: every call of one model turn sits in a single
+// model Content, and the next Content is one user turn with exactly as many functionResponse
+// parts. The Responses converter grouped consecutive function_call_output items but emitted each
+// function_call as its own model Content, so a history with parallel calls became two adjacent
+// model turns answered by one user turn with two responses.
+
+func parallelCallTestMessages(between ...schemas.ResponsesMessage) []schemas.ResponsesMessage {
+	call := func(id, args string) schemas.ResponsesMessage {
+		return schemas.ResponsesMessage{
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+			ResponsesToolMessage: &schemas.ResponsesToolMessage{
+				CallID:    schemas.Ptr(id),
+				Name:      schemas.Ptr("issue_refund"),
+				Arguments: schemas.Ptr(args),
+			},
+		}
+	}
+	output := func(id string) schemas.ResponsesMessage {
+		return schemas.ResponsesMessage{
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+			ResponsesToolMessage: &schemas.ResponsesToolMessage{
+				CallID: schemas.Ptr(id),
+				Output: &schemas.ResponsesToolMessageOutputStruct{ResponsesToolCallOutputStr: schemas.Ptr("done " + id)},
+			},
+		}
+	}
+	msgs := []schemas.ResponsesMessage{
+		{
+			Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+			Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("Refund orders 1 and 2")},
+		},
+		call("call_1", `{"order":1}`),
+	}
+	msgs = append(msgs, between...)
+	msgs = append(msgs,
+		call("call_2", `{"order":2}`),
+		output("call_1"),
+		output("call_2"),
+		schemas.ResponsesMessage{
+			Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+			Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("Make one refund call per response.")},
+		},
+	)
+	return msgs
+}
+
+func requireParallelCallTurns(t *testing.T, contents []Content) {
+	t.Helper()
+	require.Len(t, contents, 4, "user, one model turn with both calls, one user turn with both responses, user")
+
+	require.Len(t, contents[1].Parts, 2)
+	require.NotNil(t, contents[1].Parts[0].FunctionCall)
+	require.NotNil(t, contents[1].Parts[1].FunctionCall)
+	require.Equal(t, "call_1", contents[1].Parts[0].FunctionCall.ID)
+	require.Equal(t, "call_2", contents[1].Parts[1].FunctionCall.ID)
+	require.JSONEq(t, `{"order":1}`, string(contents[1].Parts[0].FunctionCall.Args))
+	require.JSONEq(t, `{"order":2}`, string(contents[1].Parts[1].FunctionCall.Args))
+
+	require.Equal(t, "user", contents[2].Role)
+	require.Len(t, contents[2].Parts, 2)
+	require.NotNil(t, contents[2].Parts[0].FunctionResponse)
+	require.NotNil(t, contents[2].Parts[1].FunctionResponse)
+	require.Equal(t, "call_1", contents[2].Parts[0].FunctionResponse.ID)
+	require.Equal(t, "call_2", contents[2].Parts[1].FunctionResponse.ID)
+
+	require.Equal(t, "user", contents[3].Role)
+	require.Len(t, contents[3].Parts, 1)
+	require.Equal(t, "Make one refund call per response.", contents[3].Parts[0].Text)
+}
+
+func TestConvertResponsesMessagesToGeminiContents_GroupsParallelFunctionCalls(t *testing.T) {
+	contents, _, err := convertResponsesMessagesToGeminiContents(parallelCallTestMessages(), "gemini-2.5-flash", schemas.Gemini)
+	require.NoError(t, err)
+	requireParallelCallTurns(t, contents)
+}
+
+// Gemini returns the thought signature on the first call of a parallel batch only. Its Responses
+// form is [function_call, reasoning(encrypted_content), function_call]: the reasoning item is
+// consumed by the first call's look-ahead and emits nothing of its own, so it must not split the
+// batch, and the signature stays on the first call's part alone.
+func TestConvertResponsesMessagesToGeminiContents_GroupsParallelFunctionCallsAcrossSignature(t *testing.T) {
+	signature := []byte("first-call-signature")
+	encoded := base64.StdEncoding.EncodeToString(signature)
+	reasoning := schemas.ResponsesMessage{
+		Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+		Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
+		ResponsesReasoning: &schemas.ResponsesReasoning{
+			Summary:          []schemas.ResponsesReasoningSummary{},
+			EncryptedContent: &encoded,
+		},
+	}
+
+	contents, _, err := convertResponsesMessagesToGeminiContents(parallelCallTestMessages(reasoning), "gemini-3-pro-preview", schemas.Gemini)
+	require.NoError(t, err)
+	requireParallelCallTurns(t, contents)
+	require.Equal(t, signature, contents[1].Parts[0].ThoughtSignature)
+	require.Equal(t, []byte(skipThoughtSignatureValidator), contents[1].Parts[1].ThoughtSignature)
+}
+
+// A function call answered before the next call starts is a new model turn, not part of the
+// previous batch.
+func TestConvertResponsesMessagesToGeminiContents_SequentialFunctionCallsStaySeparate(t *testing.T) {
+	msgs := parallelCallTestMessages()
+	// Reorder to call_1, output_1, call_2, output_2.
+	msgs[2], msgs[3] = msgs[3], msgs[2]
+
+	contents, _, err := convertResponsesMessagesToGeminiContents(msgs, "gemini-2.5-flash", schemas.Gemini)
+	require.NoError(t, err)
+	require.Len(t, contents, 6)
+	for _, i := range []int{1, 3} {
+		require.Len(t, contents[i].Parts, 1)
+		require.NotNil(t, contents[i].Parts[0].FunctionCall)
+	}
+	for _, i := range []int{2, 4} {
+		require.Equal(t, "user", contents[i].Role)
+		require.Len(t, contents[i].Parts, 1)
+		require.NotNil(t, contents[i].Parts[0].FunctionResponse)
+	}
+	require.Equal(t, "call_1", contents[1].Parts[0].FunctionCall.ID)
+	require.Equal(t, "call_1", contents[2].Parts[0].FunctionResponse.ID)
+	require.Equal(t, "call_2", contents[3].Parts[0].FunctionCall.ID)
+	require.Equal(t, "call_2", contents[4].Parts[0].FunctionResponse.ID)
+}
+
+// A function_call item that carries content of its own keeps it: the content converts as for
+// any other item, alone or when the call joins a parallel batch, and a block that fails to
+// convert still fails the request.
+func TestConvertResponsesMessagesToGeminiContents_FunctionCallContentIsKept(t *testing.T) {
+	withContent := func(msg schemas.ResponsesMessage, content *schemas.ResponsesMessageContent) schemas.ResponsesMessage {
+		msg.Content = content
+		return msg
+	}
+	call := func(id string) schemas.ResponsesMessage {
+		return schemas.ResponsesMessage{
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+			ResponsesToolMessage: &schemas.ResponsesToolMessage{
+				CallID: schemas.Ptr(id), Name: schemas.Ptr("issue_refund"), Arguments: schemas.Ptr(`{}`),
+			},
+		}
+	}
+	user := schemas.ResponsesMessage{
+		Role:    schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+		Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("refund")},
+	}
+
+	t.Run("single call with string content", func(t *testing.T) {
+		contents, _, err := convertResponsesMessagesToGeminiContents([]schemas.ResponsesMessage{
+			user, withContent(call("call_1"), &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("keep")}),
+		}, "gemini-2.5-flash", schemas.Gemini)
+		require.NoError(t, err)
+		require.Len(t, contents, 2)
+		require.Len(t, contents[1].Parts, 2)
+		require.NotNil(t, contents[1].Parts[0].FunctionCall)
+		require.Equal(t, "keep", contents[1].Parts[1].Text)
+	})
+
+	t.Run("joined call with block content", func(t *testing.T) {
+		blocks := &schemas.ResponsesMessageContent{ContentBlocks: []schemas.ResponsesMessageContentBlock{{
+			Type: schemas.ResponsesInputMessageContentBlockTypeText, Text: schemas.Ptr("also"),
+		}}}
+		contents, _, err := convertResponsesMessagesToGeminiContents([]schemas.ResponsesMessage{
+			user, call("call_1"), withContent(call("call_2"), blocks),
+		}, "gemini-2.5-flash", schemas.Gemini)
+		require.NoError(t, err)
+		require.Len(t, contents, 2)
+		require.Len(t, contents[1].Parts, 3)
+		require.Equal(t, "call_1", contents[1].Parts[0].FunctionCall.ID)
+		require.Equal(t, "call_2", contents[1].Parts[1].FunctionCall.ID)
+		require.Equal(t, "also", contents[1].Parts[2].Text)
+	})
+
+	t.Run("block that fails to convert", func(t *testing.T) {
+		image := &schemas.ResponsesMessageContent{ContentBlocks: []schemas.ResponsesMessageContentBlock{{
+			Type:                                   schemas.ResponsesInputMessageContentBlockTypeImage,
+			ResponsesInputMessageContentBlockImage: &schemas.ResponsesInputMessageContentBlockImage{ImageURL: schemas.Ptr("ftp://example.com/a.png")},
+		}}}
+		_, _, err := convertResponsesMessagesToGeminiContents([]schemas.ResponsesMessage{
+			user, call("call_1"), withContent(call("call_2"), image),
+		}, "gemini-2.5-flash", schemas.Gemini)
+		require.Error(t, err)
+	})
 }
