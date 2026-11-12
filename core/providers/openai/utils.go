@@ -316,6 +316,9 @@ func ConvertOpenAIMessagesToBifrostMessages(messages []OpenAIMessage) []schemas.
 				Annotations:      message.OpenAIChatAssistantMessage.Annotations,
 				ToolCalls:        message.OpenAIChatAssistantMessage.ToolCalls,
 			}
+			if audio := message.Audio; audio != nil {
+				bifrostMessages[i].Audio = &schemas.ChatAudioMessageAudio{ID: audio.ID}
+			}
 		}
 		bifrostMessages[i].AttachMessageCacheControl(message.CacheControl)
 	}

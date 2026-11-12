@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"mime/multipart"
@@ -162,6 +163,10 @@ func getClientKey(credentialIdentity string) string {
 // - Token acquisition fails (tokenSource.Token() error)
 // This forces the next request to re-create the token source from scratch.
 func (provider *VertexProvider) removeVertexClient(key schemas.Key) {
+	if hasCallerAccessToken(key) {
+		// A caller-supplied token has no cached source to evict (see getAuthTokenSource).
+		return
+	}
 	clientKey := getClientKey(vertexCredentialIdentity(key))
 	provider.tokenSources.Delete(clientKey)
 }
@@ -202,7 +207,7 @@ func NewVertexProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*
 		DisablePathNormalizing: true,
 	}
 	client = providerUtils.ConfigureProxy(client, config.ProxyConfig, logger)
-	client = providerUtils.ConfigureDialer(client, config.NetworkConfig.AllowPrivateNetwork)
+	client = providerUtils.ConfigureDialerFor(client, config.NetworkConfig)
 	client = providerUtils.ConfigureTLS(client, config.NetworkConfig, logger)
 	streamingClient := providerUtils.BuildStreamingClient(client)
 	return &VertexProvider{
@@ -233,6 +238,11 @@ const cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
 // credentials (GCE, GKE workload identity) use the metadata package's own client,
 // which is right: link-local metadata traffic must never be proxied.
 func (provider *VertexProvider) getAuthTokenSource(key schemas.Key) (oauth2.TokenSource, error) {
+	if hasCallerAccessToken(key) {
+		// The caller minted the token and owns its refresh. It is used as given,
+		// never cached, and no other credential is consulted.
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: key.VertexKeyConfig.AccessToken, TokenType: "Bearer"}), nil
+	}
 	authCredentials := key.VertexKeyConfig.AuthCredentials
 	clientKey := getClientKey(vertexCredentialIdentity(key))
 
@@ -4003,13 +4013,15 @@ func (provider *VertexProvider) gcsFileUploadResumable(
 	req.SetBody(metaJSON)
 
 	// content_length is optional but helps GCS validate the upload size. Depending
-	// on the transport it may arrive as a JSON number (float64) or a form-field
-	// string, so accept both numeric and string forms.
+	// on the transport it may arrive as a JSON number (float64 or json.Number) or a
+	// form-field string, so accept both numeric and string forms.
 	if request.ExtraParams != nil {
 		var contentLength int64
 		switch cl := request.ExtraParams["content_length"].(type) {
 		case float64:
 			contentLength = int64(cl)
+		case json.Number:
+			contentLength, _ = cl.Int64()
 		case int:
 			contentLength = int64(cl)
 		case int64:

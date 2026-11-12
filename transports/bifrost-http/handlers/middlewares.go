@@ -405,7 +405,7 @@ func (c *CorsMiddleware) Middleware() schemas.BifrostHTTPMiddleware {
 					if forwarded := lib.ClientForwardedIP(ctx); forwarded != "" {
 						logBuilder = logBuilder.Str("http.forwarded_for", forwarded)
 					}
-					if traceID, ok := ctx.UserValue(schemas.BifrostContextKeyTraceID).(string); ok && traceID != "" {
+					if traceID, ok := ctx.UserValue(schemas.BifrostContextKeyExportTraceID).(string); ok && traceID != "" {
 						logBuilder = logBuilder.Str("trace_id", traceID)
 					}
 					// Emit the request ID alongside trace_id
@@ -542,14 +542,25 @@ func decompressionAllowance(compressedLen, maxRequestBodyBytes int) int {
 // middleware, for anyone who can reach the listener. The work it does must therefore stay in
 // proportion to what the caller sent: the cap alone is the wire cap too, and lets a few hundred
 // bytes become a 100 MiB buffer. Two bounds keep it proportional. Each body may expand only to
-// its decompressionAllowance, and each buffered decompression charges the bytes it actually
-// inflates to a process-wide budget, as they are produced, for the life of the request, so
-// buffers cannot stack up without bound; a request that cannot be charged is answered 503 at
-// once. The allowance is not reserved up front: past cap/requestDecompressionMaxRatio
-// compressed it is the whole cap, and booking that for every multi-MB SDK body would refuse
-// the fifth concurrent one while the process holds a fraction of the budget. Streaming bodies
-// are not buffered here and take no charge.
+// its decompressionAllowance, and the bytes buffered decompressions hold are charged to a
+// process-wide budget for the life of the request, so buffers cannot stack up without bound.
+//
+// A request the budget cannot cover waits for it; it is not refused. The wait ends when other
+// requests return their bytes, or when the request itself ends: its client closes the
+// connection, or the server shuts down. So that waiting requests can never hold the budget
+// between them while each waits for more, a body takes its whole allowance in one step before
+// it is decompressed, and gives back the part it did not inflate to as soon as its size is
+// known. What is held across the handler is therefore what the body really is, and a full-cap
+// allowance (every body past cap/requestDecompressionMaxRatio compressed) is only booked while
+// that body is being decompressed. Streaming bodies are not buffered here and take no charge.
 func RequestDecompressionMiddleware(config *lib.Config) schemas.BifrostHTTPMiddleware {
+	return requestDecompressionMiddleware(config, lib.ClientDisconnectContext)
+}
+
+// requestDecompressionMiddleware is RequestDecompressionMiddleware with the context a request
+// waits for budget under supplied: waitContext is called only when a request has to wait, and
+// its context ending ends the wait.
+func requestDecompressionMiddleware(config *lib.Config, waitContext func(*fasthttp.RequestCtx) (context.Context, context.CancelFunc)) schemas.BifrostHTTPMiddleware {
 	budget := semaphore.NewWeighted(int64(requestDecompressionBudgetFactor) * int64(requestBodyCap(config)))
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
@@ -596,11 +607,20 @@ func RequestDecompressionMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 			// Buffered path: small compressed request — materialize fully. The body is in hand
 			// now, so the allowance follows its real length rather than the declared one.
 			allowed = decompressionAllowance(len(ctx.Request.Body()), maxRequestBodyBytes)
-			body, charged, err := decodeRequestBodyWithLimit(&ctx.Request, allowed, budget)
-			defer budget.Release(charged)
-			if errors.Is(err, errDecompressionBudgetExhausted) {
-				SendError(ctx, fasthttp.StatusServiceUnavailable, "too many compressed request bodies are being decompressed at once; retry shortly or send the body uncompressed")
+			held := int64(allowed)
+			if err := reserveDecompressionBudget(ctx, budget, held, waitContext); err != nil {
+				// The wait ended with the request: its client is gone or the server is
+				// shutting down. Nothing was taken from the budget.
+				SendError(ctx, fasthttp.StatusServiceUnavailable, "request ended while waiting to decompress its body")
 				return
+			}
+			defer func() { budget.Release(held) }()
+			body, err := decodeRequestBodyWithLimit(&ctx.Request, allowed)
+			// Keep only what the body inflated to (nothing, when decoding failed) for the
+			// rest of the request.
+			if inflated := int64(len(body)); inflated < held {
+				budget.Release(held - inflated)
+				held = inflated
 			}
 			if errors.Is(err, errRequestBodyTooLarge) {
 				refuseExpansion(len(ctx.Request.Body()))
@@ -705,57 +725,39 @@ func (l *limitedBodyReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-var errDecompressionBudgetExhausted = errors.New("decompressed request bytes in flight exceed the process budget")
-
-// budgetedReader charges every byte it hands out to budget, failing with
-// errDecompressionBudgetExhausted once the budget cannot cover them. The caller releases charged.
-type budgetedReader struct {
-	r       io.Reader
-	budget  *semaphore.Weighted
-	charged int64
-}
-
-func (b *budgetedReader) Read(p []byte) (int, error) {
-	n, err := b.r.Read(p)
-	if n > 0 {
-		if !b.budget.TryAcquire(int64(n)) {
-			return 0, errDecompressionBudgetExhausted
-		}
-		b.charged += int64(n)
+// reserveDecompressionBudget takes n bytes of budget. When the budget cannot cover them now it
+// waits until it can, or until the context waitContext returns for the request ends; it then
+// returns that context's error and has taken nothing.
+func reserveDecompressionBudget(ctx *fasthttp.RequestCtx, budget *semaphore.Weighted, n int64, waitContext func(*fasthttp.RequestCtx) (context.Context, context.CancelFunc)) error {
+	if budget.TryAcquire(n) {
+		return nil
 	}
-	return n, err
+	waitCtx, cancel := waitContext(ctx)
+	defer cancel()
+	return budget.Acquire(waitCtx, n)
 }
 
-// decodeRequestBodyWithLimit decodes the request body with a limit on the size of the body. With
-// a non-nil budget the decoded bytes are charged to it as they are produced; charged is what the
-// caller must release, whether or not decoding succeeded.
-func decodeRequestBodyWithLimit(req *fasthttp.Request, maxRequestBodyBytes int, budget *semaphore.Weighted) (body []byte, charged int64, err error) {
+// decodeRequestBodyWithLimit decodes the request body with a limit on the size of the body.
+func decodeRequestBodyWithLimit(req *fasthttp.Request, maxRequestBodyBytes int) ([]byte, error) {
 	encoding := strings.ToLower(strings.TrimSpace(string(req.Header.ContentEncoding())))
 	bodyReader := bytes.NewReader(req.Body())
 
 	var reader io.Reader = bodyReader
 	cleanup := func() {}
 	if encoding != "" {
+		var err error
 		reader, cleanup, err = newDecompressReader(bodyReader, encoding)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 	}
 	defer cleanup()
 
-	var budgeted *budgetedReader
-	if budget != nil {
-		budgeted = &budgetedReader{r: reader, budget: budget}
-		reader = budgeted
-	}
-	body, err = io.ReadAll(newLimitedBodyReader(reader, maxRequestBodyBytes))
-	if budgeted != nil {
-		charged = budgeted.charged
-	}
+	body, err := io.ReadAll(newLimitedBodyReader(reader, maxRequestBodyBytes))
 	if err != nil {
-		return nil, charged, err
+		return nil, err
 	}
-	return body, charged, nil
+	return body, nil
 }
 
 // newDecompressReader wraps r with a decompression reader for the given encoding.
@@ -879,8 +881,24 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 				next(ctx)
 				return
 			}
+			// Tell streaming handlers that post-hooks will run, so they allocate the
+			// completer slot this middleware resolves after next(ctx) returns. The handler
+			// replaces the marker with the slot.
+			ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, true)
+			// A stream's producer waits for the slot, so it is resolved on every path out
+			// of this middleware, a panic included. This is the "no post-hooks" answer;
+			// it has no effect once the completer has been published below.
+			defer func() {
+				if slot, ok := ctx.UserValue(schemas.BifrostContextKeyTransportPostHookCompleter).(*lib.TransportPostHookSlot); ok {
+					slot.Resolve(nil)
+				}
+			}()
 			// Get or create BifrostContext from fasthttp context
 			bifrostCtx := getBifrostContextFromFastHTTP(ctx)
+			// Store it as the request's shared context: lib.ConvertToBifrostContext builds
+			// the handler's context on top of it, so the LLM hooks see what a transport
+			// pre-hook wrote.
+			ctx.SetUserValue(lib.FastHTTPUserValueBifrostContext, bifrostCtx)
 			// Transport pre-hooks run before the inference path stamps the
 			// catalog, so stamp it here too — otherwise ctx.GetModelInfo would
 			// be nil in HTTPTransportPreHook but populated in every other hook.
@@ -932,7 +950,37 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 			retainRealtimeTurnValues(ctx, bifrostCtx)
 			next(ctx)
 
+			// The handler may have promoted a cancellable child as the shared context: that
+			// is the one the LLM hooks wrote to. Core may still be running hooks on it (a
+			// stream is produced after the handler returns, and a stream committed early
+			// has not finished its pre-hooks), and core owns its plugin-log store: it
+			// drains and recycles it from its own goroutines. So the transport hooks that
+			// follow do not run on that context itself. They run on one derived from it,
+			// which reads every value through to it and keeps the transport's plugin logs
+			// in a store only this request's transport hooks touch.
+			if shared, ok := ctx.UserValue(lib.FastHTTPUserValueBifrostContext).(*schemas.BifrostContext); ok && shared != nil {
+				bifrostCtx = shared
+			}
+			requestCtx := bifrostCtx
 			deferred, _ := ctx.UserValue(schemas.BifrostContextKeyDeferTraceCompletion).(bool)
+			if deferred {
+				// A stream's hooks do not follow the handler context's cancellation. The
+				// stream's producer cancels that context itself to stop the provider once it
+				// has nothing more to write, and that must not look to the post-hooks like a
+				// request that was cancelled. The completer below cancels this context
+				// before the post-hooks run when the request ended on its own.
+				bifrostCtx = schemas.NewBifrostContext(context.WithoutCancel(requestCtx), schemas.NoDeadline)
+			} else {
+				bifrostCtx = schemas.NewBifrostContext(requestCtx, schemas.NoDeadline)
+			}
+			// Ends the derived context's watcher; the completer does it for a stream.
+			releaseHookCtx := bifrostCtx.Cancel
+			defer func() {
+				if releaseHookCtx != nil {
+					releaseHookCtx()
+				}
+			}()
+
 			if !deferred && len(plugins) > 0 {
 				_ = runTransportPostHooks(ctx, plugins, bifrostCtx, true)
 			}
@@ -951,9 +999,9 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 			// here (while ctx is still valid) and passed through the closure.
 			if deferred {
 				// Verify the completer slot exists before allocating pooled snapshots.
-				// The streaming handler pre-allocates this *atomic.Value; if absent,
-				// skip work to avoid leaking pooled HTTPRequest/HTTPResponse objects.
-				slot, ok := ctx.UserValue(schemas.BifrostContextKeyTransportPostHookCompleter).(*atomic.Value)
+				// The streaming handler allocates it; if absent, skip work to avoid
+				// leaking pooled HTTPRequest/HTTPResponse objects.
+				slot, ok := ctx.UserValue(schemas.BifrostContextKeyTransportPostHookCompleter).(*lib.TransportPostHookSlot)
 				if !ok {
 					return
 				}
@@ -980,7 +1028,21 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 					}
 				}
 
+				hookCtx := bifrostCtx
 				completer := func() ([]schemas.PluginLogEntry, error) {
+					defer hookCtx.Cancel()
+					// The post-hooks see a cancelled context if and only if the request
+					// ended on its own: the client left, a write to it failed, or the
+					// request's own deadline or cancellation fired. The producer recorded
+					// that before any cancel of its own; a producer that records nothing
+					// leaves the request's context to answer.
+					ended, captured := slot.RequestEnded()
+					if !captured {
+						ended = requestCtx.Err() != nil
+					}
+					if ended {
+						hookCtx.Cancel()
+					}
 					defer schemas.ReleaseHTTPRequest(capturedReq)
 					defer schemas.ReleaseHTTPResponse(capturedResp)
 					postHookLogs, err := runTransportPostHooksCaptured(capturedReq, capturedResp, plugins, bifrostCtx, spanTracer, spanParentCtx)
@@ -991,10 +1053,12 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 					return allLogs, err
 				}
 
-				// Store the completer in the atomic.Value slot that the streaming handler
-				// placed on ctx. The goroutine reads from its closure-captured copy of
-				// the slot, avoiding any ctx access after the handler returns.
-				slot.Store(completer)
+				// Publish the completer to the slot that the streaming handler placed on
+				// ctx. The goroutine waits on its closure-captured copy of the slot,
+				// avoiding any ctx access after the handler returns. From here the
+				// completer owns the hook context and the snapshots.
+				releaseHookCtx = nil
+				slot.Resolve(completer)
 				return
 			}
 
@@ -1560,6 +1624,21 @@ func (m *AuthMiddleware) CheckConfiguredSetupToken(token string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(*current), []byte(token)) == 1
+}
+
+// NewStorelessSetupLock returns an AuthMiddleware for a server without a config store. It
+// holds only the operator-configured setup token (pass "" when none is configured) and the
+// operator's whitelisted routes: with no store there is no admin account, so dashboard auth is
+// never active and its SetupLockMiddleware keeps /api locked, letting through only public
+// routes and calls that carry the setup token. Nothing else on it is usable without a store.
+func NewStorelessSetupLock(configuredSetupToken string, whitelistedRoutes []string) *AuthMiddleware {
+	am := &AuthMiddleware{}
+	if configuredSetupToken != "" {
+		am.setupToken.Store(&configuredSetupToken)
+	}
+	whitelistedRoutes = slices.Clone(whitelistedRoutes)
+	am.whitelistedRoutes.Store(&whitelistedRoutes)
+	return am
 }
 
 // UpdateWhitelistedRoutes updates the configured whitelisted routes that bypass auth middleware.

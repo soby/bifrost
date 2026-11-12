@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/fasthttp/router"
@@ -154,8 +153,7 @@ func (r *RelayGatewayHandler) handle(ctx *fasthttp.RequestCtx) {
 	// slot after the handler returns, and the stream writer runs it once the stream ends, as the
 	// MCP server and inference streaming handlers do.
 	ctx.SetUserValue(schemas.BifrostContextKeyDeferTraceCompletion, true)
-	var completerSlot atomic.Value
-	ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, &completerSlot)
+	completerSlot := lib.NewTransportPostHookCompleterSlot(ctx)
 	traceCompleter, _ := ctx.UserValue(schemas.BifrostContextKeyTraceCompleter).(func([]schemas.PluginLogEntry))
 	writeEndpointHeaders(ctx, stream.Headers)
 	lib.ApplyBifrostStreamResponseHeaders(ctx, bifrostCtx, schemas.RelayRequest)
@@ -249,7 +247,7 @@ func (r *RelayGatewayHandler) handle(ctx *fasthttp.RequestCtx) {
 				bifrostCtx.StampStreamOverhead()
 				bifrostCtx.StampStreamTransport(0, clientWrite)
 				// Post-hooks run before the context is cancelled so plugins see it live.
-				return runTransportPostHookCompleter(&completerSlot, r.logger)
+				return runTransportPostHookCompleter(completerSlot, r.logger)
 			})
 			// The body ends before the trace completes, as the LLM stream writer orders them, so the
 			// caller never waits on trace export.
@@ -314,24 +312,9 @@ func relayHeartbeatEligible(headers map[string]string) bool {
 }
 
 // runTransportPostHookCompleter runs the deferred transport post-hooks once a relay stream ends and
-// returns their logs. The middleware publishes the completer just after the handler returns, which
-// can race a short stream, so the slot is polled briefly. A post-hook error cannot reach the caller
-// any more; it is logged.
-func runTransportPostHookCompleter(slot *atomic.Value, logger schemas.Logger) []schemas.PluginLogEntry {
-	var loaded any
-	deadline := time.Now().Add(100 * time.Millisecond)
-	for loaded = slot.Load(); loaded == nil && time.Now().Before(deadline); loaded = slot.Load() {
-		time.Sleep(time.Millisecond)
-	}
-	completer, ok := loaded.(func() ([]schemas.PluginLogEntry, error))
-	if !ok {
-		return nil
-	}
-	logs, err := completer()
-	if err != nil && logger != nil {
-		logger.Warn("transport post-hook failed after relay stream ended: %v", err)
-	}
-	return logs
+// returns their logs. See lib.RunTransportPostHookCompleter.
+func runTransportPostHookCompleter(slot *lib.TransportPostHookSlot, logger schemas.Logger) []schemas.PluginLogEntry {
+	return lib.RunTransportPostHookCompleter(slot, logger)
 }
 
 // writeEndpointHeaders copies the upstream's response headers, minus the ones the gateway owns and

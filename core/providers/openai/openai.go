@@ -61,7 +61,7 @@ func NewOpenAIProvider(config *schemas.ProviderConfig, logger schemas.Logger) *O
 
 	// Configure proxy and retry policy
 	client = providerUtils.ConfigureProxy(client, config.ProxyConfig, logger)
-	client = providerUtils.ConfigureDialer(client, config.NetworkConfig.AllowPrivateNetwork)
+	client = providerUtils.ConfigureDialerFor(client, config.NetworkConfig)
 	client = providerUtils.ConfigureTLS(client, config.NetworkConfig, logger)
 	streamingClient := providerUtils.BuildStreamingClient(client)
 	// Set default BaseURL if not provided
@@ -105,6 +105,18 @@ func (provider *OpenAIProvider) resolveKey(ctx context.Context, key schemas.Key)
 // GetProviderKey returns the provider identifier for OpenAI.
 func (provider *OpenAIProvider) GetProviderKey() schemas.ModelProvider {
 	return providerUtils.GetProviderName(schemas.OpenAI, provider.customProviderConfig)
+}
+
+// ForRequest implements schemas.RequestScopedProvider. The provider authenticates with the
+// key alone, so it serves every request type. A base URL yields a copy that shares the
+// receiver's clients.
+func (provider *OpenAIProvider) ForRequest(_ schemas.RequestType, _ schemas.Key, baseURL string) (schemas.Provider, error) {
+	if baseURL == "" {
+		return provider, nil
+	}
+	scoped := *provider
+	scoped.networkConfig.BaseURL = baseURL
+	return &scoped, nil
 }
 
 // buildRequestURL constructs the full request URL using the provider's configuration.
@@ -1209,6 +1221,9 @@ func HandleOpenAIChatCompletionRequest(
 	} else {
 		inBandErr = errorInValidatedChatBody(body)
 	}
+	if inBandErr == nil {
+		inBandErr = errorInChatChoices(response.Choices)
+	}
 	if inBandErr != nil {
 		logger.Debug("in-band error on a 200 from %s provider: %s", providerName, inBandErr.Error.Message)
 		return nil, providerUtils.EnrichError(ctx, inBandErr, jsonData, body, sendBackRawRequest, sendBackRawResponse, latency)
@@ -1642,6 +1657,14 @@ func HandleOpenAIChatCompletionStreaming(
 				response.Choices = []schemas.BifrostResponseChoice{}
 			}
 			response.Usage.NormalizeReasoningTokens()
+
+			// A failure during generation can arrive on the choice instead of as a
+			// top-level error (see errorInChatChoices).
+			if chunkErr := errorInChatChoices(response.Choices); chunkErr != nil {
+				ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
+				providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, providerUtils.EnrichError(ctx, chunkErr, jsonBody, nil, sendBackRawRequest, sendBackRawResponse, latency), responseChan, logger, postHookSpanFinalizer)
+				return
+			}
 
 			// ModelScope-style upstreams put a full `message` object next to
 			// `delta` in every stream chunk, and BifrostResponseChoice decodes

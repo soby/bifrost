@@ -118,3 +118,32 @@ func TestCursorStreamIncompleteUnrecognizedReasonKeepsFinishReasonNull(t *testin
 		t.Errorf("final chunk must carry usage, got %+v", chunk.Usage)
 	}
 }
+
+// The final chunk takes the terminal response's ID even when the response
+// carries no usage, as a locally generated response may not.
+func TestCursorStreamTerminalIDWithoutUsage(t *testing.T) {
+	for _, typ := range []schemas.ResponsesStreamResponseType{
+		schemas.ResponsesStreamResponseTypeCompleted,
+		schemas.ResponsesStreamResponseTypeIncomplete,
+	} {
+		t.Run(string(typ), func(t *testing.T) {
+			_, out, err := convertResponsesStreamToChatChunk(&schemas.BifrostResponsesStreamResponse{
+				Type:     typ,
+				Response: &schemas.BifrostResponsesResponse{ID: schemas.Ptr("resp_local_1")},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			chunk, ok := out.(*cursorChatChunk)
+			if !ok || chunk == nil {
+				t.Fatalf("terminal event produced no chat chunk (got %T)", out)
+			}
+			if chunk.ID != "chatcmpl-resp_local_1" {
+				t.Errorf("final chunk ID = %q, want chatcmpl-resp_local_1", chunk.ID)
+			}
+			if chunk.Usage != nil {
+				t.Errorf("final chunk usage = %+v, want none", chunk.Usage)
+			}
+		})
+	}
+}

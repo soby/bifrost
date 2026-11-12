@@ -32,6 +32,23 @@
           "description": "Largest request-body buffer (in bytes) a pooled keep-alive connection keeps for reuse between requests. Larger buffers are released after each request so connections do not pin their largest-ever body in memory; larger bodies are still accepted up to the max request body size. Not set uses the default (4 MiB); 0 means unlimited and keeps every buffer. Process-wide: also applies to outbound fasthttp request buffers. Deploy-time only.",
           "default": 4194304
         },
+        "reduce_memory_usage": {
+          "type": "boolean",
+          "description": "Release a keep-alive connection's read, write and body buffers while it idles between requests instead of holding them for reuse. Lowers memory per idle connection at the cost of a buffer allocation on the connection's next request. Deploy-time only.",
+          "default": false
+        },
+        "read_timeout_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum time in seconds to read one request, headers and body. Not set or 0 means no limit. A request that takes longer to arrive, such as a large upload over a slow link, is closed. Deploy-time only.",
+          "default": 0
+        },
+        "idle_timeout_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum time in seconds a keep-alive connection may wait for its next request before it is closed. Not set or 0 falls back to read_timeout_seconds; with neither set an idle connection is never closed. Behind a load balancer, set it above the balancer's backend keep-alive so the balancer closes idle pooled connections first. Deploy-time only.",
+          "default": 0
+        },
         "plugin_download_private_allowlist": {
           "type": "array",
           "items": {

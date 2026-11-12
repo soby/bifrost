@@ -16,6 +16,7 @@ func (req *OpenAIChatRequest) ToBifrostChatRequest(ctx *schemas.BifrostContext) 
 	params := req.ChatParameters
 	if params.MaxCompletionTokens == nil && req.MaxTokens != nil {
 		params.MaxCompletionTokens = req.MaxTokens
+		params.LegacyMaxTokens = true
 	}
 	// OpenAI chat has no reasoning.summary; on this integration it is only sent via passthrough extra_params.
 	if params.Reasoning != nil && params.Reasoning.Summary != nil {
@@ -63,9 +64,6 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 	if bifrostReq.Params != nil {
 		openaiReq.ChatParameters = *bifrostReq.Params
 		openaiReq.ServiceTier = serviceTierForModel(caps, openaiReq.ServiceTier)
-		if openaiReq.ChatParameters.MaxCompletionTokens != nil && *openaiReq.ChatParameters.MaxCompletionTokens < MinMaxCompletionTokens {
-			openaiReq.ChatParameters.MaxCompletionTokens = schemas.Ptr(MinMaxCompletionTokens)
-		}
 		// Drop user field if it exceeds OpenAI's 64 character limit
 		openaiReq.ChatParameters.User = SanitizeUserField(openaiReq.ChatParameters.User)
 		// Fable 5.1+ rejects forced tool use outright. Drop the choice so the model
@@ -87,6 +85,9 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 			}
 		}
 		openaiReq.ExtraParams = bifrostReq.Params.ExtraParams
+		if bifrostReq.Provider == schemas.OpenRouter {
+			openaiReq.OpenRouterRouting = bifrostReq.Params.ExtraParams["provider"]
+		}
 
 		// Models older than GPT-5 reject custom tools with "Invalid value: 'custom'",
 		// so each one is sent as a function tool. Chat has no custom tool call shape,
@@ -152,6 +153,10 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 
 	switch bifrostReq.Provider {
 	case schemas.OpenAI, schemas.Azure:
+		openaiReq.forwardAssistantAudio(bifrostReq.Input)
+		if openaiReq.MaxCompletionTokens != nil && *openaiReq.MaxCompletionTokens < MinMaxCompletionTokens {
+			openaiReq.MaxCompletionTokens = schemas.Ptr(MinMaxCompletionTokens)
+		}
 		openaiReq.normalizeReasoningEffort(caps)
 		openaiReq.stripUnsupportedSamplingParams(caps)
 		// URL-sourced documents are NOT inlined here. Chat Completions rejects file_url, so they
@@ -260,6 +265,14 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		openaiReq.ChatParameters.Prediction = prediction
 		return openaiReq
 	default:
+		openaiReq.forwardReasoningDetails(bifrostReq.Input)
+		openaiReq.forwardAssistantAudio(bifrostReq.Input)
+		// Destinations without a curated dialect get the limit under the name the
+		// caller used; not every OpenAI-compatible server reads max_completion_tokens.
+		if openaiReq.LegacyMaxTokens && openaiReq.MaxCompletionTokens != nil {
+			openaiReq.MaxTokens = openaiReq.MaxCompletionTokens
+			openaiReq.MaxCompletionTokens = nil
+		}
 		// Check if provider is a custom provider
 		if isCustomProvider, ok := ctx.Value(schemas.BifrostContextKeyIsCustomProvider).(bool); ok && isCustomProvider {
 			// A custom provider reports its own name, so a DeepSeek-based one lands here
@@ -538,6 +551,43 @@ func jsonSchemaInstruction(rf *schemas.ChatResponseFormat) string {
 	sb.WriteString("\n\nJSON Schema:\n")
 	sb.Write(schema)
 	return sb.String()
+}
+
+// forwardReasoningDetails replays assistant reasoning_details to destinations without a
+// curated OpenAI dialect (OpenRouter, self-hosted servers, custom providers), which accept
+// the field and need it for signed reasoning replay. The dialects handled above never get
+// it: they either reject unknown message fields or read reasoning only from
+// reasoning_content. messages is the Bifrost input the request was converted from, so it
+// lines up index for index with req.Messages.
+func (req *OpenAIChatRequest) forwardReasoningDetails(messages []schemas.ChatMessage) {
+	for i := range req.Messages {
+		if i >= len(messages) {
+			break
+		}
+		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
+		if assistantMessage == nil || messages[i].ChatAssistantMessage == nil {
+			continue
+		}
+		assistantMessage.ReasoningDetails = messages[i].ReasoningDetails
+	}
+}
+
+// forwardAssistantAudio replays the audio reference ({"id": ...}) of previous
+// assistant audio responses, which OpenAI needs to continue an audio conversation.
+// Like reasoning_details it goes only to OpenAI, Azure and destinations without a
+// curated dialect. messages lines up index for index with req.Messages.
+func (req *OpenAIChatRequest) forwardAssistantAudio(messages []schemas.ChatMessage) {
+	for i := range req.Messages {
+		if i >= len(messages) {
+			break
+		}
+		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
+		if assistantMessage == nil || messages[i].ChatAssistantMessage == nil ||
+			messages[i].Audio == nil || messages[i].Audio.ID == "" {
+			continue
+		}
+		assistantMessage.Audio = &OpenAIChatAssistantAudio{ID: messages[i].Audio.ID}
+	}
 }
 
 // renameAssistantReasoningToAlias moves replayed assistant reasoning from

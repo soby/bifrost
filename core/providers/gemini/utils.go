@@ -720,8 +720,10 @@ func (r *GeminiGenerationRequest) convertGenerationConfigToResponsesParameters(p
 	if config.ResponseJSONSchema != nil {
 		params.ExtraParams["response_json_schema"] = config.ResponseJSONSchema
 	}
+	// responseLogprobs is the Responses include "message.output_text.logprobs", which
+	// every provider conversion reads (logprobs above is top_logprobs).
 	if config.ResponseLogprobs {
-		params.ExtraParams["response_logprobs"] = config.ResponseLogprobs
+		params.Include = append(params.Include, schemas.ResponsesIncludeOutputTextLogprobs)
 	}
 	return params
 }
@@ -1599,6 +1601,14 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 		penalty := float64(*params.FrequencyPenalty)
 		config.FrequencyPenalty = &penalty
 	}
+	// generationConfig.seed is an int32. A seed outside that range is refused rather
+	// than truncated: a truncated seed would silently sample with a different seed.
+	if params.Seed != nil {
+		if *params.Seed < math.MinInt32 || *params.Seed > math.MaxInt32 {
+			return config, providerUtils.InvalidRequestErrorf("seed must be between %d and %d for Gemini generationConfig.seed, got %d", math.MinInt32, math.MaxInt32, *params.Seed)
+		}
+		config.Seed = schemas.Ptr(int32(*params.Seed))
+	}
 	// Only set ThinkingConfig if the model actually supports thinking
 	caps := schemas.ResolveModelCaps(provider, model)
 	if params.Reasoning != nil && caps.SupportsReasoning(defaultSupportsReasoning(model)) {
@@ -1661,8 +1671,11 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 			config.ResponseMIMEType = "application/json"
 		}
 	}
+	if params.TopK != nil {
+		config.TopK = params.TopK
+	}
 	if params.ExtraParams != nil {
-		if topK, ok := params.ExtraParams["top_k"]; ok {
+		if topK, ok := params.ExtraParams["top_k"]; ok && config.TopK == nil {
 			if val, success := schemas.SafeExtractInt(topK); success {
 				config.TopK = schemas.Ptr(val)
 			}
@@ -1679,13 +1692,14 @@ func convertParamsToGenerationConfig(params *schemas.ChatParameters, responseMod
 	if params.LogProbs != nil {
 		config.ResponseLogprobs = *params.LogProbs
 	}
-	// Mapping top_logprobs to generation config
+	// Mapping top_logprobs to generation config. The value is sent as given: Gemini
+	// answers an out-of-range count with its own error instead of Bifrost lowering it.
 	if params.TopLogProbs != nil {
 		topLogProbs := *params.TopLogProbs
-		if topLogProbs > 20 {
-			topLogProbs = 20
+		if topLogProbs < math.MinInt32 || topLogProbs > math.MaxInt32 {
+			return config, providerUtils.InvalidRequestErrorf("top_logprobs must be between %d and %d for Gemini generationConfig.logprobs, got %d", math.MinInt32, math.MaxInt32, topLogProbs)
 		}
-		if topLogProbs > 0 {
+		if topLogProbs != 0 {
 			config.ResponseLogprobs = true
 			config.Logprobs = schemas.Ptr(int32(topLogProbs))
 		}
@@ -3499,6 +3513,17 @@ func ConvertGeminiLogprobsResultToBifrost(result *LogprobsResult) *schemas.Bifro
 		}
 	}
 	return &schemas.BifrostLogProbs{Content: content}
+}
+
+// convertGeminiLogprobsResultToResponses converts a Gemini logprobsResult to the
+// logprobs of a Responses output_text part, one entry per decoding step. nil when
+// the candidate carries none.
+func convertGeminiLogprobsResultToResponses(result *LogprobsResult) []schemas.ResponsesOutputMessageContentTextLogProb {
+	logProbs := ConvertGeminiLogprobsResultToBifrost(result)
+	if logProbs == nil {
+		return nil
+	}
+	return schemas.ResponsesLogProbsFromChat(logProbs.Content)
 }
 
 // mimeTypeFromURI returns the IANA MIME type a URI's own file extension declares, or "" when the

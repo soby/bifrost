@@ -461,6 +461,8 @@ func clearCtxForFallback(ctx *schemas.BifrostContext) {
 	ctx.ClearValue(schemas.BifrostContextKeyStreamBodyExhausted)
 	ctx.ClearValue(schemas.BifrostContextKeyStreamParkedAfterFinish)
 	ctx.ClearValue(schemas.BifrostContextKeyStreamAttemptAbort)
+	// A per-attempt request timeout belongs to the attempt whose PreLLMHook set it.
+	ctx.ClearValue(schemas.BifrostContextKeyAttemptRequestTimeout)
 	ctx.ClearValue(schemas.BifrostContextKeySupportsAssistantPrefill)
 	ctx.ClearValue(schemas.BifrostContextKeyDisableStore)
 	// Provider response headers belong to the provider that produced them.

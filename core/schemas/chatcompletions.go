@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -50,7 +51,7 @@ type BifrostChatResponse struct {
 	Diagnostics         *CacheDiagnostics          `json:"diagnostics,omitempty"`   // Anthropic cache diagnostics (cache-diagnosis-2026-04-07); first prompt-cache prefix divergence point
 	SystemFingerprint   string                     `json:"system_fingerprint"`
 	PromptFilterResults json.RawMessage            `json:"prompt_filter_results,omitempty"` // Azure content-filter annotations for the prompt, passed through untouched
-	Usage               *BifrostLLMUsage           `json:"usage"`
+	Usage               *BifrostLLMUsage           `json:"usage,omitempty"`
 	ExtraFields         BifrostResponseExtraFields `json:"extra_fields"`
 	ExtraParams         map[string]interface{}     `json:"-"`
 
@@ -265,6 +266,8 @@ type ChatParameters struct {
 	// the combination; providers without the concept ignore it.
 	IncludeServerSideToolInvocations *bool `json:"include_server_side_tool_invocations,omitempty"`
 
+	LegacyMaxTokens bool `json:"-"` // Caller sent MaxCompletionTokens as max_tokens
+
 	// Dynamic parameters that can be provider-specific, they are directly
 	// added to the request as is.
 	ExtraParams map[string]interface{} `json:"-"`
@@ -275,12 +278,13 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 	// Alias to avoid recursion
 	type Alias ChatParameters
 
-	// Aux struct adds flat reasoning_* shorthands for decoding
+	// Aux struct accepts both stop forms and flat reasoning_* shorthands.
 	var aux struct {
 		*Alias
-		ReasoningEffort    *string `json:"reasoning_effort"` // only for input
-		ReasoningMaxTokens *int    `json:"reasoning_max_tokens"`
-		ReasoningDisplay   *string `json:"reasoning_display"`
+		Stop               json.RawMessage `json:"stop"`
+		ReasoningEffort    *string         `json:"reasoning_effort"` // only for input
+		ReasoningMaxTokens *int            `json:"reasoning_max_tokens"`
+		ReasoningDisplay   *string         `json:"reasoning_display"`
 	}
 
 	aux.Alias = (*Alias)(cp)
@@ -288,6 +292,19 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 	// Single unmarshal
 	if err := Unmarshal(data, &aux); err != nil {
 		return err
+	}
+
+	// OpenAI accepts a string or string array; providers use the array form internally.
+	if stop := bytes.TrimSpace(aux.Stop); len(stop) > 0 {
+		if stop[0] == '"' {
+			var sequence string
+			if err := Unmarshal(stop, &sequence); err != nil {
+				return fmt.Errorf("invalid stop parameter: %w", err)
+			}
+			cp.Stop = []string{sequence}
+		} else if err := Unmarshal(stop, &cp.Stop); err != nil {
+			return fmt.Errorf("invalid stop parameter: %w", err)
+		}
 	}
 
 	// Now aux.Reasoning (from Alias) and aux.ReasoningEffort are filled
@@ -352,8 +369,41 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 
 // ChatAudioParameters represents the parameters for a chat audio completion. (Only supported by OpenAI Models that support audio input)
 type ChatAudioParameters struct {
-	Format string `json:"format,omitempty"` // Format for the audio completion
-	Voice  string `json:"voice,omitempty"`  // Voice to use for the audio completion
+	Format      string          `json:"format,omitempty"` // Format for the audio completion
+	Voice       string          `json:"voice,omitempty"`  // Voice to use for the audio completion
+	VoiceObject json.RawMessage `json:"-"`                // Object-form voice (e.g. {"id":"voice_123"}), sent instead of Voice when set
+}
+
+// UnmarshalJSON accepts the voice as a built-in voice name or as an object
+// (custom voices), keeping the object verbatim in VoiceObject.
+func (a *ChatAudioParameters) UnmarshalJSON(data []byte) error {
+	type Alias ChatAudioParameters
+	var aux struct {
+		Alias
+		Voice json.RawMessage `json:"voice"`
+	}
+	if err := Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*a = ChatAudioParameters(aux.Alias)
+	if voice := bytes.TrimSpace(aux.Voice); len(voice) > 0 && voice[0] == '{' {
+		a.VoiceObject = voice
+	} else if len(voice) > 0 {
+		return Unmarshal(voice, &a.Voice)
+	}
+	return nil
+}
+
+// MarshalJSON emits VoiceObject as the voice when set, otherwise the voice name.
+func (a ChatAudioParameters) MarshalJSON() ([]byte, error) {
+	type Alias ChatAudioParameters
+	if len(a.VoiceObject) == 0 {
+		return MarshalSorted(Alias(a))
+	}
+	return MarshalSorted(struct {
+		Alias
+		Voice json.RawMessage `json:"voice"`
+	}{Alias: Alias(a), Voice: a.VoiceObject})
 }
 
 // Not in OpenAI's spec, but needed to support extra parameters for reasoning.
@@ -690,7 +740,13 @@ type ToolFunctionParameters struct {
 	keyOrder JSONKeyOrder `json:"-"`
 	// explicitEmptyObject tracks a client-supplied raw {} schema.
 	explicitEmptyObject bool `json:"-"`
+	// extraKeywords holds top-level keywords without a typed field, verbatim.
+	extraKeywords []JSONRawField `json:"-"`
 }
+
+// toolFunctionParametersKeys is the set of top-level keywords ToolFunctionParameters
+// has a typed field for; every other keyword is carried verbatim in extraKeywords.
+var toolFunctionParametersKeys = jsonFieldNames(reflect.TypeFor[ToolFunctionParameters]())
 
 // MarshalJSON serializes ToolFunctionParameters while preserving the original
 // top-level key order when available. A client-supplied raw `{}` stays `{}`;
@@ -709,6 +765,11 @@ func (t ToolFunctionParameters) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(t.extraKeywords) > 0 {
+		if data, err = appendRawFields(data, t.extraKeywords); err != nil {
+			return nil, err
+		}
+	}
 	return t.keyOrder.Apply(data)
 }
 
@@ -723,11 +784,23 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 		data = []byte(jsonStr)
 	}
 	type Alias ToolFunctionParameters
-	var temp Alias
+	// enum is decoded raw: JSON Schema allows values of any type, the typed field
+	// only strings.
+	var temp struct {
+		Alias
+		Enum json.RawMessage `json:"enum"`
+	}
 	if err := Unmarshal(data, &temp); err != nil {
 		return fmt.Errorf("failed to unmarshal ToolFunctionParameters: %w", err)
 	}
-	*t = ToolFunctionParameters(temp)
+	*t = ToolFunctionParameters(temp.Alias)
+	t.extraKeywords = t.keyOrder.CaptureUnknown(data, toolFunctionParametersKeys)
+	if len(temp.Enum) > 0 {
+		if err := Unmarshal(temp.Enum, &t.Enum); err != nil {
+			t.Enum = nil
+			t.extraKeywords = append(t.extraKeywords, JSONRawField{Key: "enum", Value: temp.Enum})
+		}
+	}
 
 	// Normalize additionalProperties: null to omitted field
 	if t.AdditionalProperties != nil &&
@@ -743,7 +816,6 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 	} else {
 		t.explicitEmptyObject = false
 	}
-	t.keyOrder.Capture(data)
 	return nil
 }
 
@@ -769,6 +841,10 @@ func (t *ToolFunctionParameters) Normalized() *ToolFunctionParameters {
 	}
 	out := *t
 	out.keyOrder = JSONKeyOrder{}
+	if len(t.extraKeywords) > 1 {
+		out.extraKeywords = slices.Clone(t.extraKeywords)
+		slices.SortFunc(out.extraKeywords, func(a, b JSONRawField) int { return strings.Compare(a.Key, b.Key) })
+	}
 	// Properties contains user-defined field names whose order is semantically
 	// meaningful for LLM structured output generation. Preserve their key order
 	// while sorting nested schema structural keys for caching determinism.
@@ -824,7 +900,7 @@ func (t *ToolFunctionParameters) hasDefinedSchemaFields() bool {
 	if t == nil {
 		return false
 	}
-	if t.Type != "" || t.Description != nil || len(t.Required) > 0 || t.AdditionalProperties != nil || len(t.Enum) > 0 {
+	if t.Type != "" || t.Description != nil || len(t.Required) > 0 || t.AdditionalProperties != nil || len(t.Enum) > 0 || len(t.extraKeywords) > 0 {
 		return true
 	}
 	if t.Properties != nil || t.Defs != nil || t.Definitions != nil || t.Ref != nil {
@@ -1849,6 +1925,7 @@ type BifrostResponseChoice struct {
 	FinishReason         *string          `json:"finish_reason"`
 	LogProbs             *BifrostLogProbs `json:"logprobs"`
 	ContentFilterResults json.RawMessage  `json:"content_filter_results,omitempty"` // Azure content-filter annotations for this choice, passed through untouched
+	Error                json.RawMessage  `json:"error,omitempty"`                  // In-band failure of this choice on a 200 (OpenRouter), passed through untouched
 
 	*TextCompletionResponseChoice
 	*ChatNonStreamResponseChoice

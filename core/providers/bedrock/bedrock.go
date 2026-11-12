@@ -47,6 +47,7 @@ type BedrockProvider struct {
 	customProviderConfig  *schemas.CustomProviderConfig // Custom provider config
 	sendBackRawRequest    bool                          // Whether to include raw request in BifrostResponse
 	sendBackRawResponse   bool                          // Whether to include raw response in BifrostResponse
+	runtimeBaseURL        string                        // Request-scoped origin for bedrock-runtime model invocation (see ForRequest); empty uses the regional host
 }
 
 // assumeRoleCredsCache caches *aws.CredentialsCache instances keyed by the
@@ -82,6 +83,14 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 	config.CheckAndSetDefaults()
 
 	requestTimeout := time.Second * time.Duration(config.NetworkConfig.DefaultRequestTimeoutInSeconds)
+	// On an instance with context-bound reads (one serving request-scoped configuration) the
+	// request timeout does not bound the wait for a response, unary or a stream's headers; the
+	// request context and the attempt's request timeout do (DoAttemptHTTPRequest). It still
+	// bounds the dial, and the TLS handshake keeps its own timeout.
+	responseTimeout := requestTimeout
+	if config.NetworkConfig.ContextBoundReads {
+		responseTimeout = 0
+	}
 
 	// Bedrock's runtime client is net/http, so proxy_config has to be applied here
 	// explicitly; ConfigureProxy below only covers the fasthttp Mantle clients. With
@@ -91,23 +100,35 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 		return nil, err
 	}
 	proxyFromConfig := proxy != nil
-	if !proxyFromConfig {
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	switch {
+	case proxyFromConfig:
+	case config.NetworkConfig.LoopbackIsPrivate:
+		// An instance serving request-scoped configuration can be pointed at a caller-chosen
+		// origin (ForRequest), so it dials directly, like its fasthttp clients, through the
+		// same private-network checks they apply.
+		dialContext = providerUtils.NetHTTPDialContextFor(config.NetworkConfig, requestTimeout)
+	default:
 		proxy = providerUtils.EnvProxyFunc()
 	}
 
-	transport, err := newBedrockHTTPTransport(config, proxy, proxyFromConfig, proxyTLS, proxyHopTLS, requestTimeout, config.NetworkConfig.EnforceHTTP2)
+	if dialContext == nil && config.NetworkConfig.ContextBoundReads {
+		dialContext = (&net.Dialer{Timeout: requestTimeout}).DialContext
+	}
+
+	transport, err := newBedrockHTTPTransport(config, proxy, proxyFromConfig, dialContext, proxyTLS, proxyHopTLS, responseTimeout, config.NetworkConfig.EnforceHTTP2)
 	if err != nil {
 		return nil, err
 	}
 	// Nova Sonic's bidirectional stream is HTTP/2 only, so it needs its own transport unless enforce_http2 is on.
 	realtimeTransport := transport
 	if !config.NetworkConfig.EnforceHTTP2 {
-		if realtimeTransport, err = newBedrockHTTPTransport(config, proxy, proxyFromConfig, proxyTLS, proxyHopTLS, requestTimeout, true); err != nil {
+		if realtimeTransport, err = newBedrockHTTPTransport(config, proxy, proxyFromConfig, dialContext, proxyTLS, proxyHopTLS, responseTimeout, true); err != nil {
 			return nil, err
 		}
 	}
 
-	client := &http.Client{Transport: transport, Timeout: requestTimeout}
+	client := &http.Client{Transport: transport, Timeout: responseTimeout}
 	streamingClient := providerUtils.BuildStreamingHTTPClient(client)
 	realtimeClient := &http.Client{Transport: realtimeTransport}
 
@@ -134,7 +155,7 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 		ConnPoolStrategy:       fasthttp.FIFO,
 	}
 	mantleFasthttpClient = providerUtils.ConfigureProxy(mantleFasthttpClient, config.ProxyConfig, logger)
-	mantleFasthttpClient = providerUtils.ConfigureDialer(mantleFasthttpClient, config.NetworkConfig.AllowPrivateNetwork)
+	mantleFasthttpClient = providerUtils.ConfigureDialerFor(mantleFasthttpClient, config.NetworkConfig)
 	mantleFasthttpClient = providerUtils.ConfigureTLS(mantleFasthttpClient, config.NetworkConfig, logger)
 	mantleStreamingFasthttpClient := providerUtils.BuildStreamingClient(mantleFasthttpClient)
 
@@ -158,16 +179,18 @@ func NewBedrockProvider(config *schemas.ProviderConfig, logger schemas.Logger) (
 }
 
 // newBedrockHTTPTransport returns an independent transport; enabling HTTP/2 mutates it and its TLS config.
-func newBedrockHTTPTransport(config *schemas.ProviderConfig, proxy func(*http.Request) (*url.URL, error), proxyFromConfig bool, proxyTLS, proxyHopTLS *tls.Config, requestTimeout time.Duration, enforceHTTP2 bool) (*http.Transport, error) {
+// A nil dialContext is net/http's default dial.
+func newBedrockHTTPTransport(config *schemas.ProviderConfig, proxy func(*http.Request) (*url.URL, error), proxyFromConfig bool, dialContext func(ctx context.Context, network, addr string) (net.Conn, error), proxyTLS, proxyHopTLS *tls.Config, responseHeaderTimeout time.Duration, enforceHTTP2 bool) (*http.Transport, error) {
 	transport := &http.Transport{
 		Proxy:                 proxy,
+		DialContext:           providerUtils.ObservedDialContext(dialContext),
 		TLSClientConfig:       proxyTLS.Clone(), // HTTP/2 setup appends to NextProtos, so never share it
 		MaxConnsPerHost:       config.NetworkConfig.MaxConnsPerHost,
 		MaxIdleConns:          schemas.DefaultMaxIdleConnsPerHost,
 		MaxIdleConnsPerHost:   schemas.DefaultMaxIdleConnsPerHost,
 		IdleConnTimeout:       time.Second * time.Duration(config.NetworkConfig.KeepAliveTimeoutInSeconds),
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: requestTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     enforceHTTP2,
 	}
@@ -232,6 +255,89 @@ func newBedrockHTTPTransport(config *schemas.ProviderConfig, proxy func(*http.Re
 // GetProviderKey returns the provider identifier for Bedrock.
 func (provider *BedrockProvider) GetProviderKey() schemas.ModelProvider {
 	return providerUtils.GetProviderName(schemas.Bedrock, provider.customProviderConfig)
+}
+
+// ForRequest implements schemas.RequestScopedProvider. Bedrock is served with an API key or a
+// static access key and secret key, in the region on the key: an attempt never falls back to
+// the AWS default credential chain or assumes a role, whose credentials are cached per role.
+// File and batch operations always sign with SigV4, so they need the static keys. Regions are
+// checked and endpoint overrides rejected, because they choose the host Bifrost connects to.
+//
+// A base URL (for example a VPC endpoint or a signing proxy) replaces the bedrock-runtime host
+// for model invocation only, Converse and InvokeModel, unary and streaming; its scheme is used
+// as given. Requests are signed exactly as without it, for the URL actually sent. Every other
+// Bedrock service (control plane, S3, batch, files, agent runtime, Mantle, the runtime's
+// OpenAI-compatible surface) keeps its AWS host, so an attempt that would reach one with a
+// base URL is refused: here by request type, and when the model routes away from Converse and
+// InvokeModel, by the operation.
+func (provider *BedrockProvider) ForRequest(requestType schemas.RequestType, key schemas.Key, baseURL string) (schemas.Provider, error) {
+	if baseURL != "" && !bedrockRuntimeInvocation(requestType) {
+		return nil, errors.New("bedrock takes a base URL only for model invocation (Converse and InvokeModel)")
+	}
+	cfg := key.BedrockKeyConfig
+	if cfg == nil || !AWSRegionRegex.MatchString(cfg.Region.GetValue()) {
+		return nil, errors.New("bedrock requires a valid bedrock_key_config.region")
+	}
+	for _, alias := range key.Aliases {
+		if region := alias.Region.GetValue(); region != "" && !AWSRegionRegex.MatchString(region) {
+			return nil, errors.New("bedrock alias regions must be valid AWS regions")
+		}
+	}
+	if cfg.RoleARN.GetValue() != "" || cfg.Endpoints != nil {
+		return nil, errors.New("bedrock role assumption and endpoint overrides are not supported")
+	}
+	if cfg.AccessKey.GetValue() == "" || cfg.SecretKey.GetValue() == "" {
+		if key.Value.GetValue() == "" {
+			return nil, errors.New("bedrock requires an API key, or an access key and secret key")
+		}
+		switch requestType {
+		case schemas.FileUploadRequest, schemas.FileListRequest, schemas.FileRetrieveRequest, schemas.FileDeleteRequest, schemas.FileContentRequest,
+			schemas.BatchCreateRequest, schemas.BatchListRequest, schemas.BatchRetrieveRequest, schemas.BatchCancelRequest, schemas.BatchResultsRequest, schemas.BatchDeleteRequest:
+			return nil, errors.New("bedrock file and batch operations require an access key and secret key")
+		}
+	}
+	if baseURL != "" {
+		scoped := *provider
+		scoped.runtimeBaseURL = baseURL
+		return &scoped, nil
+	}
+	return provider, nil
+}
+
+// bedrockRuntimeInvocation reports whether Bedrock serves requestType by invoking a model on
+// bedrock-runtime (Converse or InvokeModel), the only calls a request-scoped base URL reaches.
+func bedrockRuntimeInvocation(requestType schemas.RequestType) bool {
+	switch requestType {
+	case schemas.TextCompletionRequest, schemas.TextCompletionStreamRequest,
+		schemas.ChatCompletionRequest, schemas.ChatCompletionStreamRequest,
+		schemas.ResponsesRequest, schemas.ResponsesStreamRequest,
+		schemas.EmbeddingRequest, schemas.ImageGenerationRequest, schemas.ImageEditRequest, schemas.ImageVariationRequest:
+		return true
+	}
+	return false
+}
+
+// runtimeModelURL returns the URL of the bedrock-runtime model operation at path
+// ("<model>/<action>"): on the request-scoped base URL when the attempt has one, otherwise on
+// the key's runtime endpoint override or the regional host.
+func (provider *BedrockProvider) runtimeModelURL(key schemas.Key, region, path string) string {
+	if provider.runtimeBaseURL != "" {
+		return provider.runtimeBaseURL + "/model/" + path
+	}
+	return fmt.Sprintf("https://%s/model/%s", resolveBedrockHost(bedrockEndpoints(key.BedrockKeyConfig), bedrockServiceRuntime, region), path)
+}
+
+// checkBaseURLSurface refuses an attempt with a request-scoped base URL whose model routes to
+// Mantle or to bedrock-runtime's OpenAI-compatible surface: the base URL stands in only for
+// Converse and InvokeModel, and the attempt must not go to an AWS host instead.
+func (provider *BedrockProvider) checkBaseURLSurface(ctx *schemas.BifrostContext, key schemas.Key, surface bedrockSurface, model string, api schemas.BedrockAPI) *schemas.BifrostError {
+	if provider.runtimeBaseURL == "" {
+		return nil
+	}
+	if surface.isMantle() || runtimeServesOpenAIAPI(ctx, key, surface, model, api) {
+		return providerUtils.NewBifrostBadRequestError(fmt.Sprintf("bedrock model %q is not served by Converse or InvokeModel, which a base URL is limited to", model))
+	}
+	return nil
 }
 
 // isStreamTransportError reports whether err is a transport-level connection
@@ -379,7 +485,7 @@ func (provider *BedrockProvider) completeRequest(ctx *schemas.BifrostContext, js
 	region := resolveBedrockRegion(ctx, key, model)
 
 	// Create the request with the JSON body
-	requestURL := fmt.Sprintf("https://%s/model/%s", resolveBedrockHost(bedrockEndpoints(config), bedrockServiceRuntime, region), path)
+	requestURL := provider.runtimeModelURL(key, region, path)
 	req, err := http.NewRequestWithContext(ctx, "POST", requestURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, 0, nil, &schemas.BifrostError{
@@ -445,7 +551,7 @@ func newRequestError(err error, latency time.Duration) *schemas.BifrostError {
 func (provider *BedrockProvider) executeBedrockRequest(req *http.Request) ([]byte, time.Duration, map[string]string, *schemas.BifrostError) {
 	// Execute the request and measure latency
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	latency := time.Since(startTime)
 	if err != nil {
 		return nil, latency, nil, newRequestError(err, latency)
@@ -466,6 +572,10 @@ func (provider *BedrockProvider) executeBedrockRequest(req *http.Request) ([]byt
 		}
 	}
 	if err != nil {
+		// The attempt's request timeout or the request deadline expired mid-body.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), latency)
+		}
 		return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(&schemas.BifrostError{
 			IsBifrostError: true,
 			Error: &schemas.ErrorField{
@@ -514,7 +624,7 @@ func (provider *BedrockProvider) completeAgentRuntimeRequest(ctx *schemas.Bifros
 	}
 
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	latency := time.Since(startTime)
 	if err != nil {
 		return nil, latency, nil, newRequestError(err, latency)
@@ -526,6 +636,10 @@ func (provider *BedrockProvider) completeAgentRuntimeRequest(ctx *schemas.Bifros
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		// The attempt's request timeout or the request deadline expired mid-body.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, err), latency)
+		}
 		return nil, latency, providerResponseHeaders, providerUtils.SetErrorLatency(&schemas.BifrostError{
 			IsBifrostError: true,
 			Error: &schemas.ErrorField{
@@ -550,7 +664,7 @@ func (provider *BedrockProvider) makeStreamingRequest(ctx *schemas.BifrostContex
 	path, region := provider.getModelPathAndRegion(ctx, action, model, key)
 
 	// Create HTTP request for streaming
-	requestURL := fmt.Sprintf("https://%s/model/%s", resolveBedrockHost(bedrockEndpoints(key.BedrockKeyConfig), bedrockServiceRuntime, region), path)
+	requestURL := provider.runtimeModelURL(key, region, path)
 	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(jsonData))
 	if reqErr != nil {
 		return nil, providerUtils.NewBifrostOperationError("error creating request", reqErr)
@@ -582,7 +696,7 @@ func (provider *BedrockProvider) makeStreamingRequest(ctx *schemas.BifrostContex
 
 	// Make the request
 	startTime := time.Now()
-	resp, respErr := providerUtils.DoHTTPRequest(provider.streamingClient, req)
+	resp, respErr := providerUtils.DoAttemptStreamingHTTPRequest(provider.streamingClient, req)
 	latency := time.Since(startTime)
 	if respErr != nil {
 		return nil, newRequestError(respErr, latency)
@@ -900,7 +1014,7 @@ func (provider *BedrockProvider) listMantleModels(ctx *schemas.BifrostContext, k
 		return nil
 	}
 
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	if err != nil {
 		provider.logger.Warn("mantle list-models request failed: %v", err)
 		return nil
@@ -981,7 +1095,7 @@ func (provider *BedrockProvider) listModelsByKey(ctx *schemas.BifrostContext, ke
 	startTime := time.Now()
 
 	// Execute the request
-	resp, err := providerUtils.DoHTTPRequest(provider.client, req)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, req)
 	latency := time.Since(startTime)
 	if err != nil {
 		return nil, newRequestError(err, latency)
@@ -1302,6 +1416,9 @@ func (provider *BedrockProvider) ChatCompletion(ctx *schemas.BifrostContext, key
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIChatCompletions); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleChatCompletions(ctx, key, request)
 	}
@@ -1504,6 +1621,9 @@ func (provider *BedrockProvider) ChatCompletionStream(ctx *schemas.BifrostContex
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIChatCompletions); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleChatCompletionsStream(ctx, postHookRunner, postHookSpanFinalizer, key, request)
 	}
@@ -1867,6 +1987,9 @@ func (provider *BedrockProvider) Responses(ctx *schemas.BifrostContext, key sche
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIResponses); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleResponses(ctx, key, request)
 	}
@@ -1963,6 +2086,9 @@ func (provider *BedrockProvider) ResponsesStream(ctx *schemas.BifrostContext, po
 	}
 
 	surface := provider.resolveSurface(ctx, key, request.Model)
+	if err := provider.checkBaseURLSurface(ctx, key, surface, request.Model, schemas.BedrockAPIResponses); err != nil {
+		return nil, err
+	}
 	if surface.isMantle() {
 		return provider.mantleResponsesStream(ctx, postHookRunner, postHookSpanFinalizer, key, request)
 	}
@@ -2961,7 +3087,7 @@ func (provider *BedrockProvider) FileUpload(ctx *schemas.BifrostContext, key sch
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3093,7 +3219,7 @@ func (provider *BedrockProvider) FileList(ctx *schemas.BifrostContext, keys []sc
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3208,7 +3334,7 @@ func (provider *BedrockProvider) FileRetrieve(ctx *schemas.BifrostContext, keys 
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -3309,7 +3435,7 @@ func (provider *BedrockProvider) FileDelete(ctx *schemas.BifrostContext, keys []
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -3393,7 +3519,7 @@ func (provider *BedrockProvider) FileContent(ctx *schemas.BifrostContext, keys [
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -3602,7 +3728,7 @@ func (provider *BedrockProvider) BatchCreate(ctx *schemas.BifrostContext, key sc
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3732,7 +3858,7 @@ func (provider *BedrockProvider) BatchList(ctx *schemas.BifrostContext, keys []s
 
 	// Execute request
 	startTime := time.Now()
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	latency := time.Since(startTime)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -3850,7 +3976,7 @@ func (provider *BedrockProvider) fetchBatchManifest(ctx *schemas.BifrostContext,
 		return nil
 	}
 
-	resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+	resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 	if err != nil {
 		provider.logger.Error("failed to fetch manifest: %v", err)
 		return nil
@@ -3926,7 +4052,7 @@ func (provider *BedrockProvider) BatchRetrieve(ctx *schemas.BifrostContext, keys
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -4074,7 +4200,7 @@ func (provider *BedrockProvider) BatchCancel(ctx *schemas.BifrostContext, keys [
 
 		// Execute request
 		startTime := time.Now()
-		resp, err := providerUtils.DoHTTPRequest(provider.client, httpReq)
+		resp, err := providerUtils.DoAttemptHTTPRequest(provider.client, httpReq)
 		latency := time.Since(startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -4638,8 +4764,7 @@ func invokeIngressThinkingNeedsInvokePath(ctx *schemas.BifrostContext, reasoning
 // the same region and model-path resolution as the Converse path.
 func (provider *BedrockProvider) invokeURL(ctx *schemas.BifrostContext, key schemas.Key, model, action string) (requestURL, region string) {
 	path, region := provider.getModelPathAndRegion(ctx, action, model, key)
-	host := resolveBedrockHost(bedrockEndpoints(key.BedrockKeyConfig), bedrockServiceRuntime, region)
-	return fmt.Sprintf("https://%s/model/%s", host, path), region
+	return provider.runtimeModelURL(key, region, path), region
 }
 
 // invokeSigner returns a SigV4 body signer for bedrock-runtime, or nil when the

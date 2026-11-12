@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/maximhq/bifrost/core/network"
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/valyala/fasthttp"
 )
 
@@ -29,10 +30,11 @@ func TestConfigureDialer_SetsRetryIfErr(t *testing.T) {
 		t.Fatal("ConfigureDialer should set RetryIfErr")
 	}
 
-	// Verify it behaves like StaleConnectionRetryIfErr
+	// Verify it behaves like StaleConnectionRetryIfErr: retry within the
+	// original deadline, never with a reset timeout.
 	reset, retry := client.RetryIfErr(nil, 1, fmt.Errorf("cannot find whitespace in the first line of response"))
-	if !reset || !retry {
-		t.Error("RetryIfErr should retry on whitespace error")
+	if reset || !retry {
+		t.Errorf("RetryIfErr on whitespace error = (reset %t, retry %t), want (false, true)", reset, retry)
 	}
 	reset, retry = client.RetryIfErr(nil, 1, fmt.Errorf("dial tcp: no such host"))
 	if reset || retry {
@@ -350,8 +352,8 @@ func TestConfigureRetry_Deprecated(t *testing.T) {
 
 	// Verify it uses the same StaleConnectionRetryIfErr
 	reset, retry := client.RetryIfErr(nil, 1, fmt.Errorf("cannot find whitespace"))
-	if !reset || !retry {
-		t.Error("ConfigureRetry should install StaleConnectionRetryIfErr")
+	if reset || !retry {
+		t.Errorf("ConfigureRetry RetryIfErr = (reset %t, retry %t), want StaleConnectionRetryIfErr's (false, true)", reset, retry)
 	}
 }
 
@@ -394,6 +396,117 @@ func TestConfigureDialer_SSRFProtection(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}
+
+// TestConfigureDialerFor_LoopbackIsPrivate verifies that a client built with
+// LoopbackIsPrivate reaches loopback only when private networks are allowed, while
+// ConfigureDialer keeps loopback reachable.
+func TestConfigureDialerFor_LoopbackIsPrivate(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	tests := []struct {
+		name    string
+		build   func(*fasthttp.Client) *fasthttp.Client
+		wantErr bool
+	}{
+		{"ConfigureDialer", func(c *fasthttp.Client) *fasthttp.Client { return ConfigureDialer(c, false) }, false},
+		{"network config", func(c *fasthttp.Client) *fasthttp.Client { return ConfigureDialerFor(c, schemas.NetworkConfig{}) }, false},
+		{"loopback private", func(c *fasthttp.Client) *fasthttp.Client {
+			return ConfigureDialerFor(c, schemas.NetworkConfig{LoopbackIsPrivate: true})
+		}, true},
+		{"loopback private, private network allowed", func(c *fasthttp.Client) *fasthttp.Client {
+			return ConfigureDialerFor(c, schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true})
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := tt.build(&fasthttp.Client{ReadTimeout: time.Second})
+			conn, err := client.Dial(ln.Addr().String())
+			if conn != nil {
+				conn.Close()
+			}
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "private IP") {
+					t.Fatalf("expected the loopback dial to be refused, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected the loopback dial to succeed, got %v", err)
+			}
+		})
+	}
+
+	// Link-local stays blocked even with private networks allowed.
+	client := ConfigureDialerFor(&fasthttp.Client{ReadTimeout: time.Second}, schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true})
+	if _, err := client.Dial("169.254.169.254:80"); err == nil || !strings.Contains(err.Error(), "link-local IP") {
+		t.Fatalf("expected link-local to be refused, got %v", err)
+	}
+}
+
+// TestNetHTTPDialContextFor applies ConfigureDialerFor's address policy to net/http dials:
+// loopback with LoopbackIsPrivate needs AllowPrivateNetwork, unspecified and link-local
+// addresses are always refused.
+func TestNetHTTPDialContextFor(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	tests := []struct {
+		name    string
+		config  schemas.NetworkConfig
+		addr    string
+		wantErr string
+	}{
+		{"loopback", schemas.NetworkConfig{}, ln.Addr().String(), ""},
+		{"loopback private", schemas.NetworkConfig{LoopbackIsPrivate: true}, ln.Addr().String(), "private IP"},
+		{"loopback private, private network allowed", schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true}, ln.Addr().String(), ""},
+		{"RFC 1918", schemas.NetworkConfig{}, "10.0.0.1:80", "private IP"},
+		{"link-local", schemas.NetworkConfig{LoopbackIsPrivate: true, AllowPrivateNetwork: true}, "169.254.169.254:80", "link-local IP"},
+		{"unspecified", schemas.NetworkConfig{AllowPrivateNetwork: true}, "0.0.0.0:80", "unspecified IP"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dial := NetHTTPDialContextFor(tt.config, time.Second)
+			conn, err := dial(t.Context(), "tcp", tt.addr)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected the dial to succeed, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected an error containing %q, got %v", tt.wantErr, err)
 			}
 		})
 	}

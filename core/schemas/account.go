@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -162,6 +163,53 @@ type Key struct {
 	ConfigHash             string                  `json:"config_hash,omitempty"`               // Hash of config.json version, used for change detection
 	Status                 KeyStatusType           `json:"status,omitempty"`                    // Status of key
 	Description            string                  `json:"description,omitempty"`               // Description of key
+}
+
+// hasSecretReference reports whether any SecretVar reachable from the key (its value, its
+// provider configs, its aliases) is an env. or vault. reference rather than a literal value.
+// It walks the key by reflection, so a SecretVar added to Key or to a config later is covered
+// without a change here.
+func (k *Key) hasSecretReference() bool {
+	return k != nil && holdsSecretReference(reflect.ValueOf(k).Elem())
+}
+
+// holdsSecretReference reports whether v, or anything reachable from it through exported
+// fields, pointers, interfaces, maps, slices and arrays, is a SecretVar that is a reference.
+func holdsSecretReference(v reflect.Value) bool {
+	if v.Type() == secretVarType {
+		if v.CanAddr() {
+			return v.Addr().Interface().(*SecretVar).IsFromSecret()
+		}
+		secret := v.Interface().(SecretVar)
+		return secret.IsFromSecret()
+	}
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		return !v.IsNil() && holdsSecretReference(v.Elem())
+	case reflect.Struct:
+		for i := range v.NumField() {
+			// CanInterface is false for an unexported field (and everything under it).
+			if field := v.Field(i); field.CanInterface() && holdsSecretReference(field) {
+				return true
+			}
+		}
+	case reflect.Map:
+		if v.Len() == 0 {
+			return false
+		}
+		for iter := v.MapRange(); iter.Next(); {
+			if holdsSecretReference(iter.Value()) {
+				return true
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := range v.Len() {
+			if holdsSecretReference(v.Index(i)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ModelFamily is a typed enum identifying the underlying model family of an alias target.
@@ -835,6 +883,13 @@ type VertexKeyConfig struct {
 	UseSessionRouting bool `json:"use_session_routing,omitempty"`
 	// AWSWorkloadIdentity federates the workload's AWS identity into GCP; see VertexAWSWorkloadIdentityConfig.
 	AWSWorkloadIdentity *VertexAWSWorkloadIdentityConfig `json:"aws_workload_identity,omitempty"`
+	// AccessToken is a ready OAuth 2.0 access token with the cloud-platform scope, minted and
+	// refreshed by the caller. When set, every Vertex call authenticates with it
+	// as given: no token source is built or cached, and AuthCredentials, AWSWorkloadIdentity
+	// and Application Default Credentials are never consulted. It is the only credential a
+	// request-scoped Vertex key (BifrostRequest.UpdateProviderKey) may carry. Runtime-only:
+	// it is never serialized, persisted or returned by the API.
+	AccessToken string `json:"-"`
 }
 
 // VertexAWSWorkloadIdentityConfig configures GCP Workload Identity Federation from an AWS identity.

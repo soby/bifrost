@@ -61,6 +61,10 @@ type Store struct {
 	baseModelIndex         map[string]string                              // model → canonical base name
 	supportedResponseTypes map[string][]string                            // model → [chat_completion, responses, …]
 	supportedParams        map[string][]string                            // model → [temperature, top_p, …]
+	// parameterRows holds the model-parameters rows (model → raw row JSON)
+	// when there is no config store, so the row lookups below answer from
+	// memory exactly as they would from the database.
+	parameterRows map[string]string
 
 	// onModelParametersApplied fires after a model-parameters reload lands, so
 	// caches built from the previous sheet can be dropped.

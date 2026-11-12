@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,18 +151,25 @@ func TestRelayGatewayHeadersErrorsAndExtraHeaders(t *testing.T) {
 }
 
 func TestRelayStreamRunsDeferredTransportPostHooks(t *testing.T) {
-	var slot atomic.Value
+	marked := func() *fasthttp.RequestCtx {
+		ctx := &fasthttp.RequestCtx{}
+		ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, true)
+		return ctx
+	}
+	slot := lib.NewTransportPostHookCompleterSlot(marked())
 	ran := false
-	slot.Store(func() ([]schemas.PluginLogEntry, error) {
+	slot.Resolve(func() ([]schemas.PluginLogEntry, error) {
 		ran = true
 		return []schemas.PluginLogEntry{{PluginName: "transport"}}, nil
 	})
-	logs := runTransportPostHookCompleter(&slot, nil)
+	logs := runTransportPostHookCompleter(slot, nil)
 	assert.True(t, ran, "the transport post-hooks run once the stream ends")
 	assert.Len(t, logs, 1)
 
-	var empty atomic.Value
-	assert.Nil(t, runTransportPostHookCompleter(&empty, nil), "no completer published means no transport plugins to run")
+	none := lib.NewTransportPostHookCompleterSlot(marked())
+	none.Resolve(nil)
+	assert.Nil(t, runTransportPostHookCompleter(none, nil), "a slot resolved with no completer has no post-hooks to run")
+	assert.Nil(t, runTransportPostHookCompleter(nil, nil), "no slot means no transport plugins to run")
 }
 
 // serveRelayGatewayHTTP runs the gateway on a real socket, as a relayed stream needs one: the body is
@@ -312,14 +318,8 @@ func BenchmarkRelayStreamForward(b *testing.B) {
 		b.Fatal(err)
 	}
 	gateway := NewRelayGatewayHandler(manager, nil, nil)
-	// Publishes the transport post-hook completer after the handler returns, as
-	// TransportInterceptorMiddleware does, so the stream does not wait out the bounded poll.
-	server := &fasthttp.Server{Handler: func(ctx *fasthttp.RequestCtx) {
-		gateway.handle(ctx)
-		if slot, ok := ctx.UserValue(schemas.BifrostContextKeyTransportPostHookCompleter).(*atomic.Value); ok {
-			slot.Store(func() ([]schemas.PluginLogEntry, error) { return nil, nil })
-		}
-	}}
+	// No transport plugin middleware wraps the handler, so the stream has no completer to wait for.
+	server := &fasthttp.Server{Handler: gateway.handle}
 	go server.Serve(ln)     //nolint:errcheck
 	defer server.Shutdown() //nolint:errcheck
 	url := "http://" + ln.Addr().String() + "/relay/bench/s"
