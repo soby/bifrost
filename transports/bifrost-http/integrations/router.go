@@ -84,6 +84,25 @@ type StreamingRequest interface {
 	IsStreamingRequested() bool
 }
 
+// extraParamsJSON decodes the extra_params object with numbers as json.Number, so
+// integers beyond 2^53 and decimal literals reach the provider exactly as sent.
+var extraParamsJSON = sonic.Config{UseNumber: true}.Froze()
+
+// decodeWrappedExtraParams returns the "extra_params" object of a request body,
+// or nil when the body has none or does not decode.
+func decodeWrappedExtraParams(rawBody []byte) map[string]interface{} {
+	if len(rawBody) == 0 {
+		return nil
+	}
+	var wrapper struct {
+		ExtraParams map[string]interface{} `json:"extra_params"`
+	}
+	if err := extraParamsJSON.Unmarshal(rawBody, &wrapper); err != nil {
+		return nil
+	}
+	return wrapper.ExtraParams
+}
+
 // RequestWithSettableExtraParams is implemented by request types that accept
 // provider-specific extra parameters via the extra_params JSON key. The
 // integration router extracts extra_params from the raw request body and
@@ -829,13 +848,8 @@ func (g *GenericRouter) createHandler(config RouteConfig) fasthttp.RequestHandle
 					if rawBody == nil {
 						rawBody = ctx.Request.Body()
 					}
-					if len(rawBody) > 0 {
-						var wrapper struct {
-							ExtraParams map[string]interface{} `json:"extra_params"`
-						}
-						if err := sonic.Unmarshal(rawBody, &wrapper); err == nil && len(wrapper.ExtraParams) > 0 {
-							rws.SetExtraParams(wrapper.ExtraParams)
-						}
+					if extraParams := decodeWrappedExtraParams(rawBody); len(extraParams) > 0 {
+						rws.SetExtraParams(extraParams)
 					}
 				}
 			}
@@ -2765,35 +2779,73 @@ func (g *GenericRouter) handleStreamingRequest(ctx *fasthttp.RequestCtx, config 
 	// That keeps goroutines and upstream tokens alive long after the SSE writer has exited.
 	//
 	// We now get a cancellable context from ConvertToBifrostContext so we can cancel the upstream stream immediately when the client disconnects.
-	var stream chan *schemas.BifrostStreamChunk
-	var bifrostErr *schemas.BifrostError
 	var requestType schemas.RequestType
+	var getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError)
 
 	// Handle different request types
 	if bifrostReq.TextCompletionRequest != nil {
 		requestType = schemas.TextCompletionStreamRequest
-		stream, bifrostErr = g.client.TextCompletionStreamRequest(bifrostCtx, bifrostReq.TextCompletionRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.TextCompletionStreamRequest(bifrostCtx, bifrostReq.TextCompletionRequest)
+		}
 	} else if bifrostReq.ChatRequest != nil {
 		requestType = schemas.ChatCompletionStreamRequest
-		stream, bifrostErr = g.client.ChatCompletionStreamRequest(bifrostCtx, bifrostReq.ChatRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.ChatCompletionStreamRequest(bifrostCtx, bifrostReq.ChatRequest)
+		}
 	} else if bifrostReq.ResponsesRequest != nil {
 		requestType = schemas.ResponsesStreamRequest
-		stream, bifrostErr = g.client.ResponsesStreamRequest(bifrostCtx, bifrostReq.ResponsesRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.ResponsesStreamRequest(bifrostCtx, bifrostReq.ResponsesRequest)
+		}
 	} else if bifrostReq.ResponsesRetrieveRequest != nil {
 		requestType = schemas.ResponsesRetrieveStreamRequest
-		stream, bifrostErr = g.client.ResponsesRetrieveStreamRequest(bifrostCtx, bifrostReq.ResponsesRetrieveRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.ResponsesRetrieveStreamRequest(bifrostCtx, bifrostReq.ResponsesRetrieveRequest)
+		}
 	} else if bifrostReq.SpeechRequest != nil {
 		requestType = schemas.SpeechStreamRequest
-		stream, bifrostErr = g.client.SpeechStreamRequest(bifrostCtx, bifrostReq.SpeechRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.SpeechStreamRequest(bifrostCtx, bifrostReq.SpeechRequest)
+		}
 	} else if bifrostReq.TranscriptionRequest != nil {
 		requestType = schemas.TranscriptionStreamRequest
-		stream, bifrostErr = g.client.TranscriptionStreamRequest(bifrostCtx, bifrostReq.TranscriptionRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.TranscriptionStreamRequest(bifrostCtx, bifrostReq.TranscriptionRequest)
+		}
 	} else if bifrostReq.ImageGenerationRequest != nil {
 		requestType = schemas.ImageGenerationStreamRequest
-		stream, bifrostErr = g.client.ImageGenerationStreamRequest(bifrostCtx, bifrostReq.ImageGenerationRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.ImageGenerationStreamRequest(bifrostCtx, bifrostReq.ImageGenerationRequest)
+		}
 	} else if bifrostReq.ImageEditRequest != nil {
 		requestType = schemas.ImageEditStreamRequest
-		stream, bifrostErr = g.client.ImageEditStreamRequest(bifrostCtx, bifrostReq.ImageEditRequest)
+		getStream = func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+			return g.client.ImageEditStreamRequest(bifrostCtx, bifrostReq.ImageEditRequest)
+		}
+	}
+
+	// The stream is awaited before any header is written, so setup errors keep their
+	// HTTP status. A plugin that reports it is holding the request before the provider
+	// call commits the event stream early instead (lib.StreamSetup). Only routes whose
+	// streams carry the SSE heartbeat can commit early: the heartbeat is what keeps the
+	// committed connection alive and notices a client that leaves.
+	var stream chan *schemas.BifrostStreamChunk
+	var bifrostErr *schemas.BifrostError
+	if getStream != nil {
+		canCommitEarly := config.StreamConfig != nil && config.Type != RouteConfigTypeBedrock &&
+			config.StreamConfig.HeartbeatFraming != lib.SSEHeartbeatNone
+		setup := lib.StartStreamSetup(bifrostCtx, canCommitEarly, getStream)
+		var committedEarly bool
+		stream, bifrostErr, committedEarly = setup.Await()
+		if committedEarly {
+			ctx.SetContentType("text/event-stream")
+			ctx.Response.Header.Set("Cache-Control", "no-cache")
+			ctx.Response.Header.Set("Connection", "keep-alive")
+			ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+			g.handleCommittedStreaming(ctx, bifrostCtx, config, requestType, nil, cancel, setup)
+			return
+		}
 	}
 
 	// Provider error before streaming started — return proper HTTP error status
@@ -2947,14 +2999,27 @@ func streamErrorEventType(config RouteConfig, bifrostErr *schemas.BifrostError, 
 // cancelling leaks the watcher and the entire request-scoped BifrostContext for as long as the
 // client keeps its connection open.
 func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, config RouteConfig, streamRequestType schemas.RequestType, streamChan chan *schemas.BifrostStreamChunk, cancel context.CancelFunc) {
+	g.handleCommittedStreaming(ctx, bifrostCtx, config, streamRequestType, streamChan, cancel, nil)
+}
+
+// handleCommittedStreaming is handleStreaming for a response that may have been committed
+// before stream setup finished. A non-nil setup means it was (see lib.StreamSetup):
+// streamChan is then nil and the producer obtains the stream from setup while the heartbeat
+// keeps the connection alive. Provider and routed-identity headers are omitted, and a setup
+// error is written as this route's ordinary stream error event.
+func (g *GenericRouter) handleCommittedStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, config RouteConfig, streamRequestType schemas.RequestType, streamChan chan *schemas.BifrostStreamChunk, cancel context.CancelFunc, setup *lib.StreamSetup) {
 	// Signal to tracing middleware that trace completion should be deferred
 	// The streaming callback will complete the trace after the stream ends
 	ctx.SetUserValue(schemas.BifrostContextKeyDeferTraceCompletion, true)
 
+	// Slot for the transport post-hook completer. TransportInterceptorMiddleware stores
+	// the completer into it after next(ctx) returns; the producer goroutine reads it from
+	// this closure-captured pointer (ctx may be recycled by fasthttp by then).
+	completerSlot := lib.NewTransportPostHookCompleterSlot(ctx)
+
 	// Get the trace completer function for use in the streaming callback.
 	// Signature is func([]schemas.PluginLogEntry) so the callback never reads from
 	// ctx.UserValue (ctx may be recycled by fasthttp by the time this fires).
-	// Router path has no transport post-hook phase, so we always pass nil.
 	traceCompleter, _ := ctx.UserValue(schemas.BifrostContextKeyTraceCompleter).(func([]schemas.PluginLogEntry))
 
 	// Read here for the same reason: in headers mode every chunk drops extra_fields.
@@ -2970,6 +3035,7 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 	// Use SSEStreamReader to bypass fasthttp's internal pipe (fasthttputil.PipeConns)
 	// which batches multiple SSE events into single TCP segments.
 	reader := lib.NewSSEStreamReader()
+	reader.SetFrameTap(lib.StreamFrameTap(bifrostCtx))
 	ctx.Response.SetBodyStream(reader, -1)
 
 	// Producer goroutine: processes the stream channel, formats events, sends to reader
@@ -3022,6 +3088,9 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 			// leaving traceCompleter and the post-hooks below an uncancelled context.
 			// cancel is idempotent, so the explicit error-path calls still stand.
 			defer cancel()
+			// Before the heartbeat is stopped, which closes the reader: record how the
+			// request stood when the producer stopped, for the transport post-hooks.
+			completerSlot.CaptureRequestState(bifrostCtx, reader)
 			// The chunk loop below has drained by the time this runs, so every queued
 			// chunk is already converted -- the one ordering a stream cleanup needs.
 			// The error path has its own release in ErrorConverter; this is the normal
@@ -3037,6 +3106,22 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 			}
 			schemas.ReleaseHTTPRequest(httpReq)
 			reader.Done()
+			// Some paths below stop before the provider's stream has ended (an error
+			// chunk, a failed Bedrock event write, a failed [DONE] write). Each of them
+			// cancels the request first, so the provider is stopping. Wait for it here,
+			// now that the client's stream is closed, so the provider goroutine has run
+			// its last post-hooks before the transport post-hooks and the trace complete.
+			// A stream that already ended makes this a no-op.
+			if streamChan != nil {
+				for range streamChan {
+				}
+			}
+			// Run the transport post-hooks, once, on every exit path. Their errors are
+			// logged: nothing more can be sent.
+			var transportLogs []schemas.PluginLogEntry
+			lib.RunRecovered("stream transport post-hook completer", func() {
+				transportLogs = lib.RunTransportPostHookCompleter(completerSlot, g.logger)
+			})
 			// Split the provider-side backpressure into (A) client-write vs (B) transport
 			// CPU using what the send loop just measured. Before traceCompleter so the
 			// attributes are on the root span when the trace exports.
@@ -3044,9 +3129,41 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 			// Complete the trace after streaming finishes
 			// This ensures all spans (including llm.call) are properly ended before the trace is sent to OTEL
 			if traceCompleter != nil {
-				lib.RunRecovered("stream trace completer", func() { traceCompleter(nil) })
+				lib.RunRecovered("stream trace completer", func() { traceCompleter(transportLogs) })
 			}
 		}()
+		// stopProvider cancels the request because the producer has nothing more to
+		// write, not because the request ended: it records the request's state first, so
+		// the transport post-hooks are not told the request was cancelled.
+		stopProvider := func() {
+			completerSlot.CaptureRequestState(bifrostCtx, reader)
+			cancel()
+		}
+		if setup != nil {
+			streamChan = setup.AwaitCommitted(streamRequestType)
+			// Large-response passthrough pipes the raw upstream body, which an
+			// already-committed event stream cannot carry: end it with an error event.
+			// The passthrough reader owns the upstream response, and no fasthttp body
+			// will ever take it here, so this branch closes it exactly once. Cancel
+			// first: Close must not wait on a still-live upstream.
+			if largeResponse, ok := bifrostCtx.Value(schemas.BifrostContextKeyLargeResponseMode).(bool); ok && largeResponse {
+				// The hooks released this response and the transport is discarding it:
+				// it did not deliver what the hooks released.
+				completerSlot.MarkUndelivered()
+				cancel()
+				if upstream, ok := bifrostCtx.Value(schemas.BifrostContextKeyLargeResponseReader).(io.ReadCloser); ok && upstream != nil {
+					bifrostCtx.ClearValue(schemas.BifrostContextKeyLargeResponseReader)
+					if err := upstream.Close(); err != nil {
+						g.logger.Warn("closing the rejected large-response reader after an early commit: %v", err)
+					}
+				}
+				go func(abandoned chan *schemas.BifrostStreamChunk) {
+					for range abandoned {
+					}
+				}(streamChan)
+				streamChan = lib.ErrorStream(newBifrostErrorWithCode(nil, "the response is too large to stream on this connection", fasthttp.StatusBadGateway), streamRequestType)
+			}
+		}
 		// Registered after the teardown above so it runs first: a panic while converting a
 		// chunk is logged, an error frame in the route's format goes to the client, upstream
 		// is cancelled and drained, then the teardown closes the stream. sendPanicError is
@@ -3136,6 +3253,166 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 			shouldSendDoneMarker = false
 		}
 
+		// writeChunk converts one chunk to the route's stream format and sends it. The
+		// outcome says whether it was written and, if the stream has to end here, how.
+		writeChunk := func(chunk *schemas.BifrostStreamChunk) streamChunkOutcome {
+			// Convert response to integration-specific streaming format
+			var eventType string
+			var convertedResponse interface{}
+			var err error
+			converterMissing := false
+
+			cpuStart := time.Now()
+			switch {
+			case chunk.BifrostTextCompletionResponse != nil:
+				if config.StreamConfig.TextStreamResponseConverter == nil {
+					converterMissing = true
+					err = fmt.Errorf("text stream response converter is not configured")
+				} else {
+					eventType, convertedResponse, err = config.StreamConfig.TextStreamResponseConverter(bifrostCtx, chunk.BifrostTextCompletionResponse)
+				}
+			case chunk.BifrostChatResponse != nil:
+				if config.StreamConfig.ChatStreamResponseConverter == nil {
+					converterMissing = true
+					err = fmt.Errorf("chat stream response converter is not configured")
+				} else {
+					eventType, convertedResponse, err = config.StreamConfig.ChatStreamResponseConverter(bifrostCtx, chunk.BifrostChatResponse)
+				}
+			case chunk.BifrostResponsesStreamResponse != nil:
+				if config.StreamConfig.ResponsesStreamResponseConverter == nil {
+					converterMissing = true
+					err = fmt.Errorf("responses stream response converter is not configured")
+				} else {
+					eventType, convertedResponse, err = config.StreamConfig.ResponsesStreamResponseConverter(bifrostCtx, chunk.BifrostResponsesStreamResponse)
+				}
+			case chunk.BifrostSpeechStreamResponse != nil:
+				if config.StreamConfig.SpeechStreamResponseConverter == nil {
+					converterMissing = true
+					err = fmt.Errorf("speech stream response converter is not configured")
+				} else {
+					eventType, convertedResponse, err = config.StreamConfig.SpeechStreamResponseConverter(bifrostCtx, chunk.BifrostSpeechStreamResponse)
+				}
+			case chunk.BifrostTranscriptionStreamResponse != nil:
+				if config.StreamConfig.TranscriptionStreamResponseConverter == nil {
+					converterMissing = true
+					err = fmt.Errorf("transcription stream response converter is not configured")
+				} else {
+					eventType, convertedResponse, err = config.StreamConfig.TranscriptionStreamResponseConverter(bifrostCtx, chunk.BifrostTranscriptionStreamResponse)
+				}
+			case chunk.BifrostImageGenerationStreamResponse != nil:
+				if config.StreamConfig.ImageGenerationStreamResponseConverter == nil {
+					converterMissing = true
+					err = fmt.Errorf("image generation stream response converter is not configured")
+				} else {
+					eventType, convertedResponse, err = config.StreamConfig.ImageGenerationStreamResponseConverter(bifrostCtx, chunk.BifrostImageGenerationStreamResponse)
+				}
+			default:
+				requestType := safeGetRequestType(chunk)
+				convertedResponse, err = nil, fmt.Errorf("no response converter found for request type: %s", requestType)
+			}
+			transportCPUNs += time.Since(cpuStart).Nanoseconds()
+
+			if convertedResponse == nil && err == nil {
+				// Skip streaming chunk if no response is available and no error is returned
+				return streamChunkSkipped
+			}
+
+			if err != nil {
+				g.logger.Warn("Failed to convert streaming response: %v", err)
+				// The chunk passed every hook and the transport could not render it:
+				// the transport did not deliver what the hooks released, whether the
+				// stream ends here or goes on without the chunk.
+				completerSlot.MarkUndelivered()
+				if converterMissing {
+					sendConvertedStreamError(newBifrostErrorWithCode(nil, lib.ClientSafeInternalErrorMessage, fasthttp.StatusInternalServerError))
+					stopProvider()
+					return streamChunkEndsStreamDrained
+				}
+				// Log ordinary conversion errors and continue processing subsequent chunks.
+				return streamChunkSkipped
+			}
+
+			// Handle Bedrock Event Stream format
+			if config.Type == RouteConfigTypeBedrock && eventStreamEncoder != nil {
+				// We need to cast to BedrockStreamEvent to determine event type and structure
+				if bedrockEvent, ok := convertedResponse.(*bedrock.BedrockStreamEvent); ok {
+					if !sendBedrockEventStream(reader, eventStreamEncoder, bedrockEvent, g.logger) {
+						cancel()
+						return streamChunkEndsStream
+					}
+					return streamChunkWritten
+				}
+				// Not a Bedrock event: nothing to send for this chunk
+				return streamChunkSkipped
+			}
+
+			// Build and send SSE event. Time the whole build+send: for the common
+			// pre-formatted-SSE path (Anthropic) the buf build is trivial and this is
+			// essentially the reader.Send socket-write wait; integrations that marshal
+			// here fold a small marshal CPU into this figure, which is acceptable for
+			// the A/B ratio the breakdown derives from it.
+			writeStart := time.Now()
+			var buf []byte
+			var sent bool
+			if sseString, ok := convertedResponse.(string); ok {
+				if strings.HasPrefix(sseString, "data: ") || strings.HasPrefix(sseString, "event: ") {
+					// Pre-formatted SSE string (e.g. Anthropic custom event types)
+					if eventType != "" {
+						// Prepend event type line to pre-formatted data
+						buf = make([]byte, 0, 7+len(eventType)+1+len(sseString))
+						buf = append(buf, "event: "...)
+						buf = append(buf, eventType...)
+						buf = append(buf, '\n')
+						buf = append(buf, sseString...)
+						sent = reader.Send(buf)
+					} else {
+						sent = reader.Send([]byte(sseString))
+					}
+				} else {
+					sent = reader.SendEvent(eventType, []byte(sseString))
+				}
+			} else {
+				responseJSON, err := sonic.Marshal(convertedResponse)
+				if err != nil {
+					g.logger.Warn("Failed to marshal streaming response: %v", err)
+					// A released chunk the transport could not render; see above.
+					completerSlot.MarkUndelivered()
+					return streamChunkSkipped
+				}
+				if stripExtraFields {
+					responseJSON = lib.StripExtraFields(responseJSON)
+				}
+				sent = reader.SendEvent(eventType, responseJSON)
+			}
+
+			if !sent {
+				cancel() // Client disconnected, cancel upstream stream
+				return streamChunkEndsStreamDrained
+			}
+			clientWriteNs += time.Since(writeStart).Nanoseconds()
+			return streamChunkWritten
+		}
+
+		// A stream chunk hook writes additional chunks through schemas.StreamChunkWriter
+		// while it runs: each goes out through writeChunk at once, ahead of the chunk the
+		// hook returns. hookWrite runs only inside a hook call (see
+		// lib.InterceptStreamChunk), so writeChunk never runs beside this loop. hookOutcome
+		// records a write that ended the stream, which takes effect once the hooks return.
+		hookOutcome := streamChunkWritten
+		var hookWrite func(*schemas.BifrostStreamChunk) bool
+		if interceptor != nil {
+			hookWrite = func(extra *schemas.BifrostStreamChunk) bool {
+				if hookOutcome != streamChunkWritten || extra == nil || extra.BifrostError != nil {
+					return false
+				}
+				outcome := writeChunk(extra)
+				if outcome == streamChunkEndsStream || outcome == streamChunkEndsStreamDrained {
+					hookOutcome = outcome
+				}
+				return outcome == streamChunkWritten
+			}
+		}
+
 		// Process streaming responses
 		for chunk := range streamChan {
 			if chunk == nil {
@@ -3155,12 +3432,26 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 
 				sendConvertedStreamError(bifrostErr)
 
-				return // End stream on error, Bifrost handles cleanup internally
+				// The client's stream ends here, but the provider's may not have: an error
+				// a plugin's PostLLMHook put in place of a chunk leaves the provider reading
+				// its upstream. Cancel so it stops, and so the teardown's wait for it ends.
+				stopProvider()
+				return
 			} else {
 				// Allow plugins to modify/filter the chunk via StreamChunkInterceptor
 				if interceptor != nil {
 					var err error
-					chunk, err = interceptor.InterceptChunk(bifrostCtx, httpReq, chunk)
+					chunk, err = lib.InterceptStreamChunk(interceptor, bifrostCtx, httpReq, chunk, hookWrite)
+					// A chunk the hook wrote ended the stream: nothing the hook returned
+					// is written after it.
+					switch hookOutcome {
+					case streamChunkEndsStreamDrained:
+						for range streamChan {
+						}
+						return
+					case streamChunkEndsStream:
+						return
+					}
 					if err != nil {
 						if chunk == nil {
 							// A StreamInterceptionError carries a structured client error —
@@ -3176,7 +3467,10 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 							} else {
 								errorJSON, marshalErr := sonic.Marshal(map[string]string{"error": err.Error()})
 								if marshalErr != nil {
-									cancel()
+									// The error the hook ended the stream with could not be
+									// rendered, so nothing told the client: not delivered.
+									completerSlot.MarkUndelivered()
+									stopProvider()
 									for range streamChan {
 									}
 									return
@@ -3184,7 +3478,7 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 								// Return error event and stop streaming
 								reader.SendError(errorJSON)
 							}
-							cancel()
+							stopProvider()
 							for range streamChan {
 							}
 							return
@@ -3198,132 +3492,8 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 					}
 				}
 				// Handle successful responses
-				// Convert response to integration-specific streaming format
-				var eventType string
-				var convertedResponse interface{}
-				var err error
-				converterMissing := false
-
-				cpuStart := time.Now()
-				switch {
-				case chunk.BifrostTextCompletionResponse != nil:
-					if config.StreamConfig.TextStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("text stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.TextStreamResponseConverter(bifrostCtx, chunk.BifrostTextCompletionResponse)
-					}
-				case chunk.BifrostChatResponse != nil:
-					if config.StreamConfig.ChatStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("chat stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.ChatStreamResponseConverter(bifrostCtx, chunk.BifrostChatResponse)
-					}
-				case chunk.BifrostResponsesStreamResponse != nil:
-					if config.StreamConfig.ResponsesStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("responses stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.ResponsesStreamResponseConverter(bifrostCtx, chunk.BifrostResponsesStreamResponse)
-					}
-				case chunk.BifrostSpeechStreamResponse != nil:
-					if config.StreamConfig.SpeechStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("speech stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.SpeechStreamResponseConverter(bifrostCtx, chunk.BifrostSpeechStreamResponse)
-					}
-				case chunk.BifrostTranscriptionStreamResponse != nil:
-					if config.StreamConfig.TranscriptionStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("transcription stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.TranscriptionStreamResponseConverter(bifrostCtx, chunk.BifrostTranscriptionStreamResponse)
-					}
-				case chunk.BifrostImageGenerationStreamResponse != nil:
-					if config.StreamConfig.ImageGenerationStreamResponseConverter == nil {
-						converterMissing = true
-						err = fmt.Errorf("image generation stream response converter is not configured")
-					} else {
-						eventType, convertedResponse, err = config.StreamConfig.ImageGenerationStreamResponseConverter(bifrostCtx, chunk.BifrostImageGenerationStreamResponse)
-					}
-				default:
-					requestType := safeGetRequestType(chunk)
-					convertedResponse, err = nil, fmt.Errorf("no response converter found for request type: %s", requestType)
-				}
-				transportCPUNs += time.Since(cpuStart).Nanoseconds()
-
-				if convertedResponse == nil && err == nil {
-					// Skip streaming chunk if no response is available and no error is returned
-					continue
-				}
-
-				if err != nil {
-					g.logger.Warn("Failed to convert streaming response: %v", err)
-					if converterMissing {
-						sendConvertedStreamError(newBifrostErrorWithCode(nil, lib.ClientSafeInternalErrorMessage, fasthttp.StatusInternalServerError))
-						cancel()
-						for range streamChan {
-						}
-						return
-					}
-					// Log ordinary conversion errors and continue processing subsequent chunks.
-					continue
-				}
-
-				// Handle Bedrock Event Stream format
-				if config.Type == RouteConfigTypeBedrock && eventStreamEncoder != nil {
-					// We need to cast to BedrockStreamEvent to determine event type and structure
-					if bedrockEvent, ok := convertedResponse.(*bedrock.BedrockStreamEvent); ok {
-						if !sendBedrockEventStream(reader, eventStreamEncoder, bedrockEvent, g.logger) {
-							cancel()
-							return
-						}
-					}
-					// Continue to next chunk (we handled sending internally)
-					continue
-				}
-
-				// Build and send SSE event. Time the whole build+send: for the common
-				// pre-formatted-SSE path (Anthropic) the buf build is trivial and this is
-				// essentially the reader.Send socket-write wait; integrations that marshal
-				// here fold a small marshal CPU into this figure, which is acceptable for
-				// the A/B ratio the breakdown derives from it.
-				writeStart := time.Now()
-				var buf []byte
-				var sent bool
-				if sseString, ok := convertedResponse.(string); ok {
-					if strings.HasPrefix(sseString, "data: ") || strings.HasPrefix(sseString, "event: ") {
-						// Pre-formatted SSE string (e.g. Anthropic custom event types)
-						if eventType != "" {
-							// Prepend event type line to pre-formatted data
-							buf = make([]byte, 0, 7+len(eventType)+1+len(sseString))
-							buf = append(buf, "event: "...)
-							buf = append(buf, eventType...)
-							buf = append(buf, '\n')
-							buf = append(buf, sseString...)
-							sent = reader.Send(buf)
-						} else {
-							sent = reader.Send([]byte(sseString))
-						}
-					} else {
-						sent = reader.SendEvent(eventType, []byte(sseString))
-					}
-				} else {
-					responseJSON, err := sonic.Marshal(convertedResponse)
-					if err != nil {
-						g.logger.Warn("Failed to marshal streaming response: %v", err)
-						continue
-					}
-					if stripExtraFields {
-						responseJSON = lib.StripExtraFields(responseJSON)
-					}
-					sent = reader.SendEvent(eventType, responseJSON)
-				}
-
-				if !sent {
-					cancel() // Client disconnected, cancel upstream stream
+				switch writeChunk(chunk) {
+				case streamChunkEndsStreamDrained:
 					// Drain remaining chunks so the provider goroutine's defer
 					// (HandleStreamCancellation -> PostLLMHook -> storeOrEnqueueEntry) finishes
 					// before our own defer fires traceCompleter. Without this, Inject runs
@@ -3331,8 +3501,9 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 					for range streamChan {
 					}
 					return
+				case streamChunkEndsStream:
+					return
 				}
-				clientWriteNs += time.Since(writeStart).Nanoseconds()
 			}
 		}
 
@@ -3350,6 +3521,21 @@ func (g *GenericRouter) handleStreaming(ctx *fasthttp.RequestCtx, bifrostCtx *sc
 		}
 	}()
 }
+
+// streamChunkOutcome is what writing one chunk to a client's stream came to.
+type streamChunkOutcome uint8
+
+const (
+	// streamChunkWritten: the chunk was converted and sent.
+	streamChunkWritten streamChunkOutcome = iota
+	// streamChunkSkipped: nothing was sent for the chunk and the stream goes on.
+	streamChunkSkipped
+	// streamChunkEndsStreamDrained: the stream ends here; the producer drains the
+	// provider's stream before it returns.
+	streamChunkEndsStreamDrained
+	// streamChunkEndsStream: the stream ends here; the producer returns at once.
+	streamChunkEndsStream
+)
 
 type bedrockEventStreamException struct {
 	exceptionType string
@@ -4108,6 +4294,8 @@ func (g *GenericRouter) handlePassthroughStream(
 
 	// Skip post-hook body materialization — ctx.Response.Body() would buffer the entire stream.
 	ctx.SetUserValue(schemas.BifrostContextKeyDeferTraceCompletion, true)
+	// Slot for the transport post-hook completer; see handleStreaming.
+	completerSlot := lib.NewTransportPostHookCompleterSlot(ctx)
 
 	ctx.SetStatusCode(passthroughResp.StatusCode)
 	// Preserve the upstream Content-Type. Passthrough streams aren't always SSE — e.g.
@@ -4150,6 +4338,7 @@ func (g *GenericRouter) handlePassthroughStream(
 
 	// Use SSEStreamReader to bypass fasthttp's internal pipe batching
 	reader := lib.NewSSEStreamReader()
+	reader.SetFrameTap(lib.StreamFrameTap(bifrostCtx))
 	ctx.Response.SetBodyStream(reader, -1)
 
 	// This path proxies raw upstream bytes 1:1, and content-type isn't always SSE (see the
@@ -4168,15 +4357,32 @@ func (g *GenericRouter) handlePassthroughStream(
 
 	go func() {
 		defer func() {
+			// Before the heartbeat is stopped, which closes the reader: record how the
+			// request stood when the producer stopped, for the transport post-hooks.
+			completerSlot.CaptureRequestState(bifrostCtx, reader)
 			if heartbeatDone != nil {
 				// Must run before reader.Done(): closing eventCh while the heartbeat
 				// goroutine could still be mid-send on it panics ("send on closed channel").
 				lib.StopSSEHeartbeat(reader, heartbeatDone, heartbeatExited)
 			}
-			if traceCompleter != nil {
-				lib.RunRecovered("passthrough stream trace completer", func() { traceCompleter(nil) })
-			}
 			reader.Done()
+			// The paths below that stop early (a failed client write, an error chunk, an
+			// oversized frame) leave the provider's stream open, and each cancels the
+			// request first, so the provider is stopping. Wait for it here, now that the
+			// client's stream is closed, so the provider goroutine has run its last
+			// post-hooks before the transport post-hooks and the trace complete. A stream
+			// that already ended makes this a no-op.
+			for range stream {
+			}
+			// Run the transport post-hooks, once, on every exit path, before the trace
+			// completes so their logs are attached to it.
+			var transportLogs []schemas.PluginLogEntry
+			lib.RunRecovered("passthrough stream transport post-hook completer", func() {
+				transportLogs = lib.RunTransportPostHookCompleter(completerSlot, g.logger)
+			})
+			if traceCompleter != nil {
+				lib.RunRecovered("passthrough stream trace completer", func() { traceCompleter(transportLogs) })
+			}
 			cancel()
 		}()
 
@@ -4215,6 +4421,12 @@ func (g *GenericRouter) handlePassthroughStream(
 			}
 			if chunk.BifrostError != nil {
 				streamErr = chunk.BifrostError
+				// Nothing more is forwarded, and the provider may still be reading its
+				// upstream (an error a plugin's PostLLMHook put in place of a chunk does
+				// not end it). Cancel so it stops, and so the teardown's wait for it ends.
+				// The request's state is recorded first: this cancel is the producer's own.
+				completerSlot.CaptureRequestState(bifrostCtx, reader)
+				cancel()
 				break
 			}
 			if chunk.BifrostPassthroughResponse != nil && len(chunk.BifrostPassthroughResponse.Body) > 0 {
@@ -4226,6 +4438,11 @@ func (g *GenericRouter) handlePassthroughStream(
 			// An unterminated frame passed the cap: stop forwarding rather than leak a partial frame.
 			if frames != nil && frames.overflowed {
 				streamErr = &schemas.BifrostError{Error: &schemas.ErrorField{Code: schemas.Ptr("server_error"), Message: "upstream event exceeded the 10 MB frame limit"}}
+				// Nothing more is forwarded, so stop the upstream now rather than at teardown.
+				// Bytes that passed every hook are being withheld: the transport did not
+				// deliver what the hooks released.
+				completerSlot.MarkUndelivered()
+				cancel()
 				break
 			}
 		}
@@ -4234,12 +4451,14 @@ func (g *GenericRouter) handlePassthroughStream(
 		// by an error or by a clean close, without a terminal event can only be reported in the
 		// stream. Without one the client sees a bare close and retries blind.
 		if frames != nil {
+			// A frame the client did not take was not delivered, whatever the request's
+			// state looked like when the stream stopped.
 			if frames.sawTerminal {
-				if len(frames.pending) > 0 && !frames.overflowed {
-					reader.Send(frames.pending)
+				if len(frames.pending) > 0 && !frames.overflowed && !reader.Send(frames.pending) {
+					completerSlot.MarkUndelivered()
 				}
-			} else if frame := frames.failedFrame(streamErr); frame != nil {
-				reader.Send(frame)
+			} else if frame := frames.failedFrame(streamErr); frame != nil && !reader.Send(frame) {
+				completerSlot.MarkUndelivered()
 			}
 		}
 	}()

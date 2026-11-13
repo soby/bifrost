@@ -379,10 +379,8 @@ func makeRequestWithDoFunc(ctx context.Context, do func() error) (time.Duration,
 	select {
 	case <-ctx.Done():
 		// Context was cancelled (e.g., deadline exceeded or manual cancellation).
-		// Calculate latency even for cancelled requests.
-		latency := time.Since(startTime)
 		// Socket wait is upstream even when it ends in cancellation.
-		schemas.AddUpstreamLatency(ctx, latency)
+		latency := schemas.ObserveUpstreamWait(ctx, startTime)
 		// Return a wait function that blocks until the background goroutine finishes.
 		// The caller MUST invoke this (via defer) before releasing req/resp to avoid
 		// a data race with the still-running goroutine.
@@ -414,10 +412,8 @@ func makeRequestWithDoFunc(ctx context.Context, do func() error) (time.Duration,
 		}, func() { <-errChan }
 	case err := <-errChan:
 		// The do() call completed.
-		// Calculate latency for both successful and failed requests.
-		latency := time.Since(startTime)
 		// Single accumulation point for every unary provider call.
-		schemas.AddUpstreamLatency(ctx, latency)
+		latency := schemas.ObserveUpstreamWait(ctx, startTime)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return latency, &schemas.BifrostError{
@@ -459,7 +455,12 @@ func makeRequestWithDoFunc(ctx context.Context, do func() error) (time.Duration,
 // request or response objects. On the normal path it is a no-op. On the context-cancellation
 // path it blocks until the background client.Do goroutine finishes, preventing a data race
 // between the still-running goroutine and the caller's release of req/resp.
+//
+// A per-attempt request timeout (BifrostContextKeyAttemptRequestTimeout) bounds the call: it
+// runs on a child context with that deadline, so expiry closes the socket and is reported as
+// a timeout, which lets fallbacks run.
 func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) (time.Duration, *schemas.BifrostError, func()) {
+	ctx, cancel := withAttemptRequestTimeout(ctx)
 	// Bound to the goroutine that runs client.Do: the binding must outlive a
 	// ctx-cancelled return of makeRequestWithDoFunc and be gone before the
 	// caller's wait() returns, since req is pooled.
@@ -468,17 +469,38 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 		defer unbind()
 		return client.Do(req, resp)
 	})
+	// Released only once makeRequestWithDoFunc has chosen its outcome: cancelling earlier
+	// would race a completed call against the cancellation. On a timed-out return the
+	// child is already done, so this does not cut the still-running call short.
+	cancel()
 	return latency, bifrostErr, wait
+}
+
+// withAttemptRequestTimeout returns ctx bounded by the attempt's request timeout
+// (BifrostContextKeyAttemptRequestTimeout) and the function that releases it. Without a
+// positive timeout it returns ctx unchanged. The child keeps ctx's values and is cancelled
+// with it; a deadline already earlier on ctx still wins.
+//
+// Without it an attempt is bounded only by its provider instance's configured timeout, which
+// for a request-scoped attempt is the default network settings'.
+func withAttemptRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := attemptRequestTimeout(ctx)
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // MakeRequestWithContextFollowRedirects is like MakeRequestWithContext but follows up to
 // maxRedirects HTTP redirects automatically (equivalent to curl's -L flag).
 func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) (time.Duration, *schemas.BifrostError, func()) {
+	ctx, cancel := withAttemptRequestTimeout(ctx)
 	unbind := bindRequestContext(req, ctx)
 	latency, bifrostErr, wait := makeRequestWithDoFunc(ctx, func() error {
 		defer unbind()
 		return client.DoRedirects(req, resp, maxRedirects)
 	})
+	cancel()
 	return latency, bifrostErr, wait
 }
 
@@ -502,11 +524,16 @@ func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp
 // Returns client.Do's error untouched so callers keep their own error
 // classification and latency bookkeeping.
 func DoStreamingRequest(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) error {
-	unbind := bindRequestContext(req, ctx)
+	// A per-attempt request timeout bounds the header wait only: the transport stops
+	// watching the context once headers are parsed, so releasing it here leaves the body
+	// to the stream idle timeout.
+	attemptCtx, cancel := withAttemptRequestTimeout(ctx)
+	unbind := bindRequestContext(req, attemptCtx)
 	startTime := time.Now()
 	err := client.Do(req, resp)
 	unbind()
-	schemas.AddUpstreamLatency(ctx, time.Since(startTime))
+	cancel()
+	schemas.ObserveUpstreamWait(ctx, startTime)
 	return err
 }
 
@@ -522,7 +549,7 @@ type upstreamTimingBody struct {
 func (b *upstreamTimingBody) Read(p []byte) (int, error) {
 	start := time.Now()
 	n, err := b.inner.Read(p)
-	schemas.AddUpstreamLatency(b.ctx, time.Since(start))
+	schemas.ObserveUpstreamWait(b.ctx, start)
 	return n, err
 }
 
@@ -561,12 +588,133 @@ func DoHTTPRequest(client *http.Client, req *http.Request) (*http.Response, erro
 		req = req.WithContext(attemptCtx)
 	}
 	startTime := time.Now()
-	resp, err := client.Do(req)
-	schemas.AddUpstreamLatency(req.Context(), time.Since(startTime))
+	resp, err := client.Do(withConnectionTrace(req))
+	schemas.ObserveUpstreamWait(req.Context(), startTime)
 	if err == nil && resp != nil && resp.Body != nil {
 		resp.Body = &upstreamTimingBody{inner: resp.Body, ctx: req.Context()}
 	}
 	return resp, err
+}
+
+// errAttemptRequestTimeout is the error a net/http call bounded by the attempt's request
+// timeout fails with when that timeout, and not the request context, ended it. It is a
+// timeout (net.Error) and matches context.DeadlineExceeded, so callers classify it as a
+// retryable timeout and fallbacks run, as on the fasthttp path.
+var errAttemptRequestTimeout error = attemptRequestTimeoutError{}
+
+type attemptRequestTimeoutError struct{}
+
+func (attemptRequestTimeoutError) Error() string   { return "attempt request timeout exceeded" }
+func (attemptRequestTimeoutError) Timeout() bool   { return true }
+func (attemptRequestTimeoutError) Temporary() bool { return true }
+func (attemptRequestTimeoutError) Is(target error) bool {
+	return target == context.DeadlineExceeded
+}
+
+// attemptRequestTimeout returns the attempt's request timeout
+// (BifrostContextKeyAttemptRequestTimeout) carried by ctx, or 0 when there is none.
+func attemptRequestTimeout(ctx context.Context) time.Duration {
+	if ctx == nil {
+		return 0
+	}
+	timeout, _ := ctx.Value(schemas.BifrostContextKeyAttemptRequestTimeout).(time.Duration)
+	return max(timeout, 0)
+}
+
+// DoAttemptHTTPRequest is DoHTTPRequest for a unary provider call: the attempt's request
+// timeout (BifrostContextKeyAttemptRequestTimeout) bounds the whole call, body included, as
+// MakeRequestWithContext does on fasthttp. The call runs on a child of the request context, so
+// expiry ends the attempt without cancelling the request; it fails with a timeout that matches
+// context.DeadlineExceeded. The child is released when the body is closed. Without a positive
+// timeout it is DoHTTPRequest.
+func DoAttemptHTTPRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	timeout := attemptRequestTimeout(req.Context())
+	if timeout <= 0 {
+		return DoHTTPRequest(client, req)
+	}
+	attemptCtx, cancel := context.WithTimeoutCause(req.Context(), timeout, errAttemptRequestTimeout)
+	resp, err := DoHTTPRequest(client, req.WithContext(attemptCtx))
+	if err != nil {
+		cancel()
+		return nil, attemptError(attemptCtx, err)
+	}
+	bindAttemptBody(resp, attemptCtx, cancel)
+	return resp, nil
+}
+
+// DoAttemptStreamingHTTPRequest is DoHTTPRequest for a streaming provider call: the attempt's
+// request timeout (BifrostContextKeyAttemptRequestTimeout) bounds the wait for response
+// headers only, as DoStreamingRequest does on fasthttp; the body is left to the stream idle
+// timeout. Expiry ends the attempt without cancelling the request and fails with a timeout
+// that matches context.DeadlineExceeded. Without a positive timeout it is DoHTTPRequest.
+func DoAttemptStreamingHTTPRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	timeout := attemptRequestTimeout(req.Context())
+	if timeout <= 0 {
+		return DoHTTPRequest(client, req)
+	}
+	// A deadline cannot be lifted once headers arrive, so the header wait is bounded by a
+	// timer that cancels the attempt's context and is stopped when headers are in.
+	attemptCtx, cancel := context.WithCancelCause(req.Context())
+	timer := time.AfterFunc(timeout, func() { cancel(errAttemptRequestTimeout) })
+	resp, err := DoHTTPRequest(client, req.WithContext(attemptCtx))
+	if !timer.Stop() {
+		// The timer fired: the attempt timed out, even if headers arrived in the same instant.
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		cancel(nil)
+		return nil, errAttemptRequestTimeout
+	}
+	if err != nil {
+		cancel(nil)
+		return nil, attemptError(attemptCtx, err)
+	}
+	bindAttemptBody(resp, attemptCtx, func() { cancel(nil) })
+	return resp, nil
+}
+
+// attemptError returns errAttemptRequestTimeout when the attempt's timeout ended the call,
+// and err otherwise (a request-context cancellation or deadline stays what it was).
+func attemptError(attemptCtx context.Context, err error) error {
+	if context.Cause(attemptCtx) == errAttemptRequestTimeout {
+		return errAttemptRequestTimeout
+	}
+	return err
+}
+
+// bindAttemptBody makes closing resp's body release the attempt's context, and reports a
+// body read cut short by the attempt's timeout as errAttemptRequestTimeout. It wraps inside
+// DoHTTPRequest's timing wrapper, which NewIdleTimeoutReader looks for.
+func bindAttemptBody(resp *http.Response, attemptCtx context.Context, release func()) {
+	if resp.Body == nil {
+		release()
+		return
+	}
+	if tb, ok := resp.Body.(*upstreamTimingBody); ok {
+		tb.inner = &attemptBody{inner: tb.inner, ctx: attemptCtx, release: release}
+		return
+	}
+	resp.Body = &attemptBody{inner: resp.Body, ctx: attemptCtx, release: release}
+}
+
+type attemptBody struct {
+	inner   io.ReadCloser
+	ctx     context.Context
+	release func()
+}
+
+func (b *attemptBody) Read(p []byte) (int, error) {
+	n, err := b.inner.Read(p)
+	if err != nil && err != io.EOF {
+		err = attemptError(b.ctx, err)
+	}
+	return n, err
+}
+
+func (b *attemptBody) Close() error {
+	err := b.inner.Close()
+	b.release()
+	return err
 }
 
 // Deprecated: ConfigureRetry is now handled internally by ConfigureDialer.
@@ -592,6 +740,22 @@ func ConfigureRetry(client *fasthttp.Client) *fasthttp.Client {
 // Dead connections are detected within ~25s (10 + 5*3), before the 30s
 // MaxIdleConnDuration expires and the connection is reused.
 func ConfigureDialer(client *fasthttp.Client, allowPrivateNetwork bool) *fasthttp.Client {
+	return configureDialer(client, allowPrivateNetwork, false, false)
+}
+
+// ConfigureDialerFor is ConfigureDialer driven by a provider's network config. Besides
+// AllowPrivateNetwork it honors LoopbackIsPrivate and ContextBoundReads, which Bifrost sets on
+// the instances that serve request-scoped configuration; providers implementing
+// schemas.RequestScopedProvider must build their dialers with it.
+func ConfigureDialerFor(client *fasthttp.Client, networkConfig schemas.NetworkConfig) *fasthttp.Client {
+	return configureDialer(client, networkConfig.AllowPrivateNetwork, networkConfig.LoopbackIsPrivate, networkConfig.ContextBoundReads)
+}
+
+// configureDialer implements ConfigureDialer. Loopback addresses are always reachable unless
+// loopbackIsPrivate is set, in which case they need allowPrivateNetwork like RFC 1918 ones.
+// With contextBoundReads the client's ReadTimeout no longer bounds the wait for a response
+// (see contextTransport); it still bounds the dial below.
+func configureDialer(client *fasthttp.Client, allowPrivateNetwork, loopbackIsPrivate, contextBoundReads bool) *fasthttp.Client {
 	// A factory client forwards each request to an inner client that already carries
 	// the factory's proxy, dialer and retry policy; it is left as it is.
 	if network.IsLiveFasthttpClient(client) {
@@ -604,7 +768,7 @@ func ConfigureDialer(client *fasthttp.Client, allowPrivateNetwork bool) *fasthtt
 	// Every Bifrost client goes through the context-aware transport: it applies
 	// the client's timeouts to the header phase only on streamed responses and
 	// closes the socket when the request context ends (see roundtripper.go).
-	client.Transport = NewContextTransport()
+	client.Transport = &contextTransport{contextBoundReads: contextBoundReads}
 
 	existingDial := client.Dial
 	existingDialTimeout := client.DialTimeout
@@ -665,16 +829,8 @@ func ConfigureDialer(client *fasthttp.Client, allowPrivateNetwork bool) *fasthtt
 			}
 			var lastErr error
 			for _, ip := range ips {
-				// Unspecified (0.0.0.0, ::) and link-local (169.254.x.x, fe80::) are always blocked
-				if ip.IsUnspecified() {
-					return nil, fmt.Errorf("connection to unspecified IP %s is not allowed", ip)
-				}
-				if network.IsLinkLocal(ip) {
-					return nil, fmt.Errorf("connection to link-local IP %s is not allowed", ip)
-				}
-				// RFC 1918 blocked unless operator explicitly opted in; loopback always allowed
-				if !ip.IsLoopback() && !allowPrivateNetwork && network.IsPrivateIP(ip) {
-					return nil, fmt.Errorf("connection to private IP %s is not allowed", ip)
+				if err := checkDialIP(ip, allowPrivateNetwork, loopbackIsPrivate); err != nil {
+					return nil, err
 				}
 				conn, err = dialer.Dial("tcp", net.JoinHostPort(ip.String(), port))
 				if err == nil {
@@ -697,10 +853,68 @@ func ConfigureDialer(client *fasthttp.Client, allowPrivateNetwork bool) *fasthtt
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetKeepAliveConfig(keepAliveCfg)
 		}
-		return conn, nil
+		return observeDialedConn(conn, addr), nil
 	}
 
 	return client
+}
+
+// checkDialIP reports whether ip may be dialed. Unspecified (0.0.0.0, ::) and link-local
+// (169.254.x.x, fe80::) addresses are always refused. RFC 1918 addresses are refused unless
+// allowPrivateNetwork is set; loopback ones too when loopbackIsPrivate is set.
+func checkDialIP(ip net.IP, allowPrivateNetwork, loopbackIsPrivate bool) error {
+	if ip.IsUnspecified() {
+		return fmt.Errorf("connection to unspecified IP %s is not allowed", ip)
+	}
+	if network.IsLinkLocal(ip) {
+		return fmt.Errorf("connection to link-local IP %s is not allowed", ip)
+	}
+	if (loopbackIsPrivate || !ip.IsLoopback()) && !allowPrivateNetwork && network.IsPrivateIP(ip) {
+		return fmt.Errorf("connection to private IP %s is not allowed", ip)
+	}
+	return nil
+}
+
+// NetHTTPDialContextFor returns a net/http DialContext that applies the address policy
+// ConfigureDialerFor applies to fasthttp clients: it resolves the host, refuses an address
+// checkDialIP refuses for networkConfig, and dials the checked IP literal, so a second
+// resolution cannot swap in another address. timeout bounds the resolution and each dial.
+// It is for direct connections: a transport that dials a proxy with it checks the proxy's
+// address, not the target's.
+func NetHTTPDialContextFor(networkConfig schemas.NetworkConfig, timeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	allowPrivateNetwork, loopbackIsPrivate := networkConfig.AllowPrivateNetwork, networkConfig.LoopbackIsPrivate
+	dialer := &net.Dialer{Timeout: timeout}
+	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		resolveCtx := ctx
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			resolveCtx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		var lastErr error
+		for _, ip := range ips {
+			if err := checkDialIP(ip, allowPrivateNetwork, loopbackIsPrivate); err != nil {
+				return nil, err
+			}
+			conn, err := dialer.DialContext(ctx, netw, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("no usable address resolved for %s", host)
+	}
 }
 
 // ConfigureProxy sets up a proxy for the fasthttp client based on the provided configuration.
@@ -4231,7 +4445,7 @@ func (r *idleTimeoutReader) Read(p []byte) (n int, err error) {
 	readStart := time.Now()
 	n, err = r.reader.Read(p)
 	if r.ctx != nil {
-		schemas.AddUpstreamLatency(r.ctx, time.Since(readStart))
+		schemas.ObserveUpstreamWait(r.ctx, readStart)
 	}
 	if n > 0 {
 		r.timer.Reset(r.timeout)

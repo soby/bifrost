@@ -310,6 +310,11 @@ const (
 	BifrostContextKeyStreamEndIndicator                  BifrostContextKey = "bifrost-stream-end-indicator"            // bool (set by bifrost - DO NOT SET THIS MANUALLY)
 	BifrostContextKeyStreamGated                         BifrostContextKey = "bifrost-stream-gated"                    // bool (set by ctx.PauseStream/ResumeStream/EndStream when a plugin first engages the pause/resume gate; provider helpers use this as a fast-path check to skip Tracer.GateSend on streams that never engage the gate)
 	BifrostContextKeyStreamIdleTimeout                   BifrostContextKey = "bifrost-stream-idle-timeout"             // time.Duration (per-chunk idle timeout for streaming)
+	BifrostContextKeyAttemptRequestTimeout               BifrostContextKey = "bifrost-attempt-request-timeout"         // time.Duration (bounds each provider HTTP round trip of the current attempt - the whole call for a unary request, the wait for response headers for a stream - like default_request_timeout_in_seconds does for a configured provider. Expiry is a retryable timeout, so fallbacks run. Cleared before each fallback; set it in PreLLMHook for every attempt that needs it)
+	BifrostContextKeyRequestScopedAttempt                BifrostContextKey = "bifrost-request-scoped-attempt"          // bool (set by bifrost when an attempt of this request ran with request-scoped provider configuration - DO NOT SET THIS MANUALLY)
+	BifrostContextKeyStreamFrameTap                      BifrostContextKey = "bifrost-stream-frame-tap"                // io.Writer (receives, in order, every byte the HTTP transport's SSE stream writer releases for this request - events, heartbeat comments and the [DONE] marker - one Write per release. Set it before the stream starts. Write runs on the stream's send path and must not block or retain the slice. Absent or nil costs nothing)
+	BifrostContextKeyStreamAdmissionWait                 BifrostContextKey = "bifrost-stream-admission-wait"           // *StreamAdmissionWait (set by the HTTP transport on streaming routes that can carry SSE comment lines, before the request reaches core - DO NOT SET THIS MANUALLY. A plugin that holds the request before the provider call calls Begin so the transport commits the event stream and its heartbeat keeps the connection alive; absent elsewhere)
+	BifrostContextKeyStreamChunkWriter                   BifrostContextKey = "bifrost-stream-chunk-writer"             // StreamChunkWriter (readable only on the context passed to an HTTPTransportStreamChunkHook call of the HTTP transport, and usable only during that call - DO NOT SET THIS MANUALLY. The hook calls it, or WriteStreamChunk, to send the client an additional chunk ahead of the one it returns; absent on every other context of the request)
 	BifrostContextKeyStreamFirstTokenTimeout             BifrostContextKey = "bifrost-stream-first-token-timeout"      // time.Duration (TTFT deadline for streaming requests: an attempt with no first token in time is cut off and the next fallback runs; the last attempt is never cut off. Set by the routing plugin or an SDK caller)
 	BifrostContextKeyStreamAttemptAbort                  BifrostContextKey = "bifrost-stream-attempt-abort"            // *providerUtils.AttemptAbort (set by bifrost for one stream attempt with a first-token deadline - DO NOT SET THIS MANUALLY)
 	BifrostContextKeyStreamCommitWatch                   BifrostContextKey = "bifrost-stream-commit-watch"             // bool (set by bifrost when a held stream attempt produces its first output; consumed by the pause/resume gate - DO NOT SET THIS MANUALLY)
@@ -497,6 +502,7 @@ const (
 	BifrostContextKeyAsyncWebhookEndpoint                BifrostContextKey = "bifrost-async-webhook-endpoint" // string (webhook endpoint name to notify when an async job finishes - carried as-is from the x-bf-async-webhook header; the submit path resolves and validates it before the job is created)
 	BifrostContextKeyUpstreamLatency                     BifrostContextKey = "bifrost-upstream-latency"       // *upstreamAccumulator nanoseconds (set by bifrost - DO NOT SET THIS MANUALLY) - cumulative time blocked on provider sockets across every attempt, plus the current attempt's start mark; subtract from total to get Bifrost overhead
 	BifrostContextKeyStreamOverhead                      BifrostContextKey = "bifrost-stream-overhead"        // *streamOverhead (set by bifrost - DO NOT SET THIS MANUALLY) - per-chunk stream conversion CPU and downstream backpressure, carved out of the overhead breakdown's "core" bucket
+	BifrostContextKeyUpstreamWindow                      BifrostContextKey = "bifrost-upstream-window"        // *UpstreamWindow (set by bifrost - DO NOT SET THIS MANUALLY) - first provider transport handoff and last provider socket wait end across every attempt
 )
 
 // Request attribution keys the Grant now carries. They are kept only for readers that have not
@@ -818,6 +824,22 @@ type Fallback struct {
 	Inferred bool          `json:"-"`                // added by Bifrost, not named by the caller or a routing config
 }
 
+// ProviderOverride is provider configuration supplied with a request rather than configured
+// in Bifrost, for plugins that do dynamic user lookup and set provider/model configuration at
+// runtime. Every attempt of the request against Provider, the primary or a fallback, runs with
+// it: the attempt does not read the provider's configured keys or network settings, and the
+// provider does not need to be configured at all. Nothing about an override is registered,
+// cached or persisted; it is released with the request.
+//
+// Set it with the BifrostRequest UpdateProviderKey, UpdateProviderBaseURL and
+// UpdateProviderAllowPrivateNetwork methods.
+type ProviderOverride struct {
+	Provider            ModelProvider // provider the configuration applies to
+	Key                 Key           // credential, including endpoint settings kept on the key (AzureKeyConfig.Endpoint, VLLMKeyConfig.URL, BedrockKeyConfig.Region, ...)
+	BaseURL             string        // replaces network_config.base_url for the provider; empty keeps the provider default
+	AllowPrivateNetwork bool          // permits RFC 1918 and loopback destinations; link-local stays blocked
+}
+
 // BifrostRequest is the request struct for all bifrost requests.
 // only ONE of the following fields should be set:
 // - ListModelsRequest
@@ -888,6 +910,11 @@ type BifrostRequest struct {
 	ContainerFileContentRequest  *BifrostContainerFileContentRequest
 	ContainerFileDeleteRequest   *BifrostContainerFileDeleteRequest
 	PassthroughRequest           *BifrostPassthroughRequest
+
+	// ProviderOverrides holds request-scoped provider configuration, at most one entry per
+	// provider. Set it with the UpdateProviderKey, UpdateProviderBaseURL and
+	// UpdateProviderAllowPrivateNetwork methods. It carries credentials and is never serialized.
+	ProviderOverrides []ProviderOverride `json:"-"`
 }
 
 // GetRequestFields returns the provider, model, and fallbacks from the request.
@@ -1276,6 +1303,171 @@ func (br *BifrostRequest) SetRawRequestBody(rawRequestBody []byte) {
 	case br.CachedContentDeleteRequest != nil:
 		br.CachedContentDeleteRequest.RawRequestBody = rawRequestBody
 	}
+}
+
+// UpdateProviderKey makes key the credential of every attempt of this request against
+// provider, the primary and any fallback. The key is used as given: it is not looked up in,
+// checked against or added to the provider's configured keys, and the provider does not need
+// to be configured. Its fields must hold literal values; env. and vault. references are
+// rejected. A key without an ID is reported in routing info as "request-scoped".
+//
+// Call it from PreRequestHook to set the credential for the whole request, or from
+// PreLLMHook to set it for the attempt about to run, for example to give two fallbacks to
+// the same provider different credentials.
+func (br *BifrostRequest) UpdateProviderKey(provider ModelProvider, key Key) error {
+	if br == nil {
+		return errors.New("bifrost request is nil")
+	}
+	existing := len(br.ProviderOverrides)
+	override, err := br.providerOverride(provider)
+	if err != nil {
+		return err
+	}
+	// The key is checked where it is stored, so the check, which walks the key by
+	// reflection, does not move the argument to the heap.
+	previous := override.Key
+	override.Key = key
+	if err := override.Key.requestScopedError(); err != nil {
+		override.Key = previous
+		// Drop the override if this call added it.
+		br.ProviderOverrides = br.ProviderOverrides[:existing]
+		return err
+	}
+	return nil
+}
+
+// requestScopedError reports why the key cannot be a request's own credential, or nil.
+//
+//   - Its fields hold literal values; env. and vault. references are refused.
+//   - It is a ready credential. A key Bifrost would have to exchange for a token itself
+//     (oauth_key_config, Anthropic workload identity) is refused: the exchange reads files
+//     or calls a token endpoint the request names, outside the request's network policy,
+//     and its result is cached in the process.
+//   - An endpoint it carries (Azure, vLLM, Ollama, SGL) has the shape a request-scoped base
+//     URL must have, so a query or fragment cannot swallow the path Bifrost appends.
+func (k *Key) requestScopedError() error {
+	if k.hasSecretReference() {
+		return errors.New("request-scoped key must hold literal values, not env. or vault. references")
+	}
+	if k.OAuthKeyConfig != nil {
+		return errors.New("request-scoped key must be a ready credential: oauth_key_config is not supported")
+	}
+	if k.AnthropicKeyConfig != nil && k.AnthropicKeyConfig.HasWorkloadIdentity() {
+		return errors.New("request-scoped key must be a ready credential: Anthropic workload identity is not supported")
+	}
+	for _, endpoint := range [...]struct {
+		name  string
+		value *SecretVar
+	}{
+		{"azure_key_config.endpoint", keyEndpoint(k.AzureKeyConfig, func(c *AzureKeyConfig) *SecretVar { return &c.Endpoint })},
+		{"vllm_key_config.url", keyEndpoint(k.VLLMKeyConfig, func(c *VLLMKeyConfig) *SecretVar { return &c.URL })},
+		{"ollama_key_config.url", keyEndpoint(k.OllamaKeyConfig, func(c *OllamaKeyConfig) *SecretVar { return &c.URL })},
+		{"sgl_key_config.url", keyEndpoint(k.SGLKeyConfig, func(c *SGLKeyConfig) *SecretVar { return &c.URL })},
+	} {
+		if endpoint.value == nil || endpoint.value.GetValue() == "" {
+			continue
+		}
+		if _, err := requestScopedBaseURL(endpoint.value.GetValue()); err != nil {
+			return fmt.Errorf("request-scoped key %s: %w", endpoint.name, err)
+		}
+	}
+	return nil
+}
+
+// keyEndpoint returns the endpoint field of a key config, or nil when the key has no such config.
+func keyEndpoint[T any](config *T, field func(*T) *SecretVar) *SecretVar {
+	if config == nil {
+		return nil
+	}
+	return field(config)
+}
+
+// UpdateProviderBaseURL sends this request's attempts against provider to baseURL, which
+// takes the form network_config.base_url takes for that provider. Providers that keep their
+// endpoint on the key (Azure, vLLM) take it from the key instead and fail an attempt that
+// carries a base URL. Bedrock takes one only for model invocation (Converse and InvokeModel),
+// in place of the bedrock-runtime host, and fails any other attempt that carries one.
+//
+// The URL must be http or https with a host and no user info, query or fragment; trailing
+// slashes are removed. Its destination is checked when Bifrost connects: link-local
+// addresses are always refused, and RFC 1918 and loopback addresses need
+// UpdateProviderAllowPrivateNetwork.
+func (br *BifrostRequest) UpdateProviderBaseURL(provider ModelProvider, baseURL string) error {
+	baseURL, err := requestScopedBaseURL(baseURL)
+	if err != nil {
+		return err
+	}
+	override, err := br.providerOverride(provider)
+	if err != nil {
+		return err
+	}
+	override.BaseURL = baseURL
+	return nil
+}
+
+// UpdateProviderAllowPrivateNetwork lets this request's attempts against provider connect to
+// RFC 1918 and loopback addresses, as network_config.allow_private_network does for a
+// configured provider. Link-local addresses stay blocked.
+func (br *BifrostRequest) UpdateProviderAllowPrivateNetwork(provider ModelProvider, allow bool) error {
+	override, err := br.providerOverride(provider)
+	if err != nil {
+		return err
+	}
+	override.AllowPrivateNetwork = allow
+	return nil
+}
+
+// ProviderOverrideFor returns the request-scoped configuration this request carries for
+// provider, or nil when it has none.
+func (br *BifrostRequest) ProviderOverrideFor(provider ModelProvider) *ProviderOverride {
+	if br == nil {
+		return nil
+	}
+	for i := range br.ProviderOverrides {
+		if br.ProviderOverrides[i].Provider == provider {
+			return &br.ProviderOverrides[i]
+		}
+	}
+	return nil
+}
+
+// providerOverride returns the request's override for provider, adding an empty one when
+// the request has none.
+func (br *BifrostRequest) providerOverride(provider ModelProvider) (*ProviderOverride, error) {
+	if br == nil {
+		return nil, errors.New("bifrost request is nil")
+	}
+	if provider == "" {
+		return nil, errors.New("provider is required")
+	}
+	if override := br.ProviderOverrideFor(provider); override != nil {
+		return override, nil
+	}
+	br.ProviderOverrides = append(br.ProviderOverrides, ProviderOverride{Provider: provider})
+	return &br.ProviderOverrides[len(br.ProviderOverrides)-1], nil
+}
+
+// requestScopedBaseURL checks the shape of a request-scoped base URL and returns it without
+// trailing slashes. The host is not resolved here; its addresses are checked when Bifrost
+// connects. Errors do not quote the URL, which may carry a credential.
+func requestScopedBaseURL(baseURL string) (string, error) {
+	rest, ok := strings.CutPrefix(baseURL, "https://")
+	if !ok {
+		rest, ok = strings.CutPrefix(baseURL, "http://")
+	}
+	if !ok {
+		return "", errors.New("base URL must start with http:// or https://")
+	}
+	if host, _, _ := strings.Cut(rest, "/"); host == "" || host[0] == ':' {
+		return "", errors.New("base URL must have a host")
+	}
+	for i := 0; i < len(rest); i++ {
+		switch c := rest[i]; {
+		case c <= ' ', c == 0x7f, c == '@', c == '?', c == '#', c == '\\':
+			return "", errors.New("base URL must not contain user info, a query, a fragment, backslashes or whitespace")
+		}
+	}
+	return strings.TrimRight(baseURL, "/"), nil
 }
 
 type MCPRequestType string

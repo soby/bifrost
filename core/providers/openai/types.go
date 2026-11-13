@@ -463,6 +463,13 @@ type OpenAIChatRequest struct {
 	// (e.g. preserving cache_control for OpenRouter). Not serialized to wire.
 	Provider schemas.ModelProvider `json:"-"`
 
+	// OpenRouterRouting is OpenRouter's top-level `provider` preferences object.
+	// It deliberately has a different Go name from Provider: Provider selects the
+	// Bifrost adapter, while this value constrains which upstream OpenRouter may
+	// serve. It is populated only for the native OpenRouter adapter so a caller's
+	// routing constraint cannot leak to other OpenAI-compatible providers.
+	OpenRouterRouting any `json:"provider,omitempty"`
+
 	// Bifrost specific field (only parsed when converting from Provider -> Bifrost request)
 	Fallbacks   []string               `json:"fallbacks,omitempty"`
 	ExtraParams map[string]interface{} `json:"-"` // Optional: Extra parameters
@@ -504,15 +511,23 @@ type OpenAIChatAssistantMessage struct {
 	// ReasoningAlias and ReasoningDetails capture the other two spellings callers use to
 	// replay assistant reasoning: OpenRouter-style "reasoning" and "reasoning_details".
 	//
-	// These are inbound-only. ConvertBifrostMessagesToOpenAIMessages is the sole
-	// construction site on the outbound path and never populates them, so they stay nil
-	// there and omitempty keeps them off the wire for every provider. Read them via
+	// ReasoningAlias is inbound-only. ReasoningDetails is emitted outbound only by
+	// forwardReasoningDetails, for destinations without a curated OpenAI dialect; every
+	// other provider keeps it nil and omitempty keeps it off the wire. Read both via
 	// ConvertOpenAIMessagesToBifrostMessages, which folds them into the Bifrost schema.
 	ReasoningAlias   *string                        `json:"reasoning,omitempty"`
 	ReasoningDetails []schemas.ChatReasoningDetails `json:"reasoning_details,omitempty"`
 
 	Annotations []schemas.ChatAssistantMessageAnnotation `json:"annotations,omitempty"`
 	ToolCalls   []schemas.ChatAssistantMessageToolCall   `json:"tool_calls,omitempty"`
+
+	Audio *OpenAIChatAssistantAudio `json:"audio,omitempty"` // Reference to a previous audio response
+}
+
+// OpenAIChatAssistantAudio references the audio of a previous assistant response
+// when it is replayed in a later request.
+type OpenAIChatAssistantAudio struct {
+	ID string `json:"id"`
 }
 
 // MarshalJSON implements custom JSON marshalling for OpenAIChatRequest.

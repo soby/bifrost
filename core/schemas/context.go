@@ -54,6 +54,7 @@ var reservedKeys = map[BifrostContextKey]struct{}{
 	BifrostContextKeyInjectedToolsExecuted:   {},
 	BifrostContextKeyUpstreamLatency:         {},
 	BifrostContextKeyStreamOverhead:          {},
+	BifrostContextKeyUpstreamWindow:          {},
 	BifrostContextKeyRoutingInfo:             {},
 	BifrostContextKeyRequestedProvider:       {},
 	BifrostContextKeyRequestedModel:          {},
@@ -115,6 +116,8 @@ type BifrostContext struct {
 	pluginLogs    atomic.Pointer[pluginLogStore] // Shared log store; lazily initialized on root, shared by scoped contexts
 	valueDelegate *BifrostContext                // For scoped contexts: delegate Value/SetValue to this root context
 	scopeSpanID   string                         // For scoped contexts: parent span for spans the plugin starts, read in place of the root's
+	scopeKey      any                            // For scoped contexts: one key this scope alone reads scopeValue under (see WithPluginScopeValue)
+	scopeValue    any
 }
 
 // NewBifrostContext creates a new BifrostContext with the given parent context and deadline.
@@ -437,6 +440,9 @@ func (bc *BifrostContext) Value(key any) any {
 	if bc.valueDelegate != nil {
 		if bc.scopeSpanID != "" && key == BifrostContextKeySpanID {
 			return bc.scopeSpanID
+		}
+		if bc.scopeKey != nil && key == bc.scopeKey {
+			return bc.scopeValue
 		}
 		return bc.valueDelegate.Value(key)
 	}
@@ -1131,6 +1137,17 @@ func (bc *BifrostContext) WithPluginScope(name *string) *BifrostContext {
 func (bc *BifrostContext) WithPluginScopeSpan(name *string, spanID string) *BifrostContext {
 	scoped := bc.WithPluginScope(name)
 	scoped.scopeSpanID = spanID
+	return scoped
+}
+
+// WithPluginScopeValue is WithPluginScope with one value only this scoped context reads:
+// Value(key) on it returns value, while the root and every other scope of the request
+// keep what they had. It is how a caller hands one hook call something no other holder
+// of the request context can reach. key must be comparable.
+func (bc *BifrostContext) WithPluginScopeValue(name *string, key, value any) *BifrostContext {
+	scoped := bc.WithPluginScope(name)
+	scoped.scopeKey = key
+	scoped.scopeValue = value
 	return scoped
 }
 

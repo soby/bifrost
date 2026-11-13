@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -118,36 +117,57 @@ var textParamsKnownFields = map[string]bool{
 	"user":              true,
 }
 
-// Known fields for CompletionRequest
+// Known fields for ChatRequest: every schemas.ChatParameters field plus the
+// input-only reasoning_* spellings. A typed field missing here would also be
+// copied into ExtraParams, where it shadows the typed value on the wire.
 var chatParamsKnownFields = map[string]bool{
 	"model":                  true,
 	"messages":               true,
 	"fallbacks":              true,
 	"stream":                 true,
+	"audio":                  true,
 	"frequency_penalty":      true,
 	"logit_bias":             true,
 	"logprobs":               true,
 	"max_completion_tokens":  true,
 	"metadata":               true,
 	"modalities":             true,
+	"n":                      true,
 	"parallel_tool_calls":    true,
+	"prediction":             true,
 	"presence_penalty":       true,
 	"prompt_cache_key":       true,
+	"prompt_cache_options":   true,
 	"prompt_cache_retention": true,
 	"reasoning":              true,
+	"reasoning_display":      true,
 	"reasoning_effort":       true,
 	"reasoning_max_tokens":   true,
 	"response_format":        true,
 	"safety_identifier":      true,
+	"seed":                   true,
 	"service_tier":           true,
 	"stream_options":         true,
+	"stop":                   true,
 	"store":                  true,
 	"temperature":            true,
 	"tool_choice":            true,
 	"tools":                  true,
+	"top_logprobs":           true,
+	"top_p":                  true,
 	"truncation":             true,
 	"user":                   true,
 	"verbosity":              true,
+	"web_search_options":     true,
+
+	"top_k":              true,
+	"speed":              true,
+	"inference_geo":      true,
+	"mcp_servers":        true,
+	"container":          true,
+	"cache_control":      true,
+	"task_budget":        true,
+	"context_management": true,
 
 	"include_server_side_tool_invocations": true,
 }
@@ -783,6 +803,11 @@ func effectiveStream(bodyStream *bool) bool {
 	return false
 }
 
+// extraParamsJSON decodes extra parameter values with numbers as json.Number, so
+// integers beyond 2^53 (seeds, ids) and decimal literals reach the provider exactly
+// as the caller sent them instead of being rounded through float64.
+var extraParamsJSON = sonic.Config{UseNumber: true}.Froze()
+
 // extractExtraParams processes unknown fields from JSON data into ExtraParams
 func extractExtraParams(data []byte, knownFields map[string]bool) (map[string]any, error) {
 	// Parse JSON to extract unknown fields
@@ -796,7 +821,7 @@ func extractExtraParams(data []byte, knownFields map[string]bool) (map[string]an
 	for key, value := range rawData {
 		if !knownFields[key] {
 			var v any
-			if err := sonic.Unmarshal(value, &v); err != nil {
+			if err := extraParamsJSON.Unmarshal(value, &v); err != nil {
 				continue // Skip fields that can't be unmarshaled
 			}
 			extraParams[key] = v
@@ -1188,11 +1213,9 @@ func prepareChatCompletionRequest(ctx *fasthttp.RequestCtx, config *lib.Config) 
 		if maxTokensVal, exists := base.ExtraParams["max_tokens"]; exists {
 			delete(base.ExtraParams, "max_tokens")
 			if req.ChatParameters.MaxCompletionTokens == nil {
-				if maxTokensFloat, ok := maxTokensVal.(float64); ok {
-					maxTokens := int(maxTokensFloat)
-					req.ChatParameters.MaxCompletionTokens = &maxTokens
-				} else if maxTokensInt, ok := maxTokensVal.(int); ok {
-					req.ChatParameters.MaxCompletionTokens = &maxTokensInt
+				if maxTokens, ok := schemas.SafeExtractIntPointer(maxTokensVal); ok {
+					req.MaxCompletionTokens = maxTokens
+					req.LegacyMaxTokens = true
 				}
 			}
 		}
@@ -2299,7 +2322,13 @@ func (h *CompletionHandler) handleStreamingChatCompletion(ctx *fasthttp.RequestC
 		return h.client.ChatCompletionStreamRequest(bifrostCtx, req)
 	}
 
-	h.handleStreamingResponse(ctx, bifrostCtx, schemas.ChatCompletionStreamRequest, getStream, cancel)
+	// The stream's wire usage contract follows the caller's stream_options.include_usage,
+	// read here before any hook can change the request.
+	includeUsage := req.Params != nil &&
+		req.Params.StreamOptions != nil &&
+		req.Params.StreamOptions.IncludeUsage != nil &&
+		*req.Params.StreamOptions.IncludeUsage
+	h.handleStreamingResponseWithChatUsage(ctx, bifrostCtx, schemas.ChatCompletionStreamRequest, includeUsage, getStream, cancel)
 }
 
 // handleStreamingResponses handles streaming responses requests using Server-Sent Events (SSE)
@@ -2354,9 +2383,20 @@ func (h *CompletionHandler) handleStreamingTranscriptionRequest(ctx *fasthttp.Re
 // in lib.ConvertToBifrostContext. Bifrost handles cleanup internally for normal completion and
 // errors, so we only cancel upstream streams when the client has disconnected.
 func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, requestType schemas.RequestType, getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError), cancel context.CancelFunc) {
-	// Get the streaming channel — called BEFORE setting SSE headers so that
-	// provider errors return proper HTTP status codes + JSON content type.
-	stream, bifrostErr := getStream()
+	h.handleStreamingResponseWithChatUsage(ctx, bifrostCtx, requestType, false, getStream, cancel)
+}
+
+// handleStreamingResponseWithChatUsage is handleStreamingResponse with the chat stream's
+// usage contract stated: includeChatUsage is the caller's stream_options.include_usage and
+// only affects chat completion chunks (see marshalChatCompletionStreamEvents).
+func (h *CompletionHandler) handleStreamingResponseWithChatUsage(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, requestType schemas.RequestType, includeChatUsage bool, getStream func() (chan *schemas.BifrostStreamChunk, *schemas.BifrostError), cancel context.CancelFunc) {
+	// Get the streaming channel — awaited BEFORE setting SSE headers so that
+	// provider errors return proper HTTP status codes + JSON content type. The
+	// only exception is a plugin that reports it is holding the request before the
+	// provider call (lib.StreamSetup): the stream is then committed before setup
+	// ends and a setup error becomes an in-stream error event.
+	setup := lib.StartStreamSetup(bifrostCtx, true, getStream)
+	stream, bifrostErr, committedEarly := setup.Await()
 	if bifrostErr != nil {
 		cancel()
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
@@ -2364,19 +2404,23 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 		return
 	}
 
-	// SSE headers set only after successful stream setup
+	// SSE headers set only after successful stream setup, or at an early commit
 	ctx.SetContentType("text/event-stream")
 	ctx.Response.Header.Set("Cache-Control", "no-cache")
 	ctx.Response.Header.Set("Connection", "keep-alive")
 
-	// Forward provider response headers stored in context by streaming handlers
-	if headers, ok := bifrostCtx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string); ok {
-		lib.ForwardProviderResponseHeaders(ctx, headers)
-	}
+	// Provider and routed-identity headers exist only once setup has finished, so
+	// an early-committed stream omits them.
+	if !committedEarly {
+		// Forward provider response headers stored in context by streaming handlers
+		if headers, ok := bifrostCtx.Value(schemas.BifrostContextKeyProviderResponseHeaders).(map[string]string); ok {
+			lib.ForwardProviderResponseHeaders(ctx, headers)
+		}
 
-	// Routed-identity headers from the context snapshot — routing is final once
-	// the stream channel is returned, before any chunk arrives.
-	lib.ApplyBifrostStreamResponseHeaders(ctx, bifrostCtx, requestType)
+		// Routed-identity headers from the context snapshot — routing is final once
+		// the stream channel is returned, before any chunk arrives.
+		lib.ApplyBifrostStreamResponseHeaders(ctx, bifrostCtx, requestType)
+	}
 	// Read once on the handler goroutine: in headers mode every chunk drops extra_fields.
 	stripExtraFields := lib.ExtraFieldsInHeaders(ctx)
 
@@ -2384,12 +2428,11 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 	// The streaming callback will complete the trace after the stream ends
 	ctx.SetUserValue(schemas.BifrostContextKeyDeferTraceCompletion, true)
 
-	// Pre-allocate atomic.Value slot for the transport post-hook completer.
-	// TransportInterceptorMiddleware stores the completer into this slot after next(ctx)
-	// returns. The goroutine reads from the closure-captured pointer, avoiding any ctx
-	// access after the handler returns (fasthttp recycles RequestCtx).
-	var completerSlot atomic.Value
-	ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, &completerSlot)
+	// Slot for the transport post-hook completer. TransportInterceptorMiddleware resolves
+	// it after next(ctx) returns. The goroutine reads from the closure-captured pointer,
+	// avoiding any ctx access after the handler returns (fasthttp recycles RequestCtx).
+	// Nil when no transport plugin is loaded: nothing to run, nothing to wait for.
+	completerSlot := lib.NewTransportPostHookCompleterSlot(ctx)
 
 	// Get the trace completer function for use in the streaming callback.
 	// Signature: func([]schemas.PluginLogEntry) — accepts transport plugin logs so it
@@ -2406,6 +2449,7 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 	// which batches multiple SSE events into single TCP segments.
 	// Each event is delivered individually via a channel, ensuring one HTTP chunk per event.
 	reader := lib.NewSSEStreamReader()
+	reader.SetFrameTap(lib.StreamFrameTap(bifrostCtx))
 	ctx.Response.SetBodyStream(reader, -1)
 
 	// Producer goroutine: processes the stream channel, formats SSE events, sends to reader
@@ -2425,29 +2469,15 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 			if completerRan {
 				return
 			}
-			// Bounded wait for TransportInterceptorMiddleware to publish the completer.
-			// It calls slot.Store after next(ctx) returns, which races with this goroutine
-			// on fast/empty streams. 100ms is ample — the store runs a few instructions
-			// after the handler returns.
-			var loaded any
-			deadline := time.Now().Add(100 * time.Millisecond)
-			for {
-				if loaded = completerSlot.Load(); loaded != nil {
-					break
-				}
-				if time.Now().After(deadline) {
-					break
-				}
-				time.Sleep(time.Millisecond)
-			}
-			if loaded == nil {
-				return
-			}
-			postHookCompleter, ok := loaded.(func() ([]schemas.PluginLogEntry, error))
-			if !ok {
-				return
-			}
+			// Wait for TransportInterceptorMiddleware to resolve the slot. It does so on
+			// every path out of the middleware, just after next(ctx) returns, which a
+			// fast or empty stream can reach here first.
 			completerRan = true
+			completerSlot.CaptureRequestState(bifrostCtx, reader)
+			postHookCompleter := completerSlot.Wait()
+			if postHookCompleter == nil {
+				return
+			}
 			logs, err := postHookCompleter()
 			if err != nil {
 				if sendSSEOnError {
@@ -2475,6 +2505,9 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 		heartbeatDone, heartbeatExited := lib.StartSSEHeartbeat(lib.DefaultSSEHeartbeatInterval, reader.SendHeartbeat, cancel)
 
 		defer func() {
+			// Before the heartbeat is stopped, which closes the reader: record how the
+			// request stood when the producer stopped, for the transport post-hooks.
+			completerSlot.CaptureRequestState(bifrostCtx, reader)
 			// Must run before reader.Done(): closing eventCh while the heartbeat goroutine
 			// could still be mid-send on it panics ("send on closed channel"). See
 			// lib.StopSSEHeartbeat's doc for the full ordering rationale.
@@ -2498,6 +2531,13 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 				lib.RunRecovered("stream trace completer", func() { traceCompleter(transportLogs) })
 			}
 		}()
+		if committedEarly {
+			// Early commit: wait for setup while the heartbeat above keeps the connection
+			// alive and cancels the request if the client leaves. A setup error comes back
+			// as a one-chunk error stream, written below as this route's ordinary error
+			// event (and suppressing [DONE]).
+			stream = setup.AwaitCommitted(requestType)
+		}
 		// Registered after the teardown above so it runs first: a panic while converting a
 		// chunk is logged, an error frame goes to the client, upstream is cancelled and
 		// drained, then the teardown closes the stream.
@@ -2510,6 +2550,14 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 			}
 		})
 
+		// stopProvider cancels the request because the producer has nothing more to
+		// write, not because the request ended: it records the request's state first, so
+		// the transport post-hooks are not told the request was cancelled.
+		stopProvider := func() {
+			completerSlot.CaptureRequestState(bifrostCtx, reader)
+			cancel()
+		}
+
 		var includeEventType bool
 		var skipDoneMarker bool
 		// Set once a hard error frame reaches the client. An error frame is a
@@ -2518,73 +2566,39 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 		// ambiguity that let truncated upstream streams look successful (#5546).
 		var sawErrorChunk bool
 
-		// Process streaming responses
-		for chunk := range stream {
-			if chunk == nil {
-				continue
-			}
-
-			includeEventType = false
-			if chunk.BifrostResponsesStreamResponse != nil ||
-				chunk.BifrostImageGenerationStreamResponse != nil ||
-				(chunk.BifrostError != nil && (chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesRetrieveStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageGenerationStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageEditStreamRequest)) {
-				includeEventType = true
-			}
-
-			// Image generation streams don't use [DONE] marker
-			if chunk.BifrostImageGenerationStreamResponse != nil {
-				skipDoneMarker = true
-			}
-
-			// Allow plugins to modify/filter the chunk via StreamChunkInterceptor
-			if interceptor != nil {
-				var err error
-				chunk, err = interceptor.InterceptChunk(bifrostCtx, httpReq, chunk)
-				if err != nil {
-					if chunk == nil {
-						var errorPayload interface{} = map[string]string{"error": err.Error()}
-						var structuredErr *schemas.StreamInterceptionError
-						if errors.As(err, &structuredErr) && structuredErr != nil {
-							if sanitized := lib.SanitizeBifrostErrorForClient(structuredErr.BifrostError); sanitized != nil {
-								errorPayload = sanitized
-							}
-						}
-						errorJSON, marshalErr := sonic.Marshal(errorPayload)
-						if marshalErr != nil {
-							cancel() // Payload invalid
-							for range stream {
-							}
-							return
-						}
-						if stripExtraFields {
-							errorJSON = lib.StripExtraFields(errorJSON)
-						}
-						// Return error event and stop streaming
-						reader.SendError(errorJSON)
-						cancel()
-						for range stream {
-						}
-						return
-					}
-					// Else add warn log and continue
-					logger.Warn("%v", err)
-				}
-				if chunk == nil {
-					// Skip chunk if plugin wants to skip it
-					continue
-				}
-			}
-
-			// Convert response to JSON (transport-goroutine CPU).
+		// writeChunk renders one chunk as this route's stream event and sends it. It reports
+		// whether the chunk was rendered and sent, and whether the client has gone; it has
+		// then cancelled the request, and the caller drains the provider and stops.
+		writeChunk := func(chunk *schemas.BifrostStreamChunk, includeEventType bool) (written, clientGone bool) {
+			// Convert response to JSON (transport-goroutine CPU). A chat chunk is
+			// normalized into the OpenAI wire contract: usage is omitted unless
+			// requested, and requested usage is its own event after the chunk.
 			cpuStart := time.Now()
-			chunkJSON, err := sonic.Marshal(chunk)
+			var chunkJSON, usageJSON []byte
+			var err error
+			if requestType == schemas.ChatCompletionStreamRequest && chunk.BifrostChatResponse != nil {
+				chunkJSON, usageJSON, err = marshalChatCompletionStreamEvents(chunk.BifrostChatResponse, includeChatUsage)
+			} else {
+				chunkJSON, err = sonic.Marshal(chunk)
+			}
 			if err == nil && stripExtraFields {
 				chunkJSON = lib.StripExtraFields(chunkJSON)
+				if len(usageJSON) > 0 {
+					usageJSON = lib.StripExtraFields(usageJSON)
+				}
 			}
 			streamTransportCPUNs += time.Since(cpuStart).Nanoseconds()
 			if err != nil {
 				logger.Warn("Failed to marshal streaming response: %v", err)
-				continue
+				// The chunk passed every hook and the transport could not render it:
+				// the transport did not deliver what the hooks released.
+				completerSlot.MarkUndelivered()
+				return false, false
+			}
+			if len(chunkJSON) == 0 && len(usageJSON) == 0 {
+				// The route has no event for this chunk (a chat chunk holding only usage
+				// the caller did not ask for): nothing is sent, so nothing was written.
+				return false, false
 			}
 
 			// Checked after marshalling so a chunk that never reaches the wire does
@@ -2607,10 +2621,105 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 			}
 
 			writeStart := time.Now()
-			sent := reader.SendEvent(eventType, chunkJSON)
+			sent := len(chunkJSON) == 0 || reader.SendEvent(eventType, chunkJSON)
+			if sent && len(usageJSON) > 0 {
+				sent = reader.SendEvent("", usageJSON)
+			}
 			streamClientWriteNs += time.Since(writeStart).Nanoseconds()
 			if !sent {
 				cancel() // Client disconnected, cancel upstream stream
+				return false, true
+			}
+			return true, false
+		}
+
+		// A stream chunk hook writes additional chunks through schemas.StreamChunkWriter
+		// while it runs: each goes out through writeChunk at once, ahead of the chunk the
+		// hook returns. hookWrite runs only inside a hook call (see
+		// lib.InterceptStreamChunk), so writeChunk never runs beside this loop.
+		// hookClientGone records a write that found the client gone, which ends the stream
+		// once the hooks return.
+		var hookClientGone bool
+		var hookWrite func(*schemas.BifrostStreamChunk) bool
+		if interceptor != nil {
+			hookWrite = func(extra *schemas.BifrostStreamChunk) bool {
+				if hookClientGone || extra == nil || extra.BifrostError != nil {
+					return false
+				}
+				written, clientGone := writeChunk(extra, extra.BifrostResponsesStreamResponse != nil || extra.BifrostImageGenerationStreamResponse != nil)
+				hookClientGone = clientGone
+				return written
+			}
+		}
+
+		// Process streaming responses
+		for chunk := range stream {
+			if chunk == nil {
+				continue
+			}
+
+			includeEventType = false
+			if chunk.BifrostResponsesStreamResponse != nil ||
+				chunk.BifrostImageGenerationStreamResponse != nil ||
+				(chunk.BifrostError != nil && (chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ResponsesRetrieveStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageGenerationStreamRequest || chunk.BifrostError.ExtraFields.RequestType == schemas.ImageEditStreamRequest)) {
+				includeEventType = true
+			}
+
+			// Image generation streams don't use [DONE] marker
+			if chunk.BifrostImageGenerationStreamResponse != nil {
+				skipDoneMarker = true
+			}
+
+			// Allow plugins to modify/filter the chunk via StreamChunkInterceptor
+			if interceptor != nil {
+				var err error
+				chunk, err = lib.InterceptStreamChunk(interceptor, bifrostCtx, httpReq, chunk, hookWrite)
+				if hookClientGone {
+					// A chunk the hook wrote found the client gone: the request is
+					// cancelled, and nothing the hook returned can be delivered.
+					for range stream {
+					}
+					return
+				}
+				if err != nil {
+					if chunk == nil {
+						var errorPayload interface{} = map[string]string{"error": err.Error()}
+						var structuredErr *schemas.StreamInterceptionError
+						if errors.As(err, &structuredErr) && structuredErr != nil {
+							if sanitized := lib.SanitizeBifrostErrorForClient(structuredErr.BifrostError); sanitized != nil {
+								errorPayload = sanitized
+							}
+						}
+						errorJSON, marshalErr := sonic.Marshal(errorPayload)
+						if marshalErr != nil {
+							// The error the hook ended the stream with could not be
+							// rendered, so nothing told the client: not delivered.
+							completerSlot.MarkUndelivered()
+							stopProvider() // Payload invalid
+							for range stream {
+							}
+							return
+						}
+						if stripExtraFields {
+							errorJSON = lib.StripExtraFields(errorJSON)
+						}
+						// Return error event and stop streaming
+						reader.SendError(errorJSON)
+						stopProvider()
+						for range stream {
+						}
+						return
+					}
+					// Else add warn log and continue
+					logger.Warn("%v", err)
+				}
+				if chunk == nil {
+					// Skip chunk if plugin wants to skip it
+					continue
+				}
+			}
+
+			if _, clientGone := writeChunk(chunk, includeEventType); clientGone {
 				// Drain remaining chunks so the provider goroutine's defer
 				// (HandleStreamCancellation -> PostLLMHook -> storeOrEnqueueEntry) finishes
 				// before our own defer fires traceCompleter. Without this, Inject runs

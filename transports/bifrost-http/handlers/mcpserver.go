@@ -239,8 +239,7 @@ func (h *MCPServerHandler) serveMCPStream(ctx *fasthttp.RequestCtx, bifrostCtx *
 	handled := make(chan struct{})
 
 	// Pre-allocate the completer slot before the stream can start; see streamMCP for why.
-	var completerSlot atomic.Value
-	ctx.SetUserValue(schemas.BifrostContextKeyTransportPostHookCompleter, &completerSlot)
+	completerSlot := lib.NewTransportPostHookCompleterSlot(ctx)
 	traceCompleter, _ := ctx.UserValue(schemas.BifrostContextKeyTraceCompleter).(func([]schemas.PluginLogEntry))
 
 	go func() {
@@ -266,20 +265,26 @@ func (h *MCPServerHandler) serveMCPStream(ctx *fasthttp.RequestCtx, bifrostCtx *
 	ctx.Response.Header.Set("X-Accel-Buffering", "no")
 	ctx.Response.SetBodyStream(w.reader, -1)
 
-	go streamMCP(bifrostCtx, cancel, w.reader, handled, &completerSlot, traceCompleter)
+	go streamMCP(bifrostCtx, cancel, w.reader, handled, completerSlot, traceCompleter)
 }
 
 // streamMCP keeps an MCP SSE stream alive until the transport finishes or the client goes away,
 // then runs the deferred transport post-hooks and completes the trace. It reads nothing from the
-// fasthttp ctx: TransportInterceptorMiddleware stores the completer into the closure-captured slot
-// after the handler returns, and fasthttp recycles the RequestCtx.
-func streamMCP(bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc, reader *lib.SSEStreamReader, handled <-chan struct{}, completerSlot *atomic.Value, traceCompleter func([]schemas.PluginLogEntry)) {
+// fasthttp ctx: TransportInterceptorMiddleware resolves the closure-captured slot after the
+// handler returns, and fasthttp recycles the RequestCtx.
+func streamMCP(bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc, reader *lib.SSEStreamReader, handled <-chan struct{}, completerSlot *lib.TransportPostHookSlot, traceCompleter func([]schemas.PluginLogEntry)) {
 	var transportLogs []schemas.PluginLogEntry
 	defer func() {
 		// Run the deferred transport post-hook completer before cancelling the
 		// context so plugins see a live context. Errors are logged server-side
 		// only — the stream is already closing.
-		transportLogs = runMCPStreamCompleter(completerSlot)
+		if postHookCompleter := completerSlot.Wait(); postHookCompleter != nil {
+			logs, err := postHookCompleter()
+			if err != nil {
+				logger.Warn("transport post-hook failed after stream terminated: %v", err)
+			}
+			transportLogs = logs
+		}
 		cancel()
 		reader.Done()
 		// Complete the trace after streaming finishes, passing transport plugin logs.
@@ -319,29 +324,6 @@ func streamMCP(bifrostCtx *schemas.BifrostContext, cancel context.CancelFunc, re
 			return
 		}
 	}
-}
-
-// runMCPStreamCompleter invokes the transport post-hook completer once the middleware has published
-// it, and returns the transport plugin logs. The store races with the stream on fast or empty
-// streams, so it waits briefly; 100ms is ample, as it runs a few instructions after the handler returns.
-func runMCPStreamCompleter(completerSlot *atomic.Value) []schemas.PluginLogEntry {
-	var loaded any
-	deadline := time.Now().Add(100 * time.Millisecond)
-	for {
-		if loaded = completerSlot.Load(); loaded != nil || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	postHookCompleter, ok := loaded.(func() ([]schemas.PluginLogEntry, error))
-	if !ok {
-		return nil
-	}
-	logs, err := postHookCompleter()
-	if err != nil {
-		logger.Warn("transport post-hook failed after stream terminated: %v", err)
-	}
-	return logs
 }
 
 // SyncMCPServer replaces the server's tools with those currently available. Called whenever the set

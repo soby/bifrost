@@ -388,6 +388,10 @@ type HTTPTransportPlugin interface {
 	// - (*BifrostStreamChunk, error): Log warning and continue with the BifrostStreamChunk
 	// - (nil, error): Send back error to the client and stop the streaming
 	//
+	// To send the client more than one chunk for one call, write the additional chunks with
+	// WriteStreamChunk(ctx, chunk) during the call, on the ctx the hook received: each is
+	// written at once, in call order, ahead of the returned chunk. See StreamChunkWriter.
+	//
 	// Return (*BifrostStreamChunk, nil) unchanged if the plugin doesn't need streaming chunk interception.
 	HTTPTransportStreamChunkHook(ctx *BifrostContext, req *HTTPRequest, chunk *BifrostStreamChunk) (*BifrostStreamChunk, error)
 }

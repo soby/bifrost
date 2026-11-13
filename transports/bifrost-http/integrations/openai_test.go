@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -968,4 +969,43 @@ func TestRewriteOpenAIRawRequestBodyRejectsUnmappedLiteral(t *testing.T) {
 		map[string]string{"alice@example.com": "[EMAIL]"},
 	)
 	require.Error(t, err)
+}
+
+func TestAzureEndpointPreHook_DecodesDeploymentPath(t *testing.T) {
+	tests := []struct {
+		name, deploymentPath, want string
+	}{
+		{"plain deployment", "gpt-4o/chat/completions", "azure/gpt-4o"},
+		{"provider and model", "openai/gpt-4o/chat/completions", "openai/gpt-4o"},
+		{"escaped slashes", "openai%2Forg%2Fmodel-a/chat/completions", "openai/org/model-a"},
+		{"escaped space", "my%20deployment/chat/completions", "azure/my deployment"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := &fasthttp.RequestCtx{}
+			ctx.SetUserValue("deploymentPath", tt.deploymentPath)
+			req := &openai.OpenAIChatRequest{Model: "org/model-a"}
+			bifrostCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			if err := AzureEndpointPreHook(&mockHandlerStore{})(ctx, bifrostCtx, req); err != nil {
+				t.Fatalf("AzureEndpointPreHook() error = %v", err)
+			}
+			if req.Model != tt.want {
+				t.Fatalf("model = %q, want %q", req.Model, tt.want)
+			}
+		})
+	}
+}
+
+func TestAzureEndpointPreHook_RejectsMalformedEscape(t *testing.T) {
+	ctx := &fasthttp.RequestCtx{}
+	ctx.SetUserValue("deploymentPath", "gpt%zz4o/chat/completions")
+	req := &openai.OpenAIChatRequest{Model: "gpt-4o"}
+	bifrostCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	err := AzureEndpointPreHook(&mockHandlerStore{})(ctx, bifrostCtx, req)
+	if err == nil || !strings.Contains(err.Error(), "invalid azure deployment path") {
+		t.Fatalf("AzureEndpointPreHook() error = %v, want an invalid deployment path error", err)
+	}
+	if req.Model != "gpt-4o" {
+		t.Fatalf("model = %q, want the request unchanged", req.Model)
+	}
 }

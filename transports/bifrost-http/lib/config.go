@@ -62,6 +62,17 @@ import (
 	"gorm.io/gorm"
 )
 
+// StreamChunkWriterInterceptor is a StreamChunkInterceptor that can offer its hooks a
+// writer for additional chunks. See InterceptStreamChunk.
+type StreamChunkWriterInterceptor interface {
+	StreamChunkInterceptor
+	// InterceptChunkWithWriter is InterceptChunk with write, the stream's own chunk write,
+	// offered to the hook calls it makes. write must not be called outside a hook call or
+	// by two callers at once: an implementation offers it through a writer that is open
+	// for one hook call only.
+	InterceptChunkWithWriter(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk, write func(chunk *schemas.BifrostStreamChunk) bool) (*schemas.BifrostStreamChunk, error)
+}
+
 // StreamChunkInterceptor intercepts streaming chunks before they're sent to clients.
 // Implementations can modify, filter, or observe chunks in real-time.
 // This interface enables proper dependency injection for streaming handlers.
@@ -161,6 +172,26 @@ func IsBuiltinPlugin(name string) bool {
 	return slices.Contains(builtinPluginNames, name)
 }
 
+// ConnectionReadTimeout returns the limit for reading one request, headers and
+// body, from server.read_timeout_seconds. Zero, the value when not set, is no limit.
+func (c *ServerConfig) ConnectionReadTimeout() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return time.Duration(max(c.ReadTimeoutSeconds, 0)) * time.Second
+}
+
+// ConnectionIdleTimeout returns the limit for waiting on the next request of a
+// keep-alive connection, from server.idle_timeout_seconds. Zero, the value when
+// not set, falls back to the read timeout, as fasthttp does; with neither set
+// an idle connection is never closed.
+func (c *ServerConfig) ConnectionIdleTimeout() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return time.Duration(max(c.IdleTimeoutSeconds, 0)) * time.Second
+}
+
 // pluginOrderInfo stores ordering metadata for a plugin.
 type pluginOrderInfo struct {
 	Placement schemas.PluginPlacement
@@ -177,6 +208,13 @@ type ServerConfig struct {
 	// it is a pointer to tell the two apart. See ApplyBodyBufferPoolLimit. Deploy-time
 	// only - read from config.json at startup.
 	BodyBufferPoolLimitBytes *int `json:"body_buffer_pool_limit_bytes,omitempty"`
+
+	// Inbound connection settings, passed to the fasthttp server. Not set keeps
+	// fasthttp's behavior: buffers are kept between requests and nothing times out.
+	// Deploy-time only - read from config.json at startup.
+	ReduceMemoryUsage  bool `json:"reduce_memory_usage,omitempty"`  // release a keep-alive connection's read, write and body buffers while it idles between requests
+	ReadTimeoutSeconds int  `json:"read_timeout_seconds,omitempty"` // see ConnectionReadTimeout
+	IdleTimeoutSeconds int  `json:"idle_timeout_seconds,omitempty"` // see ConnectionIdleTimeout
 
 	// PluginDownloadPrivateAllowlist lists hostnames, IPs, and CIDR ranges that custom
 	// plugin (.so) downloads may reach even when they resolve to a private/loopback/
@@ -8538,6 +8576,14 @@ type pluginChunkInterceptor struct {
 // InterceptChunk processes a chunk through all plugin HTTPTransportStreamChunkHook methods.
 // Plugins are called in reverse order (same as PostHook) so modifications chain correctly.
 func (i *pluginChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {
+	return i.InterceptChunkWithWriter(ctx, req, stream, nil)
+}
+
+// InterceptChunkWithWriter is InterceptChunk with write offered to each hook call as its
+// schemas.StreamChunkWriter. Every call of a plugin's hook gets a writer of its own, on
+// the context that call receives and nowhere else, open until that call returns or panics
+// and closed for good after.
+func (i *pluginChunkInterceptor) InterceptChunkWithWriter(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, stream *schemas.BifrostStreamChunk, write func(chunk *schemas.BifrostStreamChunk) bool) (*schemas.BifrostStreamChunk, error) {
 	for j := len(i.plugins) - 1; j >= 0; j-- {
 		plugin := i.plugins[j]
 		pluginName := plugin.GetName()
@@ -8546,7 +8592,14 @@ func (i *pluginChunkInterceptor) InterceptChunk(ctx *schemas.BifrostContext, req
 			err      error
 		)
 		func() {
-			pluginCtx := ctx.WithPluginScope(&pluginName)
+			var pluginCtx *schemas.BifrostContext
+			if write != nil {
+				call := &streamChunkHookCall{write: write}
+				defer call.close()
+				pluginCtx = ctx.WithPluginScopeValue(&pluginName, schemas.BifrostContextKeyStreamChunkWriter, schemas.StreamChunkWriter(call.writeChunk))
+			} else {
+				pluginCtx = ctx.WithPluginScope(&pluginName)
+			}
 			defer pluginCtx.ReleasePluginScope()
 			modified, err = plugin.HTTPTransportStreamChunkHook(pluginCtx, req, stream)
 		}()

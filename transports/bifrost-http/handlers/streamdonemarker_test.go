@@ -38,6 +38,13 @@ func serveStreamingResponseWithConfig(t *testing.T, config *lib.Config, chunks [
 // runs on the request context before the handler, e.g. to install a trace completer.
 func serveStreamingResponseWithSetup(t *testing.T, config *lib.Config, setup func(*fasthttp.RequestCtx), chunks []*schemas.BifrostStreamChunk) string {
 	t.Helper()
+	return serveChatStreamingResponse(t, config, setup, false, chunks)
+}
+
+// serveChatStreamingResponse is serveStreamingResponseWithSetup with the caller's
+// stream_options.include_usage stated.
+func serveChatStreamingResponse(t *testing.T, config *lib.Config, setup func(*fasthttp.RequestCtx), includeUsage bool, chunks []*schemas.BifrostStreamChunk) string {
+	t.Helper()
 
 	handler := func(reqCtx *fasthttp.RequestCtx) {
 		if setup != nil {
@@ -57,7 +64,7 @@ func serveStreamingResponseWithSetup(t *testing.T, config *lib.Config, setup fun
 			return stream, nil
 		}
 
-		h.handleStreamingResponse(reqCtx, bifrostCtx, schemas.ChatCompletionStreamRequest, getStream, cancel)
+		h.handleStreamingResponseWithChatUsage(reqCtx, bifrostCtx, schemas.ChatCompletionStreamRequest, includeUsage, getStream, cancel)
 	}
 
 	serverConn, clientConn := net.Pipe()

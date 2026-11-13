@@ -2978,69 +2978,158 @@ func TestRequestDecompressionMiddleware_ExpansionBound(t *testing.T) {
 	}
 }
 
-// TestRequestDecompressionMiddleware_InFlightBudget pins that buffered decompressions cannot
-// stack up without bound: the bytes each one inflates are charged to a budget of four times the
-// cap for the life of the request, and a request that cannot be charged is answered 503 rather
-// than given another buffer.
-func TestRequestDecompressionMiddleware_InFlightBudget(t *testing.T) {
-	config := &lib.Config{ClientConfig: &configstore.ClientConfig{MaxRequestBodySizeMB: 1}}
+// decompressionBudgetHarness drives the decompression middleware on a 1 MiB cap, so its budget
+// is 4 MiB, with bodies that inflate to the whole cap: four fill the budget. Every admitted
+// request blocks in the handler until release receives, and a request that has to wait for
+// budget reports on waiting just before it blocks.
+type decompressionBudgetHarness struct {
+	handler    fasthttp.RequestHandler
+	compressed []byte
+	entered    chan struct{}
+	release    chan struct{}
+	waiting    chan struct{}
+}
+
+// decompressionWaitContextKey carries, on a request, the context its wait for budget runs under.
+const decompressionWaitContextKey = "test-decompression-wait-context"
+
+func newDecompressionBudgetHarness(t *testing.T) *decompressionBudgetHarness {
+	t.Helper()
 	compressed, err := gzipCompress(make([]byte, 1024*1024))
 	if err != nil {
 		t.Fatal(err)
 	}
-	entered := make(chan struct{}, 8)
-	release := make(chan struct{})
-	handler := RequestDecompressionMiddleware(config)(func(*fasthttp.RequestCtx) {
-		entered <- struct{}{}
-		<-release
+	h := &decompressionBudgetHarness{
+		compressed: compressed,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+		waiting:    make(chan struct{}),
+	}
+	config := &lib.Config{ClientConfig: &configstore.ClientConfig{MaxRequestBodySizeMB: 1}}
+	waitContext := func(ctx *fasthttp.RequestCtx) (context.Context, context.CancelFunc) {
+		parent, _ := ctx.UserValue(decompressionWaitContextKey).(context.Context)
+		if parent == nil {
+			parent = context.Background()
+		}
+		h.waiting <- struct{}{}
+		return context.WithCancel(parent)
+	}
+	h.handler = requestDecompressionMiddleware(config, waitContext)(func(*fasthttp.RequestCtx) {
+		h.entered <- struct{}{}
+		<-h.release
 	})
-	send := func() *fasthttp.RequestCtx {
+	return h
+}
+
+// send runs one compressed request on its own goroutine and delivers its RequestCtx when the
+// middleware returns. waitCtx, when non-nil, is the context its wait for budget runs under.
+func (h *decompressionBudgetHarness) send(waitCtx context.Context) <-chan *fasthttp.RequestCtx {
+	done := make(chan *fasthttp.RequestCtx, 1)
+	go func() {
 		ctx := &fasthttp.RequestCtx{}
 		ctx.Request.Header.SetMethod("POST")
 		ctx.Request.Header.Set("Content-Encoding", "gzip")
-		ctx.Request.SetBodyRaw(compressed)
-		handler(ctx)
-		return ctx
-	}
-
-	// Each body inflates to the whole 1 MiB cap, so four fill the 4 MiB budget.
-	done := make(chan struct{})
-	for range 4 {
-		go func() {
-			send()
-			done <- struct{}{}
-		}()
-	}
-	for range 4 {
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the first four requests must be admitted")
+		ctx.Request.SetBodyRaw(h.compressed)
+		if waitCtx != nil {
+			ctx.SetUserValue(decompressionWaitContextKey, waitCtx)
 		}
+		h.handler(ctx)
+		done <- ctx
+	}()
+	return done
+}
+
+// fill admits four requests, which hold the whole budget, and returns their results.
+func (h *decompressionBudgetHarness) fill() []<-chan *fasthttp.RequestCtx {
+	holders := make([]<-chan *fasthttp.RequestCtx, 4)
+	for i := range holders {
+		holders[i] = h.send(nil)
+		<-h.entered
 	}
-	fifth := make(chan *fasthttp.RequestCtx, 1)
-	go func() { fifth <- send() }()
+	return holders
+}
+
+// TestRequestDecompressionMiddleware_InFlightBudgetWaits pins that buffered decompressions
+// cannot stack up without bound, and that the bound makes a request wait rather than fail: the
+// bytes each body inflates to are charged to a budget of four times the cap for the life of the
+// request, and a request the budget cannot cover blocks until another returns its bytes.
+func TestRequestDecompressionMiddleware_InFlightBudgetWaits(t *testing.T) {
+	h := newDecompressionBudgetHarness(t)
+	holders := h.fill()
+
+	fifth := h.send(nil)
+	<-h.waiting
 	select {
 	case ctx := <-fifth:
-		if ctx.Response.StatusCode() != fasthttp.StatusServiceUnavailable {
-			t.Fatalf("the fifth request must be refused with 503 while the budget is held, got %d: %s", ctx.Response.StatusCode(), ctx.Response.Body())
-		}
-	case <-entered:
-		close(release)
+		t.Fatalf("the fifth request must wait while four hold the whole budget, got %d: %s", ctx.Response.StatusCode(), ctx.Response.Body())
+	case <-h.entered:
 		t.Fatal("the fifth request was admitted while four held the whole budget")
-	case <-time.After(5 * time.Second):
-		close(release)
-		t.Fatal("the fifth request neither returned nor entered the handler")
+	default:
 	}
-	close(release)
+
+	// One holder returns its bytes: the fifth request is decompressed and reaches the handler.
+	h.release <- struct{}{}
+	<-h.entered
 	for range 4 {
-		<-done
+		h.release <- struct{}{}
 	}
-	// The reservations end with their requests.
-	release = make(chan struct{})
-	close(release)
-	if ctx := send(); ctx.Response.StatusCode() != fasthttp.StatusOK {
-		t.Fatalf("a request after the others returned must be admitted, got %d: %s", ctx.Response.StatusCode(), ctx.Response.Body())
+	if ctx := <-fifth; ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("the request that waited must succeed, got %d: %s", ctx.Response.StatusCode(), ctx.Response.Body())
+	}
+	for _, holder := range holders {
+		if ctx := <-holder; ctx.Response.StatusCode() != fasthttp.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", ctx.Response.StatusCode(), ctx.Response.Body())
+		}
+	}
+
+	// The reservations end with their requests: the whole budget is available again.
+	for _, holder := range h.fill() {
+		h.release <- struct{}{}
+		<-holder
+	}
+}
+
+// TestRequestDecompressionMiddleware_CancelledWaitTakesNoBudget pins that a request whose
+// context ends while it waits for budget stops waiting, never reaches the handler, and neither
+// holds nor returns budget: the requests that held it still hold all of it.
+func TestRequestDecompressionMiddleware_CancelledWaitTakesNoBudget(t *testing.T) {
+	h := newDecompressionBudgetHarness(t)
+	holders := h.fill()
+
+	waitCtx, clientLeaves := context.WithCancel(context.Background())
+	cancelled := h.send(waitCtx)
+	<-h.waiting
+	clientLeaves()
+	ctx := <-cancelled
+	if ctx.Response.StatusCode() == fasthttp.StatusOK {
+		t.Fatalf("a request whose wait was cancelled must not be served: %s", ctx.Response.Body())
+	}
+
+	// The budget is still exactly full: the next request has to wait too, and one holder
+	// returning its bytes is what admits it.
+	next := h.send(nil)
+	<-h.waiting
+	select {
+	case <-h.entered:
+		t.Fatal("the cancelled request gave back budget it never held")
+	default:
+	}
+	h.release <- struct{}{}
+	<-h.entered
+	for range 4 {
+		h.release <- struct{}{}
+	}
+	if ctx := <-next; ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", ctx.Response.StatusCode(), ctx.Response.Body())
+	}
+	for _, holder := range holders {
+		<-holder
+	}
+
+	// And it is whole once they are done: four more requests are admitted together.
+	for _, holder := range h.fill() {
+		h.release <- struct{}{}
+		<-holder
 	}
 }
 
@@ -3066,7 +3155,7 @@ func sdkLikeJSONBody(t testing.TB, inflatedLen int) []byte {
 // SDK bodies are not refused just because several are in flight at once. Each body is past
 // cap/100 compressed, so its expansion allowance is the whole cap; the in-flight budget must be
 // charged for what the bodies really inflate to, not for that allowance, or the fifth concurrent
-// request is answered 503 while the process holds a fraction of the budget.
+// request is held back while the process holds a fraction of the budget.
 func TestRequestDecompressionMiddleware_ConcurrentMultiMBGzipNotRefused(t *testing.T) {
 	config := &lib.Config{ClientConfig: &configstore.ClientConfig{MaxRequestBodySizeMB: 10}}
 	plain := sdkLikeJSONBody(t, 2*1024*1024)
@@ -3853,6 +3942,7 @@ func TestTracingMiddleware_AccessLogIncludesRequestID(t *testing.T) {
 	ctx.Request.SetRequestURI("/openai/v1/chat/completions")
 	ctx.Request.Header.SetMethod("POST")
 	ctx.Request.Header.Set("x-request-id", "req-xyz")
+	ctx.Request.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
 
 	// CORS owns the access-log defer and wraps TracingMiddleware, so the trace_id
 	// UserValue and x-request-id header set by tracing are visible when it runs.
@@ -3865,8 +3955,8 @@ func TestTracingMiddleware_AccessLogIncludesRequestID(t *testing.T) {
 	if got := fields["request_id"]; got != "req-xyz" {
 		t.Errorf("access log request_id = %q, want req-xyz", got)
 	}
-	if got := fields["trace_id"]; got == "" {
-		t.Error("expected access log to include a non-empty trace_id")
+	if got := fields["trace_id"]; got != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Errorf("access log trace_id = %q, want inherited W3C trace ID", got)
 	}
 }
 

@@ -93,6 +93,11 @@ func TestCompletionWirePreservesReportedTokenCounts(t *testing.T) {
 						require.NoError(t, json.Unmarshal(wire, &body))
 						require.Equal(t, "usage-test", body.ID)
 						require.Equal(t, "fixture", body.Model)
+						if tc.want == "null" && strings.HasPrefix(name, "chat") {
+							// A chat response without usage carries no usage key rather than a null one.
+							require.Empty(t, body.Usage)
+							return
+						}
 						// Exact JSON equality checks both values and missing fields.
 						require.JSONEq(t, tc.want, string(body.Usage))
 					})

@@ -690,6 +690,56 @@ func TestChatCompletionRequest_EmptyInputRejected(t *testing.T) {
 // making semantic progress. custom_provider_config.does_not_send_done_marker is the operator's
 // declaration that finish_reason is terminal for this upstream; this pins the whole path, from
 // the account config through the per-attempt context stamp to the provider's read loop.
+// TestCustomProviderOnOpenAIBaseKeepsCallerFields pins that a custom provider built on
+// the OpenAI base is treated as custom: its requests skip the OpenAI-specific field
+// filter, so caller fields such as store and prediction reach the upstream. The
+// custom-provider flag used to follow the base type, which is always standard.
+func TestCustomProviderOnOpenAIBaseKeepsCallerFields(t *testing.T) {
+	var body atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body.Store(string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"c","object":"chat.completion","created":1,"model":"m",`+
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	const customProvider = schemas.ModelProvider("custom-openai")
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(customProvider, 1, 1, server.URL)
+	account.configs[customProvider].NetworkConfig.MaxRetries = 0
+	account.SetCustomProviderConfig(customProvider, &schemas.CustomProviderConfig{BaseProviderType: schemas.OpenAI})
+	account.SetKeysForProvider(customProvider, []schemas.Key{
+		{ID: "custom-key", Value: *schemas.NewSecretVar("sk-custom"), Models: schemas.WhiteList{"*"}, Weight: 100},
+	})
+	client := newStreamTestClient(t, account)
+
+	ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+	_, bifrostErr := client.ChatCompletionRequest(ctx, &schemas.BifrostChatRequest{
+		Provider: customProvider,
+		Model:    "m",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: Ptr("hi")},
+		}},
+		Params: &schemas.ChatParameters{
+			Store:      Ptr(true),
+			Prediction: &schemas.ChatPrediction{Type: "content", Content: "hello"},
+		},
+	})
+	if bifrostErr != nil {
+		t.Fatalf("request failed: %s", bifrostErr.Error.Message)
+	}
+
+	wire, _ := body.Load().(string)
+	for _, want := range []string{`"store":true`, `"prediction":`} {
+		if !strings.Contains(wire, want) {
+			t.Fatalf("custom provider wire body %s lost %s", wire, want)
+		}
+	}
+}
+
 func TestCustomProviderDoesNotSendDoneMarkerEndsParkedStream(t *testing.T) {
 	const chunk = `data: {"id":"chatcmpl-repro","object":"chat.completion.chunk","created":1,"model":"repro-model",` +
 		`"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}` + "\n\n" +
@@ -5557,6 +5607,189 @@ func TestFallbackUsesPinnedKey(t *testing.T) {
 
 	if got, _ := gotAPIKey.Load().(string); got != "sk-pinned" {
 		t.Fatalf("fallback used api key %q, want %q", got, "sk-pinned")
+	}
+}
+
+// TestFallbackDoesNotInheritProviderPassthroughExtraParams covers providers that force
+// extra-param passthrough for their own attempt (DeepSeek, vLLM, SGL, ...). The flag is
+// set on the shared request context, so without a per-attempt reset a fallback to a
+// provider that filters extra params received them anyway. Both orchestrator loops are
+// covered: they are independent copies.
+func TestFallbackDoesNotInheritProviderPassthroughExtraParams(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", streaming), func(t *testing.T) {
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = fmt.Fprint(w, `{"error":{"message":"rate limited","type":"rate_limit_error"}}`)
+			}))
+			defer primary.Close()
+
+			var fallbackBody atomic.Value
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				fallbackBody.Store(string(body))
+				if streaming {
+					sseHandler(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"id":"c","object":"chat.completion","created":1,"model":"gpt-4o-mini",`+
+					`"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+			}))
+			defer fallback.Close()
+
+			account := NewMockAccount()
+			account.AddProviderWithBaseURL(schemas.DeepSeek, 1, 1, primary.URL)
+			account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, fallback.URL)
+			account.configs[schemas.DeepSeek].NetworkConfig.MaxRetries = 0
+			account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
+			account.SetKeysForProvider(schemas.DeepSeek, []schemas.Key{
+				{ID: "deepseek-key", Value: *schemas.NewSecretVar("sk-deepseek"), Models: schemas.WhiteList{"*"}, Weight: 100},
+			})
+			account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+				{ID: "openai-key", Value: *schemas.NewSecretVar("sk-openai"), Models: schemas.WhiteList{"*"}, Weight: 100},
+			})
+			client := newStreamTestClient(t, account)
+
+			req := &schemas.BifrostChatRequest{
+				Provider: schemas.DeepSeek,
+				Model:    "deepseek-chat",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+				},
+				Params:    &schemas.ChatParameters{ExtraParams: map[string]interface{}{"deepseek_only": true}},
+				Fallbacks: []schemas.Fallback{{Provider: schemas.OpenAI, Model: "gpt-4o-mini"}},
+			}
+			ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+			if streaming {
+				stream, bifrostErr := client.ChatCompletionStreamRequest(ctx, req)
+				if bifrostErr != nil {
+					t.Fatalf("fallback stream failed: %s", bifrostErr.Error.Message)
+				}
+				if _, errs := drainChatStream(stream); len(errs) > 0 {
+					t.Fatalf("fallback stream emitted error chunks: %v", errs)
+				}
+			} else if _, bifrostErr := client.ChatCompletionRequest(ctx, req); bifrostErr != nil {
+				t.Fatalf("fallback failed: %s", bifrostErr.Error.Message)
+			}
+
+			body, _ := fallbackBody.Load().(string)
+			if body == "" {
+				t.Fatal("fallback provider was not called")
+			}
+			if strings.Contains(body, "deepseek_only") {
+				t.Fatalf("fallback inherited the primary provider's extra-param passthrough: %s", body)
+			}
+		})
+	}
+}
+
+// TestInBandChoiceErrorFallsBack pins that a 200 whose choice reports a failure
+// (choices[i].error with finish_reason "error", as OpenRouter sends once generation
+// has started) is an error, not a success: without a fallback the caller gets the
+// provider's status and message, and with one the request moves to the fallback.
+// Covers both orchestrator loops and a top-level error as the control.
+func TestInBandChoiceErrorFallsBack(t *testing.T) {
+	const choiceError = `{"id":"gen-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,` +
+		`"message":{"role":"assistant","content":""},"finish_reason":"error",` +
+		`"error":{"code":429,"message":"upstream rate limited","metadata":{"error_type":"rate_limit_exceeded"}}}]}`
+	const choiceErrorChunk = `{"id":"gen-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,` +
+		`"delta":{"content":""},"finish_reason":"error","error":{"code":429,"message":"upstream rate limited"}}]}`
+	const topLevelError = `{"error":{"code":429,"message":"upstream rate limited"}}`
+
+	for _, tc := range []struct {
+		name      string
+		streaming bool
+		body      string
+	}{
+		{name: "unary choice error", body: choiceError},
+		{name: "unary top-level error", body: topLevelError},
+		{name: "stream choice error", streaming: true, body: choiceErrorChunk},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.streaming {
+					sseHandler(tc.body)(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, tc.body)
+			}))
+			defer primary.Close()
+			var fallbackHits atomic.Int32
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fallbackHits.Add(1)
+				if tc.streaming {
+					sseHandler(`{"id":"c","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"id":"c","object":"chat.completion","created":1,"model":"gpt-4o-mini",`+
+					`"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+			}))
+			defer fallback.Close()
+
+			account := NewMockAccount()
+			account.AddProviderWithBaseURL(schemas.OpenRouter, 1, 1, primary.URL)
+			account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, fallback.URL)
+			account.configs[schemas.OpenRouter].NetworkConfig.MaxRetries = 0
+			account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
+			account.SetKeysForProvider(schemas.OpenRouter, []schemas.Key{
+				{ID: "openrouter-key", Value: *schemas.NewSecretVar("sk-or"), Models: schemas.WhiteList{"*"}, Weight: 100},
+			})
+			account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+				{ID: "openai-key", Value: *schemas.NewSecretVar("sk-openai"), Models: schemas.WhiteList{"*"}, Weight: 100},
+			})
+			client := newStreamTestClient(t, account)
+
+			request := func(fallbacks []schemas.Fallback) (string, *schemas.BifrostError) {
+				req := &schemas.BifrostChatRequest{
+					Provider: schemas.OpenRouter,
+					Model:    "openai/gpt-4o-mini",
+					Input: []schemas.ChatMessage{
+						{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+					},
+					Fallbacks: fallbacks,
+				}
+				ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(30*time.Second))
+				if !tc.streaming {
+					resp, bifrostErr := client.ChatCompletionRequest(ctx, req)
+					if bifrostErr != nil {
+						return "", bifrostErr
+					}
+					return *resp.Choices[0].Message.Content.ContentStr, nil
+				}
+				stream, bifrostErr := client.ChatCompletionStreamRequest(ctx, req)
+				if bifrostErr != nil {
+					return "", bifrostErr
+				}
+				for chunk := range stream {
+					if chunk.BifrostError != nil {
+						return "", chunk.BifrostError
+					}
+				}
+				return "streamed", nil
+			}
+
+			_, bifrostErr := request(nil)
+			if bifrostErr == nil {
+				t.Fatal("an in-band failure on a 200 must surface as an error")
+			}
+			if bifrostErr.StatusCode == nil || *bifrostErr.StatusCode != http.StatusTooManyRequests {
+				t.Errorf("status = %v, want 429 from the provider's numeric code", bifrostErr.StatusCode)
+			}
+			if bifrostErr.Error == nil || bifrostErr.Error.Message != "upstream rate limited" {
+				t.Errorf("error = %+v, want the provider's message", bifrostErr.Error)
+			}
+
+			if _, bifrostErr := request([]schemas.Fallback{{Provider: schemas.OpenAI, Model: "gpt-4o-mini"}}); bifrostErr != nil {
+				t.Fatalf("fallback after an in-band failure failed: %s", bifrostErr.Error.Message)
+			}
+			if fallbackHits.Load() != 1 {
+				t.Fatalf("fallback hits = %d, want 1", fallbackHits.Load())
+			}
+		})
 	}
 }
 

@@ -106,6 +106,11 @@ func assertCompletionUsage(t *testing.T, response any, want string) {
 	require.NoError(t, err)
 	var body struct{ Usage json.RawMessage }
 	require.NoError(t, json.Unmarshal(wire, &body))
+	if want == "null" {
+		// A response without usage carries no usage key rather than a null one.
+		require.Empty(t, body.Usage)
+		return
+	}
 	require.JSONEq(t, want, string(body.Usage))
 }
 
@@ -210,6 +215,46 @@ func TestToOpenAIChatRequest_ToolNormalization(t *testing.T) {
 	if result.ChatParameters.Tools[0].Function == bifrostReq.Params.Tools[0].Function {
 		t.Error("expected Function pointer to be a copy, not the original")
 	}
+}
+
+// TestToOpenAIChatRequest_OpenRouterProviderRouting pins OpenRouter's upstream
+// routing contract without enabling broad arbitrary-extra-parameter passthrough.
+func TestToOpenAIChatRequest_OpenRouterProviderRouting(t *testing.T) {
+	routing := map[string]any{
+		"order":           []any{"reka"},
+		"allow_fallbacks": false,
+	}
+	makeRequest := func(provider schemas.ModelProvider) *schemas.BifrostChatRequest {
+		return &schemas.BifrostChatRequest{
+			Provider: provider,
+			Model:    "deepseek/deepseek-v4-flash-0731",
+			Input: []schemas.ChatMessage{{
+				Role: schemas.ChatMessageRoleUser,
+			}},
+			Params: &schemas.ChatParameters{
+				ExtraParams: map[string]any{"provider": routing},
+			},
+		}
+	}
+
+	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
+	defer cancel()
+
+	openRouterRequest := ToOpenAIChatRequest(ctx, makeRequest(schemas.OpenRouter))
+	wireBody, err := sonic.Marshal(openRouterRequest)
+	require.NoError(t, err)
+	var wire map[string]any
+	require.NoError(t, sonic.Unmarshal(wireBody, &wire))
+	require.Equal(t, routing, wire["provider"])
+
+	// The native field must not require the broad arbitrary-extra-parameter
+	// passthrough switch, and must never leak onto another provider's wire body.
+	openAIRequest := ToOpenAIChatRequest(ctx, makeRequest(schemas.OpenAI))
+	wireBody, err = sonic.Marshal(openAIRequest)
+	require.NoError(t, err)
+	wire = nil
+	require.NoError(t, sonic.Unmarshal(wireBody, &wire))
+	require.NotContains(t, wire, "provider")
 }
 
 // TestToOpenAIChatRequest_InvalidatesStaleSerializedCache guards the fix for a
@@ -2422,6 +2467,63 @@ func TestToOpenAIChatRequest_DoesNotEmitInboundReasoningAliases(t *testing.T) {
 	}
 }
 
+// TestToOpenAIChatRequest_ForwardsReasoningDetails covers the outbound half of #5274:
+// destinations without a curated OpenAI dialect (OpenRouter, custom providers) receive
+// replayed reasoning_details verbatim, signature included, so signed reasoning survives
+// the hop. The curated dialects stay pinned by DoesNotEmitInboundReasoningAliases.
+func TestToOpenAIChatRequest_ForwardsReasoningDetails(t *testing.T) {
+	signature := "Eu8Bsig"
+	reasoning := "thinking about Paris weather"
+
+	tests := []struct {
+		name     string
+		provider schemas.ModelProvider
+		custom   bool
+	}{
+		{name: "openrouter", provider: schemas.OpenRouter},
+		{name: "custom provider", provider: schemas.ModelProvider("my-vllm"), custom: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			if tt.custom {
+				ctx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+			}
+
+			bifrostReq := &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "some-model",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("weather in paris?")}},
+					{
+						Role: schemas.ChatMessageRoleAssistant,
+						ChatAssistantMessage: &schemas.ChatAssistantMessage{
+							ReasoningDetails: []schemas.ChatReasoningDetails{
+								{Index: 0, Type: schemas.BifrostReasoningDetailsTypeText, Text: &reasoning, Signature: &signature},
+								{Index: 1, Type: schemas.BifrostReasoningDetailsTypeEncrypted, Data: schemas.Ptr("ENCRYPTED_PAYLOAD")},
+							},
+						},
+					},
+				},
+			}
+
+			wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, bifrostReq))
+			require.NoError(t, err)
+
+			require.False(t, providerUtils.GetJSONField(wireBody, "messages.0.reasoning_details").Exists(),
+				"a user message must not grow reasoning_details")
+			details := providerUtils.GetJSONField(wireBody, "messages.1.reasoning_details")
+			require.Equal(t, 2, len(details.Array()), "wire body: %s", wireBody)
+			require.Equal(t, "reasoning.text", details.Get("0.type").String())
+			require.Equal(t, reasoning, details.Get("0.text").String())
+			require.Equal(t, signature, details.Get("0.signature").String())
+			require.Equal(t, "reasoning.encrypted", details.Get("1.type").String())
+			require.Equal(t, "ENCRYPTED_PAYLOAD", details.Get("1.data").String())
+		})
+	}
+}
+
 // TestXAIReasoningEffortEndToEnd pins reasoning_effort through the FULL conversion
 // pipeline, not just applyXAICompatibility. filterOpenAISpecificParameters runs
 // normalizeReasoningEffort BEFORE the xAI compat pass, so a value can be rewritten
@@ -3558,4 +3660,174 @@ func TestOpenAIChatRequest_MessageLevelCacheControlIngress(t *testing.T) {
 	body, err := sonic.Marshal(ToOpenAIChatRequest(ctx, bifrostReq))
 	require.NoError(t, err)
 	require.Equal(t, 3, strings.Count(string(body), `"cache_control"`), "all three breakpoints must reach OpenRouter: %s", body)
+}
+
+// TestToOpenAIChatRequest_MinCompletionTokensClampScope pins that the 16-token floor
+// OpenAI enforces on max_completion_tokens is applied only for OpenAI and Azure. Other
+// OpenAI-wire destinations accept smaller limits and get the caller's value.
+func TestToOpenAIChatRequest_MinCompletionTokensClampScope(t *testing.T) {
+	tests := []struct {
+		provider schemas.ModelProvider
+		custom   bool
+		want     int
+	}{
+		{provider: schemas.OpenAI, want: MinMaxCompletionTokens},
+		{provider: schemas.Azure, want: MinMaxCompletionTokens},
+		{provider: schemas.Groq, want: 5},
+		{provider: schemas.VLLM, want: 5},
+		{provider: schemas.ModelProvider("my-vllm"), custom: true, want: 5},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.provider), func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			if tt.custom {
+				ctx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+			}
+			result := ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "some-model",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+				},
+				Params: &schemas.ChatParameters{MaxCompletionTokens: schemas.Ptr(5)},
+			})
+			require.NotNil(t, result.MaxCompletionTokens)
+			require.Equal(t, tt.want, *result.MaxCompletionTokens)
+		})
+	}
+}
+
+// TestToOpenAIChatRequest_LegacyMaxTokens pins that a limit the caller sent as
+// max_tokens reaches OpenAI-compatible destinations without a curated dialect under
+// that name, while OpenAI keeps max_completion_tokens.
+func TestToOpenAIChatRequest_LegacyMaxTokens(t *testing.T) {
+	tests := []struct {
+		provider  schemas.ModelProvider
+		custom    bool
+		wantField string
+		dropField string
+	}{
+		{provider: schemas.OpenAI, wantField: "max_completion_tokens", dropField: "max_tokens"},
+		{provider: schemas.OpenRouter, wantField: "max_tokens", dropField: "max_completion_tokens"},
+		{provider: schemas.ModelProvider("my-vllm"), custom: true, wantField: "max_tokens", dropField: "max_completion_tokens"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.provider), func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			if tt.custom {
+				ctx.SetValue(schemas.BifrostContextKeyIsCustomProvider, true)
+			}
+			wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "some-model",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+				},
+				Params: &schemas.ChatParameters{MaxCompletionTokens: schemas.Ptr(100), LegacyMaxTokens: true},
+			}))
+			require.NoError(t, err)
+			require.Equal(t, int64(100), providerUtils.GetJSONField(wireBody, tt.wantField).Int(), "wire body: %s", wireBody)
+			require.False(t, providerUtils.GetJSONField(wireBody, tt.dropField).Exists(), "wire body: %s", wireBody)
+		})
+	}
+}
+
+// TestOpenAIChatRequestToBifrostRecordsLegacyMaxTokens pins that the OpenAI
+// integration records a max_tokens limit so it can be replayed under that name.
+func TestOpenAIChatRequestToBifrostRecordsLegacyMaxTokens(t *testing.T) {
+	var req OpenAIChatRequest
+	require.NoError(t, sonic.Unmarshal([]byte(`{"model":"openai/gpt-4o","messages":[],"max_tokens":100}`), &req))
+	params := req.ToBifrostChatRequest(nil).Params
+	require.Equal(t, 100, *params.MaxCompletionTokens)
+	require.True(t, params.LegacyMaxTokens)
+
+	require.NoError(t, sonic.Unmarshal([]byte(`{"model":"openai/gpt-4o","messages":[],"max_completion_tokens":100}`), &req))
+	require.False(t, req.ToBifrostChatRequest(nil).Params.LegacyMaxTokens)
+}
+
+// TestToOpenAIChatRequest_ToolSchemaKeepsUnknownKeywords pins the provider wire for a
+// tool schema carrying JSON Schema keywords without a typed field and a non-string enum.
+func TestToOpenAIChatRequest_ToolSchemaKeepsUnknownKeywords(t *testing.T) {
+	var tool schemas.ChatTool
+	require.NoError(t, sonic.Unmarshal([]byte(`{"type":"function","function":{"name":"f","parameters":`+
+		`{"type":"object","$comment":"v2","properties":{"n":{"type":"integer"}},"minProperties":1,"enum":[1,null]}}}`), &tool))
+
+	ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+	defer cancel()
+	wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+		Provider: schemas.OpenAI,
+		Model:    "gpt-4o",
+		Input: []schemas.ChatMessage{
+			{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}},
+		},
+		Params: &schemas.ChatParameters{Tools: []schemas.ChatTool{tool}},
+	}))
+	require.NoError(t, err)
+	params := providerUtils.GetJSONField(wireBody, "tools.0.function.parameters")
+	require.Equal(t, "v2", params.Get(`\$comment`).String(), "wire body: %s", wireBody)
+	require.Equal(t, int64(1), params.Get("minProperties").Int())
+	require.Equal(t, `[1,null]`, params.Get("enum").Raw)
+}
+
+// TestToOpenAIChatRequest_AudioVoiceObjectAndAssistantAudio pins the provider wire for
+// audio replay: an object-valued output voice ({"id": ...}, custom voices) reaches the
+// wire as sent, and a prior assistant turn's audio reference is replayed as {"id": ...}
+// to OpenAI and to destinations without a curated dialect, but not to curated
+// dialects that do not define it.
+func TestToOpenAIChatRequest_AudioVoiceObjectAndAssistantAudio(t *testing.T) {
+	var params schemas.ChatParameters
+	require.NoError(t, sonic.Unmarshal([]byte(`{"modalities":["text","audio"],"audio":{"voice":{"id":"voice_123"},"format":"wav"}}`), &params))
+	var messages []schemas.ChatMessage
+	require.NoError(t, sonic.Unmarshal([]byte(`[{"role":"user","content":"hi"},`+
+		`{"role":"assistant","content":null,"audio":{"id":"audio_abc"}},{"role":"user","content":"again"}]`), &messages))
+
+	for _, tt := range []struct {
+		provider       schemas.ModelProvider
+		assistantAudio bool
+	}{
+		{provider: schemas.OpenAI, assistantAudio: true},
+		{provider: schemas.Azure, assistantAudio: true},
+		{provider: schemas.OpenRouter, assistantAudio: true},
+		{provider: schemas.Groq, assistantAudio: false},
+	} {
+		t.Run(string(tt.provider), func(t *testing.T) {
+			ctx, cancel := schemas.NewBifrostContextWithCancel(t.Context())
+			defer cancel()
+			paramsCopy := params
+			wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+				Provider: tt.provider,
+				Model:    "gpt-4o-audio-preview",
+				Input:    messages,
+				Params:   &paramsCopy,
+			}))
+			require.NoError(t, err)
+			require.JSONEq(t, `{"voice":{"id":"voice_123"},"format":"wav"}`, providerUtils.GetJSONField(wireBody, "audio").Raw, "wire body: %s", wireBody)
+			audio := providerUtils.GetJSONField(wireBody, "messages.1.audio")
+			if tt.assistantAudio {
+				require.JSONEq(t, `{"id":"audio_abc"}`, audio.Raw, "wire body: %s", wireBody)
+			} else {
+				require.False(t, audio.Exists(), "wire body: %s", wireBody)
+			}
+		})
+	}
+
+	var named schemas.ChatParameters
+	require.NoError(t, sonic.Unmarshal([]byte(`{"audio":{"voice":"alloy","format":"mp3"}}`), &named))
+	require.Equal(t, "alloy", named.Audio.Voice)
+	encoded, err := sonic.Marshal(named.Audio)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"voice":"alloy","format":"mp3"}`, string(encoded))
+}
+
+// TestConvertOpenAIMessagesToBifrostMessages_AssistantAudio pins that the OpenAI
+// integration keeps a replayed assistant audio reference.
+func TestConvertOpenAIMessagesToBifrostMessages_AssistantAudio(t *testing.T) {
+	var msg OpenAIMessage
+	require.NoError(t, sonic.Unmarshal([]byte(`{"role":"assistant","content":null,"audio":{"id":"audio_abc"}}`), &msg))
+	converted := ConvertOpenAIMessagesToBifrostMessages([]OpenAIMessage{msg})
+	require.NotNil(t, converted[0].ChatAssistantMessage)
+	require.NotNil(t, converted[0].Audio)
+	require.Equal(t, "audio_abc", converted[0].Audio.ID)
 }

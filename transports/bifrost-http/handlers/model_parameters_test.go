@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/maximhq/bifrost/framework/configstore"
@@ -109,5 +111,37 @@ func TestGetModelParameters_ResolvesQualifiedAndBareIDs(t *testing.T) {
 
 		require.Equal(t, fasthttp.StatusOK, reqCtx.Response.StatusCode())
 		require.Equal(t, `{"model_parameters":[{"id":"reasoning_effort"}]}`, string(reqCtx.Response.Body()))
+	})
+}
+
+// Without a config store the catalog holds the datasheet in memory, and the
+// handler serves its rows from there instead of refusing for want of a store.
+func TestGetModelParameters_ServesTheInMemoryCatalogWithoutAConfigStore(t *testing.T) {
+	SetLogger(&mockLogger{})
+	ctx := context.Background()
+
+	paramsPath := filepath.Join(t.TempDir(), "model-parameters.json")
+	require.NoError(t, os.WriteFile(paramsPath, []byte(`{"gpt-5.5":{"model_parameters":[{"id":"seed"}]}}`), 0o600))
+	ds := datasheet.New(nil, &mockLogger{}, datasheet.Config{ModelParametersURL: "file://" + paramsPath})
+	require.NoError(t, ds.LoadModelParamsFromURLIntoMemory(ctx))
+
+	h := &ProviderHandler{inMemoryStore: &lib.Config{ModelCatalog: modelcatalog.NewTestCatalogWithDatasheet(ds)}}
+	get := func(model string) *fasthttp.RequestCtx {
+		var req fasthttp.Request
+		req.SetRequestURI("/api/models/parameters?model=" + model)
+		reqCtx := &fasthttp.RequestCtx{}
+		reqCtx.Init(&req, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, nil)
+		h.getModelParameters(reqCtx)
+		return reqCtx
+	}
+
+	found := get("openai/gpt-5.5")
+	require.Equal(t, fasthttp.StatusOK, found.Response.StatusCode())
+	require.Equal(t, `{"model_parameters":[{"id":"seed"}]}`, string(found.Response.Body()))
+	require.Equal(t, fasthttp.StatusNotFound, get("definitely-not-a-model").Response.StatusCode())
+
+	t.Run("neither a catalog nor a store is unavailable", func(t *testing.T) {
+		h = &ProviderHandler{}
+		require.Equal(t, fasthttp.StatusServiceUnavailable, get("gpt-5.5").Response.StatusCode())
 	})
 }

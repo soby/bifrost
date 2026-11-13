@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"slices"
 	"strconv"
@@ -1451,6 +1452,11 @@ type GeminiResponsesStreamState struct {
 	HasStartedText     bool            // Whether we've started text content
 	HasStartedToolCall bool            // Whether we've started a tool call
 	TextBuffer         strings.Builder // Accumulates text deltas for output_text.done
+	// Token logprobs of the current chunk's logprobsResult, not yet attached to an
+	// output_text.delta, and those of the open text item, for output_text.done and
+	// the item's output_text part.
+	PendingLogProbs []schemas.ResponsesOutputMessageContentTextLogProb
+	TextLogProbs    []schemas.ResponsesOutputMessageContentTextLogProb
 
 	CodeExecOutputIndex int    // -1 when no code_interpreter_call is open
 	CodeExecItemID      string // Item ID of the open code_interpreter_call
@@ -1578,6 +1584,17 @@ func (state *GeminiResponsesStreamState) flush() {
 	state.CodeExecItemID = ""
 	state.CodeExecCode = ""
 	state.TextBuffer.Reset()
+	state.PendingLogProbs = nil
+	state.TextLogProbs = nil
+}
+
+// textItemLogProbs returns the open text item's token logprobs, or an empty list
+// (the output_text logprobs field is always present) when it has none.
+func (state *GeminiResponsesStreamState) textItemLogProbs() []schemas.ResponsesOutputMessageContentTextLogProb {
+	if state.TextLogProbs == nil {
+		return []schemas.ResponsesOutputMessageContentTextLogProb{}
+	}
+	return state.TextLogProbs
 }
 
 // closeTextItemIfOpen closes the text item if it's open and returns the responses.
@@ -1666,6 +1683,9 @@ func (response *GenerateContentResponse) toBifrostResponsesStream(sequenceNumber
 	if len(response.Candidates) > 0 {
 		candidate := response.Candidates[0]
 
+		// A chunk's logprobsResult covers the tokens of that chunk: the first
+		// output_text.delta of the chunk carries them.
+		state.PendingLogProbs = convertGeminiLogprobsResultToResponses(candidate.LogprobsResult)
 		if candidate.Content != nil && len(candidate.Content.Parts) > 0 {
 			for _, part := range candidate.Content.Parts {
 				if part == nil {
@@ -1675,6 +1695,12 @@ func (response *GenerateContentResponse) toBifrostResponsesStream(sequenceNumber
 				responses = append(responses, partResponses...)
 			}
 		}
+		// No delta in this chunk took them (a chunk with logprobs but no text): they
+		// still belong to the open text item's output.
+		if state.PendingLogProbs != nil && state.HasStartedText && !state.TextItemClosed {
+			state.TextLogProbs = append(state.TextLogProbs, state.PendingLogProbs...)
+		}
+		state.PendingLogProbs = nil
 
 		if candidate.FinishReason != "" {
 			state.PendingFinishReason = candidate.FinishReason
@@ -1793,6 +1819,7 @@ func processGeminiTextPart(part *Part, state *GeminiResponsesStreamState, sequen
 	if !state.HasStartedText || state.TextItemClosed {
 		state.TextItemClosed = false
 		state.TextBuffer.Reset()
+		state.TextLogProbs = nil
 		outputIndex = state.nextOutputIndex()
 		state.TextOutputIndex = outputIndex // Cache the text item's output index
 		itemID := generateItemID(state.MessageID, "item", outputIndex)
@@ -1856,6 +1883,11 @@ func processGeminiTextPart(part *Part, state *GeminiResponsesStreamState, sequen
 			ItemID:         &itemID,
 			Delta:          &text,
 			LogProbs:       []schemas.ResponsesOutputMessageContentTextLogProb{},
+		}
+		if state.PendingLogProbs != nil {
+			streamResponse.LogProbs = state.PendingLogProbs
+			state.TextLogProbs = append(state.TextLogProbs, state.PendingLogProbs...)
+			state.PendingLogProbs = nil
 		}
 		if len(part.ThoughtSignature) > 0 {
 			thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
@@ -2544,6 +2576,8 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 
 	// Emit output_text.done
 	fullText := state.TextBuffer.String()
+	logProbs := state.textItemLogProbs()
+	state.TextLogProbs = nil
 	responses = append(responses, &schemas.BifrostResponsesStreamResponse{
 		Type:           schemas.ResponsesStreamResponseTypeOutputTextDone,
 		SequenceNumber: sequenceNumber + len(responses),
@@ -2551,7 +2585,7 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 		ContentIndex:   &contentIndex,
 		ItemID:         &itemID,
 		Text:           &fullText,
-		LogProbs:       []schemas.ResponsesOutputMessageContentTextLogProb{},
+		LogProbs:       logProbs,
 	})
 
 	// Emit content_part.done with accumulated text
@@ -2560,7 +2594,7 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 		Type: schemas.ResponsesOutputMessageContentTypeText,
 		Text: &partText,
 		ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
-			LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+			LogProbs:    logProbs,
 			Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
 		},
 	}
@@ -2586,7 +2620,7 @@ func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) 
 					Text: &itemText,
 					ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
 						Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
-						LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+						LogProbs:    logProbs,
 					},
 				},
 			},
@@ -4245,6 +4279,14 @@ func convertGeminiCandidatesToResponsesOutput(candidates []*Candidate, messageID
 			}
 		}
 
+		// logprobsResult covers the candidate's whole output, so it goes on the
+		// candidate's text block, where the streaming path puts it too.
+		if logProbs := convertGeminiLogprobsResultToResponses(candidate.LogprobsResult); logProbs != nil {
+			if block := textBlockOf(messages, textMessageIdx); block != nil {
+				block.LogProbs = logProbs
+			}
+		}
+
 		// check if gemini used google search tool
 		if candidate.GroundingMetadata != nil {
 			webSearchmessage := schemas.ResponsesMessage{
@@ -4491,12 +4533,20 @@ func (r *GeminiGenerationRequest) convertParamsToGenerationConfigResponses(param
 	}
 	// Not clamped: an out-of-range value is Google's to reject, not ours to rewrite.
 	// Gemini only honours logprobs when responseLogprobs is on, so a positive value
-	// turns it on (the GenAI ingress also carries an explicit response_logprobs below).
+	// turns it on (extra_params.response_logprobs below does too). generationConfig.logprobs
+	// is an int32: a value outside that range is refused rather than truncated.
 	if params.TopLogProbs != nil {
+		if *params.TopLogProbs < math.MinInt32 || *params.TopLogProbs > math.MaxInt32 {
+			return config, providerUtils.InvalidRequestErrorf("top_logprobs must be between %d and %d for Gemini generationConfig.logprobs, got %d", math.MinInt32, math.MaxInt32, *params.TopLogProbs)
+		}
 		config.Logprobs = schemas.Ptr(int32(*params.TopLogProbs))
 		if *params.TopLogProbs > 0 {
 			config.ResponseLogprobs = true
 		}
+	}
+	// include "message.output_text.logprobs" asks for the chosen tokens' logprobs.
+	if slices.Contains(params.Include, schemas.ResponsesIncludeOutputTextLogprobs) {
+		config.ResponseLogprobs = true
 	}
 	// Only set ThinkingConfig if the model actually supports thinking
 	caps := schemas.ResolveModelCaps(provider, capModel)
@@ -4594,8 +4644,14 @@ func (r *GeminiGenerationRequest) convertParamsToGenerationConfigResponses(param
 				config.ResponseLogprobs = true
 			}
 		}
+		// The Responses API has no seed field; a seed rides extra_params.seed.
+		// generationConfig.seed is an int32, and a seed outside it is refused rather
+		// than truncated.
 		if seed, ok := params.ExtraParams["seed"]; ok {
 			if val, success := schemas.SafeExtractInt(seed); success {
+				if val < math.MinInt32 || val > math.MaxInt32 {
+					return config, providerUtils.InvalidRequestErrorf("seed must be between %d and %d for Gemini generationConfig.seed, got %d", math.MinInt32, math.MaxInt32, val)
+				}
 				config.Seed = schemas.Ptr(int32(val))
 			}
 		}
@@ -5057,6 +5113,14 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 		pendingFunctionCallIDs = nil
 	}
 
+	// Index in contents of the model turn opened by the most recent function_call, or -1.
+	// Gemini requires the parallel function calls of one model turn to share a single Content,
+	// answered by one user Content with as many functionResponse parts. A function_call that
+	// arrives while that turn is still the last content (nothing else appended since, e.g. only a
+	// signature-only reasoning item already consumed by the look-ahead sat between them) joins it
+	// instead of opening a new model turn.
+	functionCallTurn := -1
+
 	// Set once the leading system prompt ends (first non-system message). Only the leading run is
 	// hoisted into systemInstruction; a system turn that arrives after the conversation has
 	// started is inlined in place instead -- see inlineGeminiSystemReminder.
@@ -5172,6 +5236,8 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 
 		// Handle regular messages
 		content := Content{}
+		// Set when this item is a function call that produced a functionCall part.
+		isFunctionCall := false
 
 		if msg.Role != nil {
 			// Map Responses roles to Gemini roles (Gemini only supports "user" and "model")
@@ -5258,6 +5324,7 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 					}
 
 					content.Parts = append(content.Parts, part)
+					isFunctionCall = true
 				}
 
 			case schemas.ResponsesMessageTypeCodeInterpreterCall:
@@ -5400,7 +5467,14 @@ func convertResponsesMessagesToGeminiContents(messages []schemas.ResponsesMessag
 		}
 
 		if len(content.Parts) > 0 {
+			if isFunctionCall && functionCallTurn >= 0 && functionCallTurn == len(contents)-1 {
+				contents[functionCallTurn].Parts = append(contents[functionCallTurn].Parts, content.Parts...)
+				continue
+			}
 			contents = append(contents, content)
+			if isFunctionCall {
+				functionCallTurn = len(contents) - 1
+			}
 		}
 	}
 

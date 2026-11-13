@@ -538,6 +538,11 @@ type PromptCacheBreakpoint struct {
 	TTL  *string `json:"ttl,omitempty"` // "30m" or "12h"; defaults to prompt_cache_options.ttl
 }
 
+// ResponsesIncludeOutputTextLogprobs is the ResponsesParameters.Include value that
+// asks for the log probabilities of the generated output_text tokens: the Responses
+// form of Chat's logprobs: true.
+const ResponsesIncludeOutputTextLogprobs = "message.output_text.logprobs"
+
 type ResponsesParameters struct {
 	Background           *bool                          `json:"background,omitempty"`
 	Conversation         *ResponsesResponseConversation `json:"conversation,omitempty"`

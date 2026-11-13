@@ -3475,6 +3475,19 @@ func (s *BifrostHTTPServer) DialBootMCPClients(reconnect func(ctx context.Contex
 	}
 }
 
+// storelessAPIMiddlewares guards /api on a server without a config store. There is no admin
+// account to sign in with, so (OSS only, as with a store) the setup lock keeps /api closed to
+// any call without the setup token, exactly as before an admin account exists. Every request
+// it admits is then marked as bypassed; otherwise the handlers that require genuine auth for
+// dangerous changes see an unmarked request and let it through.
+func storelessAPIMiddlewares(ctx context.Context, setupToken string, allowedOrigins, whitelistedRoutes []string) []schemas.BifrostHTTPMiddleware {
+	var chain []schemas.BifrostHTTPMiddleware
+	if ctx.Value(schemas.BifrostContextKeyIsEnterprise) == nil {
+		chain = append(chain, handlers.NewStorelessSetupLock(setupToken, whitelistedRoutes).SetupLockMiddleware())
+	}
+	return append(chain, handlers.AuthBypassedMiddleware(allowedOrigins, whitelistedRoutes))
+}
+
 // Bootstrap initializes the Bifrost HTTP server with all necessary components.
 // It:
 // 1. Initializes Prometheus collectors for monitoring
@@ -3691,10 +3704,7 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	inferenceMiddlewares := commonMiddlewares
 	if s.Config.ConfigStore == nil {
 		logger.Error("auth middleware requires config store, skipping auth middleware initialization")
-		// No auth runs in this mode, so mark every API request as bypassed; otherwise the
-		// handlers that require genuine auth for dangerous changes see an unmarked request and
-		// let it through.
-		apiMiddlewares = append(apiMiddlewares, handlers.AuthBypassedMiddleware(s.Config.ClientConfig.AllowedOrigins, s.Config.ClientConfig.WhitelistedRoutes))
+		apiMiddlewares = append(apiMiddlewares, storelessAPIMiddlewares(ctx, s.Config.SetupToken, s.Config.ClientConfig.AllowedOrigins, s.Config.ClientConfig.WhitelistedRoutes)...)
 	} else {
 		// Use a signed (stateless) ticket store when an encryption key is configured
 		// so tickets are verifiable across nodes; otherwise fall back to in-memory.
@@ -3901,6 +3911,9 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		Handler:            handlers.ServerRootHandler(s.CORSMiddleware, s.Config, s.Router.Handler),
 		MaxRequestBodySize: maxRequestBodySizeMB * 1024 * 1024,
 		ReadBufferSize:     s.Config.ServerConfig.ReadBufferSize,
+		ReduceMemoryUsage:  s.Config.ServerConfig.ReduceMemoryUsage,
+		ReadTimeout:        s.Config.ServerConfig.ConnectionReadTimeout(),
+		IdleTimeout:        s.Config.ServerConfig.ConnectionIdleTimeout(),
 		// Explain an oversized body (413 naming the configured limit) instead of fasthttp's generic 400.
 		ErrorHandler: lib.RequestErrorHandler(maxRequestBodySizeMB, logger.Warn),
 	}

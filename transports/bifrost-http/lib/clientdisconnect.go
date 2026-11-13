@@ -6,6 +6,8 @@ import (
 	"net"
 	"syscall"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 // DefaultClientDisconnectPollInterval is how often an in-flight request's
@@ -62,6 +64,26 @@ func startClientDisconnectWatcher(conn net.Conn, ctx context.Context, cancel con
 			}
 		}
 	}()
+}
+
+// ClientDisconnectContext returns a context for work done on behalf of ctx's request before
+// the request has a BifrostContext: it ends when the client closes its socket (see
+// startClientDisconnectWatcher for what is detected), when the server shuts down, or when
+// cancel is called. The caller must call cancel when the work is done.
+func ClientDisconnectContext(ctx *fasthttp.RequestCtx) (context.Context, context.CancelFunc) {
+	parent := context.Context(ctx)
+	func() {
+		// Zero-value fasthttp.RequestCtx can panic on Done(); fall back safely.
+		defer func() {
+			if recover() != nil {
+				parent = context.Background()
+			}
+		}()
+		_ = ctx.Done()
+	}()
+	watched, cancel := context.WithCancel(parent)
+	startClientDisconnectWatcher(ctx.Conn(), watched, cancel)
+	return watched, cancel
 }
 
 // rawConnOf unwraps TLS and returns the socket's raw handle, or nil when the

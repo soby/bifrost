@@ -269,16 +269,16 @@ func convertResponsesStreamToChatChunk(resp *schemas.BifrostResponsesStreamRespo
 				FinishReason: finishReasonPtr,
 			}},
 		}
+		// Use the response ID if available, with or without usage
+		if resp.Response != nil && resp.Response.ID != nil {
+			chunk.ID = "chatcmpl-" + *resp.Response.ID
+		}
 		// Include usage from the completed response if available
 		if resp.Response != nil && resp.Response.Usage != nil {
 			chunk.Usage = &cursorUsage{
 				PromptTokens:     resp.Response.Usage.InputTokens,
 				CompletionTokens: resp.Response.Usage.OutputTokens,
 				TotalTokens:      resp.Response.Usage.TotalTokens,
-			}
-			// Use response ID if available
-			if resp.Response.ID != nil {
-				chunk.ID = "chatcmpl-" + *resp.Response.ID
 			}
 		}
 		return "", chunk, nil
